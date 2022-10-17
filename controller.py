@@ -66,9 +66,9 @@ class CoordinateListener(Node):
             ui.lcdNumber.display(round(trans.transform.translation.x,3))
             ui.lcdNumber_2.display(round(trans.transform.translation.y,3))
             ui.lcdNumber_3.display(round(trans.transform.translation.z,3))
-            ui.lcdNumber_4.display(round(roll_x*57.2957795131,2))
-            ui.lcdNumber_5.display(round(pitch_y*57.2957795131,2))
-            ui.lcdNumber_6.display(round(yaw_z*57.2957795131,2))
+            ui.lcdNumber_4.display(round(roll_x*57.2957795131,1))
+            ui.lcdNumber_5.display(round(pitch_y*57.2957795131,1))
+            ui.lcdNumber_6.display(round(yaw_z*57.2957795131,1))
         except:
             pass
             #ui.statusbar.showMessage("Cannot reach TF2 data")
@@ -100,7 +100,7 @@ def add_step():
 
 def add_cmd():
     if ui.addCmdCombo.currentIndex() == 0:  
-        operation.execute("insert into joints (Command,L1,L2,L3,L4,L5,L6) values('Wait',0,0,0,0,0,0)")
+        operation.execute("insert into joints (Command,L1,L2,L3,L4,L5,L6) values('Wait',1,0,0,0,0,0)")
         connection.commit()
         print("Succesful")
         list_table()

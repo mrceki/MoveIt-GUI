@@ -1,22 +1,20 @@
-from matplotlib.transforms import Transform
+
 import rclpy 
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros import TransformException
 from rclpy.node import Node
 from rclpy.duration import Duration
-from geometry_msgs.msg import TransformStamped, Vector3
-class Plane(Node):
+class CoordinateListener(Node):
 
     def __init__(self):
 
-        super().__init__('plane')
+        super().__init__('CoordinateListener')
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds = 10.))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.timer = self.create_timer(0.01, self.get_transform)
         self.trans = None
-        self.msg=TransformStamped()
 
         while rclpy.ok() and self.trans == None:
             rclpy.spin(self)
@@ -27,7 +25,7 @@ class Plane(Node):
         
         try:
             now = rclpy.time.Time()
-            trans = self.tf_buffer.lookup_transform('base_link', 'rg2_hand', now) #timeout=Duration(seconds=1.0)
+            trans = self.tf_buffer.lookup_transform('base_link', 'tool0', now) #timeout=Duration(seconds=1.0)
             self.trans = trans
             print(trans.transform.translation.x)
             print(trans.transform.translation.y)
@@ -39,7 +37,7 @@ class Plane(Node):
 
 def main():
     rclpy.init()
-    plane = Plane()
+    coordinate = CoordinateListener()
 
 
 if __name__ == '__main__':
