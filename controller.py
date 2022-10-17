@@ -294,21 +294,21 @@ def run_program():
                                     node.destroy_node() 
                                     for x in range(0,7):
                                         ui.tableWidget.item(i,x).setBackground(QtGui.QColor(60, 60, 60))      
-                                    print("destroyed")
+                                    ui.statusbar.showMessage("destroyed")
 
                                 except:
                                     node.destroy_node()
-                                    print("Cant Go")
+                                    ui.statusbar.showMessage("Cant Go")
                     except:
                         pass
          
     else:
-        print ("Pause")
+        ui.statusbar.showMessage("Pause")
         
-def button_clicked():                                          # +++
-    if ui.runButton.isChecked():                                    # +++
-        ui.runButton.setIcon(QIcon('/home/cenk/Downloads/Icons/pause-icon-512.png'))                       # +++
-    else:                                                          # +++
+def button_clicked():                                          
+    if ui.runButton.isChecked():
+        ui.runButton.setIcon(QIcon('/home/cenk/Downloads/Icons/pause-icon-512.png'))                       
+    else:
         ui.runButton.setIcon(QIcon('/home/cenk/Downloads/Icons/play-icon-512.png')) 
 
 class JointStateSubscriber(Node):
@@ -334,15 +334,15 @@ class JointStateSubscriber(Node):
             L6_ADD = round(msg.position[5],3)
             print(L1_ADD)
         except:
-            print("subsdan veri alınamadı")
+            ui.statusbar.showMessage("Can't get joint data!!")
         try:
             add = "insert into joints (Command,L1,L2,L3,L4,L5,L6) values(?,?,?,?,?,?,?)"  
             operation.execute(add,('Move',L1_ADD,L2_ADD,L3_ADD,L4_ADD,L5_ADD,L6_ADD))
             connection.commit()
-            print("Succesful")
+            ui.statusbar.showMessage("Succesful")
             list_table()
         except:
-            print("ERROR")
+            ui.statusbar.showMessage("ERROR")
 
 
 ui.retranslateUi(MainWindow)
