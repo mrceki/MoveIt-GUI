@@ -118,7 +118,7 @@ def insert_db():
                 rowData.append((widgetItem.text()))
             else:
                 rowData.append('')
-        print(rowData)
+         #print(rowData)
         query = " insert into joints (Command, L1,L2,L3,L4,L5,L6) values(?,?,?,?,?,?,?);"
 
         connection.execute(query,rowData)
