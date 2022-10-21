@@ -115,11 +115,11 @@ def insert_db():
         for column in range(columnCount):
             widgetItem =ui.tableWidget.item(row,column)
             if(widgetItem and widgetItem.text()):
-                rowData.append(float(widgetItem.text()))
+                rowData.append((widgetItem.text()))
             else:
                 rowData.append('')
         print(rowData)
-        query = " insert into joints (L1,L2,L3,L4,L5,L6) values(?,?,?,?,?,?);"
+        query = " insert into joints (Command, L1,L2,L3,L4,L5,L6) values(?,?,?,?,?,?,?);"
 
         connection.execute(query,rowData)
         connection.commit()
@@ -128,31 +128,77 @@ def insert_db():
 
 def move_up():
     chosen_row=ui.tableWidget.currentRow()
+    chosen_row2=ui.tableWidget.currentRow()
+    chosen_column=ui.tableWidget.currentColumn()
     columnCount = ui.tableWidget.model().columnCount()
-    #connection.execute("DELETE FROM joints;")
-    for column in range(0,columnCount):
-        rowData = []
-        widgetItem =ui.tableWidget.item(chosen_row-1,column)
-        if(widgetItem and widgetItem.text()):
-            rowData.append(float(widgetItem.text()))       
+    print(chosen_row)
+    print(chosen_column)
+    rowData = [0,0,0,0,0,0,0]
 
     for column in range(0,columnCount):
-        rowData_2 = []
         widgetItem =ui.tableWidget.item(chosen_row,column)
         if(widgetItem and widgetItem.text()):
-            rowData_2.append(float(widgetItem.text()))        
-    #rowData_tmp=[]
-    #rowData_tmp = rowData
-    #rowData = rowData_2
-    rowData,rowData_2=rowData_2,rowData
+            rowData[column] = widgetItem.text() #rowData.append(widgetItem.text())   
+    rowData_2 = [0,0,0,0,0,0,0]
+
+    for column in range(0,columnCount):
+        
+        widgetItem =ui.tableWidget.item(chosen_row2-1,column)
+        if(widgetItem and widgetItem.text()):
+            rowData_2[column]= widgetItem.text() #rowData_2.append(widgetItem.text())
+
+    rowData_tmp=[0,0,0,0,0,0,0]
+    rowData_tmp = rowData
+    rowData = rowData_2
+    rowData_2 = rowData_tmp
+    print(rowData)
+    print(rowData_2)
     columnCount = ui.tableWidget.model().columnCount()
-    for column in range(columnCount):
-        ui.tableWidget.setItem(chosen_row,column-1,QTableWidgetItem(str(rowData_2[column])))
+
+    for column in range(0,columnCount):
+        ui.tableWidget.setItem(chosen_row,column,QTableWidgetItem(str(rowData[column])))
     #rowData_2 = rowData_tmp
-    for column in range(columnCount):
-        ui.tableWidget.setItem(chosen_row-1,column-1,QTableWidgetItem(str(rowData[column])))
+    for column in range(0,columnCount):
+        ui.tableWidget.setItem(chosen_row2-1,column,QTableWidgetItem(str(rowData_2[column])))
     insert_db()
-    
+
+def move_down():
+    chosen_row=ui.tableWidget.currentRow()
+    chosen_row2=ui.tableWidget.currentRow()
+    chosen_column=ui.tableWidget.currentColumn()
+    columnCount = ui.tableWidget.model().columnCount()
+    print(chosen_row)
+    print(chosen_column)
+    rowData = [0,0,0,0,0,0,0]
+
+    for column in range(0,columnCount):
+        widgetItem =ui.tableWidget.item(chosen_row,column)
+        if(widgetItem and widgetItem.text()):
+            rowData[column] = widgetItem.text() #rowData.append(widgetItem.text())   
+    rowData_2 = [0,0,0,0,0,0,0]
+
+    for column in range(0,columnCount):
+        
+        widgetItem =ui.tableWidget.item(chosen_row2+1,column)
+        if(widgetItem and widgetItem.text()):
+            rowData_2[column]= widgetItem.text() #rowData_2.append(widgetItem.text())
+
+    rowData_tmp=[0,0,0,0,0,0,0]
+    rowData_tmp = rowData
+    rowData = rowData_2
+    rowData_2 = rowData_tmp
+    print(rowData)
+    print(rowData_2)
+    columnCount = ui.tableWidget.model().columnCount()
+
+    for column in range(0,columnCount):
+        ui.tableWidget.setItem(chosen_row,column,QTableWidgetItem(str(rowData[column])))
+    #rowData_2 = rowData_tmp
+    for column in range(0,columnCount):
+        ui.tableWidget.setItem(chosen_row2+1,column,QTableWidgetItem(str(rowData_2[column])))
+    insert_db()
+
+
 def delete_step():
 
     chosen_step=ui.tableWidget.currentRow()
@@ -389,6 +435,7 @@ ui.radioButton.toggled['bool'].connect(lambda: ui.label_9.setText("Rx")) # type:
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_11.setText("Ry")) # type: ignore
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_12.setText("Rz"))# type: ignore
 ui.moveUpButton.clicked.connect(move_up)
+ui.moveDownButton.clicked.connect(move_down)
 ui.moveDownButton.clicked.connect(insert_db)
 ui.runButton.clicked.connect(thread_run) #run_program
 ui.runButton.clicked.connect(button_clicked) #run_program
