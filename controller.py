@@ -1,5 +1,6 @@
 from multiprocessing.connection import wait
 from time import sleep
+from traceback import print_tb
 from controllerGui import *
 import sys
 from PyQt5.QtWidgets import *
@@ -357,6 +358,32 @@ def button_clicked():
     else:
         ui.runButton.setIcon(QIcon('/home/cenk/Downloads/Icons/play-icon-512.png')) 
 
+def moveRowsDown(): #not working
+    columnCount = ui.tableWidget.model().columnCount()
+    chosenRow = ui.tableWidget.currentRow()
+    rowCount = ui.tableWidget.model().rowCount()
+    #print(ui.tableWidget.item(chosenRow,0).text())
+    for countRow in range (28, 0, -1):
+        if ui.tableWidget.item(countRow,0).text()!='':
+            newRowCount = countRow +1
+            break
+    
+    print(newRowCount)
+            
+    for index in range (newRowCount-1, chosenRow-1,-1):
+        rowData = [0,0,0,0,0,0,0]
+        for column in range(0,columnCount):
+            widgetItem =ui.tableWidget.item(index,column)
+            if(widgetItem and widgetItem.text()):
+                rowData[column] = widgetItem.text()
+
+
+        for column in range(0,columnCount):
+            ui.tableWidget.setItem(index+1,column,QTableWidgetItem(str(rowData[column])))
+
+
+
+
 class JointStateSubscriber(Node):
 
     def __init__(self):
@@ -435,8 +462,8 @@ ui.radioButton.toggled['bool'].connect(lambda: ui.label_9.setText("Rx")) # type:
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_11.setText("Ry")) # type: ignore
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_12.setText("Rz"))# type: ignore
 ui.moveUpButton.clicked.connect(move_up)
-ui.moveDownButton.clicked.connect(move_down)
-ui.moveDownButton.clicked.connect(insert_db)
+ui.moveDownButton.clicked.connect(moveRowsDown) #move_down
+#ui.moveDownButton.clicked.connect(insert_db)
 ui.runButton.clicked.connect(thread_run) #run_program
 ui.runButton.clicked.connect(button_clicked) #run_program
 ui.deleteButton.clicked.connect(delete_step)
