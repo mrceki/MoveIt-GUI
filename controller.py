@@ -367,7 +367,8 @@ def moveRowsDown(): #not working
         if ui.tableWidget.item(countRow,0).text()!='':
             newRowCount = countRow +1
             break
-    
+            
+ 
     print(newRowCount)
             
     for index in range (newRowCount-1, chosenRow-1,-1):
@@ -381,7 +382,30 @@ def moveRowsDown(): #not working
         for column in range(0,columnCount):
             ui.tableWidget.setItem(index+1,column,QTableWidgetItem(str(rowData[column])))
 
+def copyRow():
+    
+    chosenRow = ui.tableWidget.currentRow()
+    columnCount = ui.tableWidget.columnCount()
+    global copiedRowData
+    copiedRowData = [0,0,0,0,0,0,0]
 
+    for column in range (0, columnCount):
+        widgetItem =ui.tableWidget.item(chosenRow,column)
+        if(widgetItem and widgetItem.text()):
+            copiedRowData[column] = widgetItem.text()
+    insert_db()
+    ui.statusbar.showMessage("Row copied")
+            
+
+def pasteRow():
+    moveRowsDown()
+    chosenRow = ui.tableWidget.currentRow()
+    columnCount = ui.tableWidget.columnCount()
+    for column in range(0,columnCount):
+        ui.tableWidget.setItem(chosenRow,column,QTableWidgetItem(str(copiedRowData[column])))
+    insert_db()
+    ui.statusbar.showMessage("Row Pasted")
+    
 
 
 class JointStateSubscriber(Node):
@@ -461,8 +485,8 @@ ui.radioButton.toggled['bool'].connect(lambda: ui.label_8.setText("Z")) # type: 
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_9.setText("Rx")) # type: ignore
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_11.setText("Ry")) # type: ignore
 ui.radioButton.toggled['bool'].connect(lambda: ui.label_12.setText("Rz"))# type: ignore
-ui.moveUpButton.clicked.connect(move_up)
-ui.moveDownButton.clicked.connect(moveRowsDown) #move_down
+ui.moveUpButton.clicked.connect(copyRow) # move_up
+ui.moveDownButton.clicked.connect(pasteRow) #move_down
 #ui.moveDownButton.clicked.connect(insert_db)
 ui.runButton.clicked.connect(thread_run) #run_program
 ui.runButton.clicked.connect(button_clicked) #run_program
