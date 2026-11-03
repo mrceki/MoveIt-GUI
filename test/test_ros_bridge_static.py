@@ -1,0 +1,230 @@
+"""Tests of RosBridge logic that need no ROS: rclpy & messages are stubbed with MagicMock."""
+import sys
+import threading
+import time
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+STUBS = ["rclpy", "rclpy.action", "rclpy.callback_groups", "rclpy.executors", "rclpy.node", "rclpy.qos",
+         "rclpy.time", "builtin_interfaces", "builtin_interfaces.msg", "controller_manager_msgs",
+         "controller_manager_msgs.srv", "geometry_msgs", "geometry_msgs.msg", "sensor_msgs", "sensor_msgs.msg",
+         "std_msgs", "std_msgs.msg", "std_srvs", "std_srvs.srv", "lifecycle_msgs", "lifecycle_msgs.msg"]
+STUBS += ["trajectory_msgs", "trajectory_msgs.msg", "action_msgs", "action_msgs.srv"]
+
+
+@pytest.fixture
+def ros_bridge_module():
+    with mock.patch.dict(sys.modules, {m: mock.MagicMock() for m in STUBS}):
+        sys.modules.pop("moveit_gui.ros_bridge", None)
+        import moveit_gui.ros_bridge as rb
+        yield rb
+        sys.modules.pop("moveit_gui.ros_bridge", None)
+
+
+def _bare_bridge(rb):
+    from moveit_gui.bridge_api import Snapshot
+    from moveit_gui.profile import RobotProfile
+    b = object.__new__(rb.RosBridge)
+    b.profile = RobotProfile.load(ROOT / "profiles" / "ur7e_lab.yaml")
+    b._lock = threading.Lock()
+    b._snap = Snapshot()
+    b._t_joints = time.monotonic()
+    b._joints_received = True
+    b._velocities_ok = True
+    b._freedrive_on = False
+    return b
+
+
+def test_snapshot_does_not_deadlock(ros_bridge_module):
+    b = _bare_bridge(ros_bridge_module)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("snap", b.snapshot()), daemon=True)
+    t.start()
+    t.join(2.0)
+    assert not t.is_alive(), "RosBridge.snapshot() deadlocked on its own lock"
+    assert out["snap"].joint_state_age is not None
+
+
+def test_unknown_moveit_result_is_failure(ros_bridge_module):
+    b = _bare_bridge(ros_bridge_module)
+    b.moveit = mock.MagicMock()
+    b.moveit.wait_until_executed.return_value = None
+    b._logs = __import__("collections").deque()
+    b.node = mock.MagicMock()
+    assert b._moveit_wait() is False
+
+
+def test_is_stationary_unknown_without_velocities(ros_bridge_module):
+    b = _bare_bridge(ros_bridge_module)
+    assert b.is_stationary() is None          # no velocities in the snapshot
+    b._snap.joint_velocities = [0.0] * 6
+    assert b.is_stationary() is True
+    b._t_joints = time.monotonic() - 5
+    assert b.is_stationary() is None          # stale
+
+
+def test_trajectory_goal_names_the_controller_of_the_active_mode(ros_bridge_module):
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b.log = lambda *_: None
+    b.list_controllers = lambda: {"admittance_controller": "active", "admittance_trajectory_controller": "active",
+                                  "scaled_joint_trajectory_controller": "inactive"}
+    b._execute_cli = mock.MagicMock()
+    rb.ExecuteTrajectory = mock.MagicMock()
+    b._wait_future = mock.MagicMock(return_value=None)     # goal rejected after being sent: enough to inspect it
+    assert b._execute_on_active_controller(mock.MagicMock()) is False
+    goal = b._execute_cli.send_goal_async.call_args[0][0]
+    assert goal.controller_names == ["admittance_trajectory_controller"]
+
+
+def test_trajectory_is_refused_when_no_active_mode_takes_moveit(ros_bridge_module):
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b.log = lambda *_: None
+    b.list_controllers = lambda: {"cartesian_impedance_controller": "active"}
+    b._execute_cli = mock.MagicMock()
+    assert b._execute_on_active_controller(mock.MagicMock()) is False
+    b._execute_cli.send_goal_async.assert_not_called()
+
+
+def test_health_tick_reports_moveit_only_when_its_action_server_answers(ros_bridge_module):
+    """The graph also lists actions that only have a client (the GUI's own), so names prove nothing.
+    (An earlier version also called Node.get_action_names_and_types(), which does not exist, and killed the
+    executor thread.)"""
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b.node = mock.create_autospec(object, instance=True)
+    b._t_wrench = 0.0
+    b._gripper_cli = b._servo_cli = b._gripper_list_cli = None
+    b._list_cli = mock.MagicMock()
+    b._list_cli.service_is_ready.return_value = False
+    b._execute_cli = mock.MagicMock()
+    b._execute_cli.server_is_ready.return_value = False
+    b._health_tick()
+    assert b._snap.connected["MoveIt"] is False
+    b._execute_cli.server_is_ready.return_value = True
+    b._health_tick()
+    assert b._snap.connected["MoveIt"] is True
+
+
+
+def _executing_bridge(rb):
+    b = _bare_bridge(rb)
+    b.log = lambda *_: None
+    b.list_controllers = lambda: {"scaled_joint_trajectory_controller": "active"}
+    b._execute_cli = mock.MagicMock()
+    b._execute_handle = None
+    rb.ExecuteTrajectory = mock.MagicMock()
+    return b
+
+
+def test_stop_while_planning_never_sends_the_goal(ros_bridge_module):
+    """pymoveit2 cannot cancel plan(): a STOP during planning bumps stop_epoch and nothing is sent afterwards."""
+    rb = ros_bridge_module
+    b = _executing_bridge(rb)
+
+    def plan(*_a, **_k):
+        b.cancel_motion()                         # STOP pressed while MoveIt plans
+        return mock.MagicMock()
+    b.moveit = mock.MagicMock()
+    b.moveit.plan.side_effect = plan
+    assert b.move_joints([0.0] * 6) is False
+    b._execute_cli.send_goal_async.assert_not_called()
+
+
+def test_stop_while_the_goal_is_being_sent_cancels_it(ros_bridge_module):
+    rb = ros_bridge_module
+    b = _executing_bridge(rb)
+    handle = mock.MagicMock(accepted=True)
+    result = mock.MagicMock()
+    result.result.error_code.val = -7             # PREEMPTED, as MoveIt reports a cancelled goal
+    calls = iter([handle, result])
+
+    def wait_future(_future, _timeout):
+        out = next(calls)
+        if out is handle:
+            b.stop_epoch += 1                     # STOP arrived while the goal was in flight
+        return out
+    b._wait_future = wait_future
+    assert b._execute_on_active_controller(mock.MagicMock()) is False
+    handle.cancel_goal_async.assert_called()
+
+
+def test_stop_reaches_move_group_and_every_trajectory_controller(ros_bridge_module):
+    """MoveIt 2.12 accepts a cancel of /execute_trajectory without stopping the trajectory, so STOP also sends
+    "stop" on trajectory_execution_event and cancels all goals of each trajectory controller MoveIt can use."""
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b.stop_epoch = 0
+    b._exec_event_pub = mock.MagicMock()
+    ready, down = mock.MagicMock(), mock.MagicMock()
+    ready.service_is_ready.return_value = True
+    down.service_is_ready.return_value = False
+    b._fjt_cancel = {"scaled_joint_trajectory_controller": ready, "admittance_trajectory_controller": down}
+    b._execute_handle = mock.MagicMock()
+    b.moveit = None
+    b.cancel_motion()
+    assert b.stop_epoch == 1
+    rb.String.assert_called_with(data="stop")
+    b._exec_event_pub.publish.assert_called_once()
+    ready.call_async.assert_called_once()                # a controller that is not up is skipped, not waited for
+    down.call_async.assert_not_called()
+    b._execute_handle.cancel_goal_async.assert_called_once()
+
+
+def test_remote_control_state_comes_from_the_dashboard_answer(ros_bridge_module):
+    b = _bare_bridge(ros_bridge_module)
+    fut = mock.MagicMock()
+    fut.result.return_value = mock.MagicMock(success=True, remote_control=True)
+    b._on_remote_control(fut)
+    assert b._snap.remote_control is True
+    fut.result.return_value = mock.MagicMock(success=True, remote_control=False)
+    b._on_remote_control(fut)
+    assert b._snap.remote_control is False
+    fut.result.return_value = mock.MagicMock(success=False, remote_control=False)    # no answer: unknown
+    b._on_remote_control(fut)
+    assert b._snap.remote_control is None
+
+
+def test_program_running_is_cleared_when_the_arm_stops_running_and_set_by_the_dashboard(ros_bridge_module):
+    """On the UR7e the driver did not report the program stopping after a power cycle; robot_program_running is
+    only published on change, so it stayed true. Leaving RUNNING clears it; the Dashboard poll sets the truth."""
+    rb = ros_bridge_module
+    b = _bare_bridge(rb)
+    b._snap.program_running = True
+    rb.RobotMode = object                                  # ur_dashboard_msgs is not stubbed here
+    rb._enum_name = lambda enum, v: v                      # use the mode name directly
+    for mode, expect in (("RUNNING", True), ("POWER_OFF", False)):
+        b._on_robot_mode(mock.MagicMock(mode=mode))
+        assert b._snap.program_running is expect, mode
+    b._on_robot_mode(mock.MagicMock(mode="RUNNING"))        # brakes released again: still not running
+    assert b._snap.program_running is False
+    fut = mock.MagicMock()
+
+    def answer(state, success=True, text=""):
+        fut.result.return_value = mock.MagicMock(success=success, answer=text, state=mock.MagicMock(state=state))
+        b._on_dashboard_program(fut)
+    answer("PLAYING")                                                    # Play pressed
+    assert b._snap.program_running is True and b._snap.program_state == "PLAYING"
+    answer("", success=False, text="timeout")                            # no answer: keep what we know
+    assert b._snap.program_running is True
+    answer("PAUSED")                                                     # a pause is not a stop
+    assert b._snap.program_running is False and b._snap.program_state == "PAUSED"
+    b._reconnect_dashboard_bg = mock.MagicMock()
+    answer("", success=False, text="Failed to send request to dashboard server. Are you connected to the "
+                                   "Dashboard Server?")                  # the driver lost the Dashboard
+    assert b._snap.program_state is None and b._reconnect_dashboard_bg.called
+
+
+def test_pendant_speed_percent_becomes_a_fraction(ros_bridge_module):
+    """ur_controllers' SpeedScalingStateBroadcaster publishes percent: 100 must not show as 10000 %."""
+    b = _bare_bridge(ros_bridge_module)
+    b._on_speed(mock.MagicMock(data=100.0))
+    assert b._snap.speed_scaling == 1.0
+    b._on_speed(mock.MagicMock(data=25.0))
+    assert b._snap.speed_scaling == 0.25
