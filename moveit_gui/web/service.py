@@ -1014,7 +1014,7 @@ class WebService(WorkcellCommands):
         "comment": {"text": str},
         "move_relative": {"offset_mm": _floats(3), "rotate_deg": _floats(3), "frame": str, "cartesian": bool,
                           "velocity": float, "acceleration": float, "pivot": _choice("tcp", "frame"),
-                          "on_fail": _choice("stop", "continue")},
+                          "start": _choice("here", "planned"), "on_fail": _choice("stop", "continue")},
         "move_until_contact": {"direction": _floats(3), "frame": str, "distance_mm": float, "force_n": float,
                                "velocity": float, "on_no_contact": _choice("fail", "continue"),
                                "on_fail": _choice("stop", "continue")},
