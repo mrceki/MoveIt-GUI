@@ -46,6 +46,10 @@ it by itself whenever `~/ur7e_robotiq` changes. Then it builds `~/ws` inside the
 **Take control** (top right) to command anything; other browsers watch until you release. Ctrl-C in the terminal
 stops everything.
 
+The server accepts the `Host` header only as an IP address, `localhost`, a short name or `*.ts.net`. If you reach it
+by another DNS name (a lab domain name, a CNAME), add `--allow-host robot.lab.example.org` (repeatable) to the
+`moveit_gui_web` command line, else the page answers "unknown Host header" (403). `0.0.0.0` is refused as `--host`.
+
 ## 4. Real robot
 
 1. On the pendant: the robot is in Remote control and the External Control URCap program points at this PC.
@@ -97,6 +101,7 @@ yours from `~/ws/src/moveit_gui/programs/`.
 
 ## Trouble
 
+* **403 "unknown Host header"**: you reached the GUI by a DNS name it does not know: add `--allow-host NAME`.
 * **Port busy**: `--port <n>`. Find the old process with `ss -ltnp | grep 8180` and stop it by PID.
 * **A container called ur7e_robotiq is already running**: another terminal has the stack. `docker stop ur7e_robotiq`.
 * **Old UI in the browser after an update**: a banner offers a reload. Otherwise reload the page.

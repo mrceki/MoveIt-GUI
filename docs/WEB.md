@@ -12,7 +12,11 @@ On the robot PC:
 ~/ur7e_gui.sh        # builds what changed, starts the robot stack and the web GUI in the ur7e_robotiq container
 ```
 
-Open `http://<robot-pc tailscale ip>:8180/` from the other PC (the script prints it). The server listens only on
+Open `http://<robot-pc tailscale ip>:8180/` from the other PC (the script prints it). The server refuses
+`--host 0.0.0.0` / `::`. It also checks the `Host` header (anti DNS-rebinding): an IP address, `localhost`, a short
+single-label name or `*.ts.net` (Tailscale MagicDNS) is accepted, any other DNS name needs `--allow-host NAME`
+(repeatable). A POST whose `Origin` is not the page's own host:port is refused, and the page cannot be framed
+(`X-Frame-Options: DENY`, CSP `frame-ancestors 'none'`). The server listens only on
 the Tailscale address, so only your tailnet reaches it, and Tailscale encrypts the traffic. The header shows the
 operator's IP. Never listen on `0.0.0.0`: there is no login. **Never use `tailscale funnel`**: it publishes to the
 internet.
@@ -32,9 +36,20 @@ program runner and lease, and they do not know about each other.
 - **■ STOP works from every browser, with or without control** (and Esc). It stops the GUI program, MoveIt motion and the
   running policy. It is not an emergency stop: the pendant e-stop is.
   A STOP pressed while MoveIt is still planning (or while the move waits to start) also counts: that move is never sent.
-- **Heartbeat.** The controlling browser checks in every second. If the robot PC hears nothing for 2.5 s
-  (closed laptop, Wi-Fi gone, tab killed), it **stops everything** and ends freedrive. If the robot was idle,
-  it simply drops the lease.
+- **Heartbeat.** The controlling browser checks in every 500 ms (one at a time, 2 s timeout), and every request that
+  carries the control token (commands, jog and force renewals, hold-to-run) counts as one too. If the robot PC hears
+  nothing for 2.5 s (closed laptop, Wi-Fi gone, tab killed), it **stops everything** and ends freedrive. If the robot
+  was idle, it simply drops the lease. The robot-PC log says why and for how long it was silent ("lost contact with
+  <name> (no heartbeat for 2.6 s, limit 2.5 s)").
+- **Lost control, or just a slow link?** A page declares "You lost control" **only when the robot PC answers that it no
+  longer holds the lease** (it timed out, or someone took over). If the answer does not arrive (network hiccup, the
+  browser's connection limit busy with camera streams) the page shows a yellow "Connection problem" banner, keeps
+  trying, and control continues the moment an answer comes back in time.
+- **Control token.** Take control makes the robot PC issue a random secret token, sent only to that browser. Every
+  command, heartbeat and release must carry it (STOP and the read-only status calls need none). The state everyone
+  watches shows only the holder's name and a public id, which is no credential. The token lives in the tab's
+  `sessionStorage`: **reloading the tab keeps control** (if the reload takes less than 2.5 s), a duplicated tab does
+  not inherit it. Closing the tab drops control after 2.5 s.
 - **Take over** from another browser is only possible while the robot is idle. The browser that loses control
   gets a message that stays until dismissed ("You lost control: <name> took over").
 - **Operator names.** The first Take control asks for your name (kept in that browser); the header then shows
@@ -222,7 +237,9 @@ TopicSensorBridge) all see the same values at once. Reading = raw sensor − bia
 * Refused while anything uses the reading: Admittance (or any `requires_ft` mode), an applied force, a program,
   policy or motion. Every change is read back and logged.
 * The broadcaster starts with no bias every time the robot stack starts. The GUI then shows that the last bias
-  is gone and offers **Re-apply**; it never re-applies by itself.
+  is gone. With `ft_bias.auto_restore: true` (the default, `moveit_gui/ft_bias.py`) the GUI then puts the last
+  bias back **by itself** as soon as nothing uses the reading (checked every `poll_s`) and logs it; with
+  `auto_restore: false` it only shows that the bias is gone and offers **Re-apply**.
 * The payload calibration holds only for the bias it was collected with: **Apply to admittance** is refused after
   the bias changed (collect again, or set the bias back). Zeroing with the gripper on and gravity compensation
   set makes Admittance subtract the gripper weight twice.

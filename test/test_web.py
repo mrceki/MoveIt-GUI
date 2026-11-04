@@ -66,31 +66,31 @@ def test_commands_need_the_lease_but_stop_does_not(env):
 
 def test_takeover_is_refused_while_the_robot_moves(env):
     s, bridge, clock, _ = env
-    s.take_lease("a", "alice")
+    a = s.take_lease("", "alice")["token"]
     bridge.joint_speed = 0.5                                      # a slow move
-    s.command("a", "move_joints", {"q_deg": [30, -90, 0, -90, 0, 0], "vel": 0.1})
+    s.command(a, "move_joints", {"q_deg": [30, -90, 0, -90, 0, 0], "vel": 0.1})
     assert wait(lambda: s.core.busy)
     s.tick()
     with pytest.raises(CommandError, match="alice"):
-        s.take_lease("b", "bob")
+        s.take_lease("", "bob")
     s.stop()
     assert wait(lambda: not s.core.busy)
     s.tick()
-    assert s.take_lease("b", "bob")["client"] == "b"              # idle: take over is allowed
+    assert s.take_lease("", "bob")["name"] == "bob"             # idle: take over is allowed
     with pytest.raises(CommandError):
-        s.command("a", "switch_mode", {"mode": "admittance"})
+        s.command(a, "switch_mode", {"mode": "admittance"})
 
 
 def test_lost_heartbeat_stops_a_moving_robot(env):
     s, bridge, clock, _ = env
-    s.take_lease("a", "alice")
+    a = s.take_lease("", "alice")["token"]
     bridge.joint_speed = 0.5
-    s.command("a", "move_joints", {"q_deg": [30, -90, 0, -90, 0, 0], "vel": 0.1})
+    s.command(a, "move_joints", {"q_deg": [30, -90, 0, -90, 0, 0], "vel": 0.1})
     assert wait(lambda: s.core.busy)
     clock.t += 1.0
-    assert s.heartbeat("a")
+    assert s.heartbeat(a)
     s.tick()
-    assert s.lease.client == "a"
+    assert s.lease.holds(a)
     n = bridge.calls.count(("cancel",))
     clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1                     # browser gone
     s.tick()
@@ -102,7 +102,7 @@ def test_lost_heartbeat_stops_a_moving_robot(env):
 
 def test_lost_heartbeat_while_idle_just_releases(env):
     s, bridge, clock, _ = env
-    s.take_lease("a")
+    a = s.take_lease("")["token"]
     n = bridge.calls.count(("cancel",))
     clock.t += svc_mod.LEASE_TIMEOUT_S + 0.1
     s.tick()
@@ -112,70 +112,70 @@ def test_lost_heartbeat_while_idle_just_releases(env):
 # --------------------------------------------------------------- commands
 def test_move_runs_as_a_job_and_reports_back(env):
     s, bridge, _, _ = env
-    s.take_lease("a")
-    r = s.command("a", "move_waypoint", {"name": "ready", "vel": 0.5})
+    a = s.take_lease("")["token"]
+    r = s.command(a, "move_waypoint", {"name": "ready", "vel": 0.5})
     assert r["ok"] and r["job"]
     assert wait(lambda: any(x["id"] == r["job"] for x in s.results))
     res = [x for x in s.results if x["id"] == r["job"]][0]
     assert res["ok"] and res["msg"] == "motion done"
     with pytest.raises(CommandError, match="scaling"):
-        s.command("a", "move_waypoint", {"name": "ready", "vel": 5})
+        s.command(a, "move_waypoint", {"name": "ready", "vel": 5})
 
 
 def test_motion_rules_are_the_cores(env):
     s, _, _, _ = env
-    s.take_lease("a")
+    a = s.take_lease("")["token"]
     s.core.modes.unknown_reason = "rollback failed"
     s.tick()
     with pytest.raises(CommandError, match="UNKNOWN"):
-        s.command("a", "move_waypoint", {"name": "ready"})
+        s.command(a, "move_waypoint", {"name": "ready"})
 
 
 def test_teach_scrape_save_and_no_paths_from_the_browser(env):
     s, _, _, tmp = env
-    s.take_lease("a")
+    a = s.take_lease("")["token"]
     s.core.store.put_fixture(FixtureDef("vial", "base_link", tf.make([0.5, 0.0, 0.05]), {"method": "vial_xy_circle"}))
     s.tick()
-    r = s.command("a", "program_record", {"kind": "pose", "frame": "vial"})
+    r = s.command(a, "program_record", {"kind": "pose", "frame": "vial"})
     assert r["program"]["steps"][-1]["type"] == "move_pose" and "vial" in r["program"]["steps"][-1]["detail"]
-    r = s.command("a", "program_record", {"kind": "joints"})
+    r = s.command(a, "program_record", {"kind": "joints"})
     assert r["program"]["steps"][-1]["type"] == "movej"
-    r = s.command("a", "program_save", {"name": "taught"})
+    r = s.command(a, "program_save", {"name": "taught"})
     assert (tmp / "progs" / "taught.yaml").exists()
     for bad in ("../evil.yaml", "/etc/passwd", "x.txt"):
         with pytest.raises(CommandError):
-            s.command("a", "program_save", {"name": bad})
+            s.command(a, "program_save", {"name": bad})
     assert not (tmp / "evil.yaml").exists()
-    s.command("a", "program_open", {"name": "taught.yaml"})
+    s.command(a, "program_open", {"name": "taught.yaml"})
     assert s.program.name == "taught" and len(s.program.steps) == 2
 
 
 def test_program_runs_and_is_visible_in_state(env):
     s, _, _, _ = env
-    s.take_lease("a")
-    s.command("a", "program_set_yaml", {"text": "version: 2\nname: t\nsteps:\n"
+    a = s.take_lease("")["token"]
+    s.command(a, "program_set_yaml", {"text": "version: 2\nname: t\nsteps:\n"
                                                 "  - {type: movej, target: ready, velocity: 0.5}\n"
                                                 "  - {type: wait, seconds: 0.1}\n"})
-    s.command("a", "program_run", {})
+    s.command(a, "program_run", {})
     assert wait(lambda: s.core.program_result is not None)
     s.tick()
     st = s.state()
     assert st["runner"]["result"][0] is True and st["runner"]["state"] == "IDLE"
     with pytest.raises(CommandError, match="YAML"):
-        s.command("a", "program_set_yaml", {"text": "steps: [unclosed"})
+        s.command(a, "program_set_yaml", {"text": "steps: [unclosed"})
 
 
 def test_vial_capture_and_save_through_the_web(env):
     s, bridge, _, _ = env
-    s.take_lease("a")
+    a = s.take_lease("")["token"]
     for name, xyz in (("Rim 1", (0.512, 0.1, 0.08)), ("Rim 2", (0.5, 0.112, 0.08)), ("Rim 3", (0.488, 0.1, 0.08))):
         s.vial_points[name] = list(xyz)
-    s.command("a", "vial_capture", {"point": "Bottom"})          # the live TCP pose, through the command
+    s.command(a, "vial_capture", {"point": "Bottom"})          # the live TCP pose, through the command
     assert len(s.vial_points["Bottom"]) == 3
     s.vial_points["Bottom"] = [0.5, 0.1, 0.02]
     v = s.vial_view()
     assert v["result"]["r"] == pytest.approx(0.012, abs=1e-6)
-    s.command("a", "vial_save", {"name": "vial"})
+    s.command(a, "vial_save", {"name": "vial"})
     assert "vial" in s.core.store.fixtures
 
 
@@ -212,10 +212,10 @@ def test_http_static_info_and_json_only_posts(http):
         assert json.loads(r.read())["profile"] == "ur7e_lab"
     code, _ = _post(base + "/api/stop", {}, ctype="text/plain")          # a cross-site form cannot do this
     assert code == 409
-    code, body = _post(base + "/api/cmd", {"client": "x", "cmd": "move_waypoint", "args": {"name": "ready"}})
+    code, body = _post(base + "/api/cmd", {"token": "x", "cmd": "move_waypoint", "args": {"name": "ready"}})
     assert code == 409 and "take control" in body["msg"]
-    assert _post(base + "/api/lease", {"client": "x"})[1]["ok"]
-    code, body = _post(base + "/api/cmd", {"client": "x", "cmd": "move_waypoint", "args": {"name": "ready"}})
+    tok = _post(base + "/api/lease", {})[1]["lease"]["token"]
+    code, body = _post(base + "/api/cmd", {"token": tok, "cmd": "move_waypoint", "args": {"name": "ready"}})
     assert code == 200 and body["ok"]
     for escape in ("/static/../server.py", "/static/%2e%2e/server.py"):  # no escaping the static folder
         with pytest.raises(urllib.error.HTTPError) as e:

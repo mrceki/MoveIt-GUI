@@ -5,7 +5,8 @@
   GET  /                      the app (static files, no build step, no internet needed)
   GET  /api/info              robot profile: joints, modes, waypoints, cameras, policies
   GET  /api/events            Server-Sent Events: "state" 10 Hz, "log" lines, "result" of jobs
-  POST /api/lease|heartbeat|release   the control lease (see service.py)
+  POST /api/lease|heartbeat|release   the control lease (see service.py): /api/lease returns a secret token that
+                              every later request must carry as "token"; it is never broadcast
   POST /api/stop              STOP GUI MOTION, from anyone
   POST /api/cmd               {client, cmd, args}
   GET  /api/camera.mjpeg?topic=...    one image topic as MJPEG (only while someone watches)
@@ -14,6 +15,7 @@
 
 Reach it from another PC on the tailnet without opening a port:   tailscale serve --bg 8180
 (the server listens on 127.0.0.1 by default; tailscale serve adds HTTPS and the Tailscale-User-* headers).
+The Host header must be an IP, localhost, a single-label name or *.ts.net (else --allow-host NAME): DNS rebinding.
 """
 from __future__ import annotations
 
@@ -35,6 +37,34 @@ from .service import CommandError, WebService
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 1 << 20
 CAMERA_FPS = 10.0
+ERR_EVERY_S = 30.0
+
+
+def host_allowed(host_header: str, extra=()) -> bool:
+    """The Host header names this server by something a DNS-rebinding page cannot make up: an IP literal,
+    localhost, a single-label name (LAN / MagicDNS short name), *.ts.net, or a name given with --allow-host."""
+    h = (host_header or "").strip().lower()
+    if not h:
+        return False
+    if h.startswith("["):                                     # [::1]:8180
+        name = h[1:].split("]", 1)[0]
+    else:
+        name = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    name = name.rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    if name == "localhost" or name in {x.lower() for x in extra}:
+        return True
+    return "." not in name or name.endswith(".ts.net")
+
+
+def host_port(netloc: str) -> str:
+    return (netloc or "").strip().lower().rstrip(".")
 
 
 def encode_jpeg(rgb, quality: int = 70) -> bytes:
@@ -77,6 +107,7 @@ class Hub:
         self.version = 0
         self.state_json = "{}"
         self.running = True
+        self._last_err = -1e9
         self.camera_lock = threading.Lock()
         self.camera_viewers = 0
         self._thread = threading.Thread(target=self._loop, daemon=True, name="web-tick")
@@ -98,6 +129,13 @@ class Hub:
                 js = json.dumps(st, default=_json_default)
             except Exception as e:                           # keep ticking: the lease watchdog lives here
                 js = json.dumps({"error": f"{type(e).__name__}: {e}"})
+                now = time.monotonic()
+                if now - self._last_err > ERR_EVERY_S:
+                    self._last_err = now
+                    try:
+                        self.service.core.bridge.log(f"web: state update failed: {type(e).__name__}: {e}")
+                    except Exception:
+                        pass
             with self.cond:
                 self.state_json = js
                 self.version += 1
@@ -124,7 +162,7 @@ def _json_default(o):
     return str(o)
 
 
-def make_handler(hub: Hub):
+def make_handler(hub: Hub, allow_hosts=()):
     service = hub.service
 
     class Handler(BaseHTTPRequestHandler):
@@ -173,6 +211,22 @@ def make_handler(hub: Hub):
             port = o.port or {"http": 80, "https": 443}.get(o.scheme)
             return o.scheme == "http" and ours(o.hostname) and port == self.server.server_address[1]
 
+        def _host_ok(self) -> bool:
+            """Refuse a Host we are not known by (DNS rebinding) and, on POST, a page from another origin."""
+            if not host_allowed(self.headers.get("Host"), allow_hosts):
+                self._json(403, {"ok": False, "msg": "unknown Host header (use the server's IP or name; "
+                                                     "for a custom DNS name start with --allow-host NAME)"})
+                return False
+            origin = self.headers.get("Origin")
+            if self.command == "POST" and origin is not None and origin != "null":
+                if host_port(urlparse(origin).netloc) != host_port(self.headers.get("Host")):
+                    self._json(403, {"ok": False, "msg": "cross-origin request refused"})
+                    return False
+            elif self.command == "POST" and origin == "null":
+                self._json(403, {"ok": False, "msg": "cross-origin request refused"})
+                return False
+            return True
+
         def _json(self, code: int, obj):
             body = json.dumps(obj, default=_json_default).encode()
             self.send_response(code)
@@ -186,7 +240,12 @@ def make_handler(hub: Hub):
             # JSON only: a cross-site HTML form cannot send it without a CORS preflight, which is never granted.
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 raise CommandError("Content-Type must be application/json")
-            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0:
+                raise ValueError("bad Content-Length")
             if n > MAX_BODY:
                 raise CommandError("request too large")
             data = json.loads(self.rfile.read(n) or b"{}")
@@ -198,6 +257,8 @@ def make_handler(hub: Hub):
         def do_GET(self):
             url = urlparse(self.path)
             path = url.path
+            if not self._host_ok():
+                return
             try:
                 if path in ("/", "/index.html"):
                     return self._static("index.html")
@@ -228,6 +289,9 @@ def make_handler(hub: Hub):
                              ("; charset=utf-8" if p.suffix in (".html", ".js", ".css") else ""))
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-cache")
+            if p.suffix in (".html", ".htm"):
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
 
@@ -262,9 +326,9 @@ def make_handler(hub: Hub):
                     hub.cond.wait_for(lambda: hub.version != seen_version or not hub.running, timeout=5.0)
                     seen_version, js = hub.version, hub.state_json
                 out = [f"event: state\ndata: {js}\n\n"]
-                logs = [line for seq, line in list(service.logs) if seq > log_seq]
+                logs = [[seq, line] for seq, line in list(service.logs) if seq > log_seq]
                 if logs:
-                    log_seq = service.logs[-1][0]
+                    log_seq = logs[-1][0]                      # the page dedupes by these sequence numbers
                     out.append(f"event: log\ndata: {json.dumps(logs)}\n\n")
                 for r in [r for r in list(service.results) if r["id"] > res_id]:
                     res_id = r["id"]
@@ -310,15 +374,17 @@ def make_handler(hub: Hub):
         # -------------------------------------------------------------- POST
         def do_POST(self):
             path = urlparse(self.path).path
+            if not self._host_ok():
+                return
             try:
                 body = self._body()
-                client = str(body.get("client") or "")
+                client = str(body.get("token") or body.get("client") or "")        # the lease secret; STOP and /api/lease need none
                 if path == "/api/stop":
                     return self._json(200, service.stop(self._who()))
                 if path == "/api/lease":
                     op = " ".join(str(body.get("name") or "").split())[:24]   # operator name typed in the browser
                     return self._json(200, {"ok": True, "lease": service.take_lease(
-                        client, f"{op} @ {self._who()}" if op else self._who())})
+                        "", f"{op} @ {self._who()}" if op else self._who(), presented=client)})
                 if path == "/api/heartbeat":
                     return self._json(200, {"ok": True, "holds": service.heartbeat(client)})
                 if path == "/api/release":
@@ -341,10 +407,22 @@ def make_handler(hub: Hub):
     return Handler
 
 
+def check_bind_host(host: str):
+    """Never listen on every interface: this server can move a robot."""
+    try:
+        unspecified = ipaddress.ip_address(host.strip("[]")).is_unspecified
+    except ValueError:
+        unspecified = host == ""
+    if unspecified:
+        raise ValueError(f"refusing to listen on {host or '(all)'}: that exposes the robot to every network. "
+                         "Use 127.0.0.1 with `tailscale serve`, or this PC's Tailscale IP.")
+
+
 class Server:
-    def __init__(self, service: WebService, host: str = "127.0.0.1", port: int = 8180):
+    def __init__(self, service: WebService, host: str = "127.0.0.1", port: int = 8180, allow_hosts=()):
+        check_bind_host(host)
         self.hub = Hub(service)
-        self.httpd = ThreadingHTTPServer((host, port), make_handler(self.hub))
+        self.httpd = ThreadingHTTPServer((host, port), make_handler(self.hub, tuple(allow_hosts)))
         self.httpd.daemon_threads = True
 
     @property
@@ -379,8 +457,14 @@ def main(argv=None):
     ap.add_argument("--urdf", help="--fake only: a URDF file for the 3D view")
     ap.add_argument("--host", default="127.0.0.1",
                     help="127.0.0.1 + `tailscale serve` (recommended), or this PC's Tailscale IP")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="also accept this DNS name in the Host header (repeatable), e.g. robot.lab.example.org")
     ap.add_argument("--port", type=int, default=8180)   # 8080 code-server, 8090 a tunnel client on the lab PC
     args = ap.parse_args(argv)
+    try:
+        check_bind_host(args.host)
+    except ValueError as e:
+        ap.error(str(e))
     profiles_dir, programs_dir, policies_dir = prepare_dirs(args, root)
     profile = RobotProfile.load(resolve_profile(args.profile, profiles_dir))
     if args.fake:
@@ -392,7 +476,7 @@ def main(argv=None):
         from ..ros_bridge import RosBridge
         bridge = RosBridge(profile)
     core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake)
-    server = Server(WebService(core), args.host, args.port)
+    server = Server(WebService(core), args.host, args.port, args.allow_host)
     print(f"MoveIt GUI web: http://{args.host}:{server.port}/  ({profile.display_name}"
           f"{', FAKE robot' if args.fake else ''})", flush=True)
     stop = threading.Event()

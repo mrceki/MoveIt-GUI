@@ -132,9 +132,10 @@ def test_server_counts_only_a_same_pc_page_without_proxy_headers_as_local(http):
     ]
     for h in refused:
         code, r = post(base + "/api/cmd", body, h)
-        assert code == 409 and "robot PC" in r["msg"], h
+        # 409: refused as not-local; 403: the server's own Host/Origin check refused it even earlier
+        assert code in (409, 403) and (code == 403 or "robot PC" in r["msg"]), h
     assert dash(s) == []
-    code, r = post(base + "/api/cmd", body, {"Origin": f"http://localhost:{port}"})
+    code, r = post(base + "/api/cmd", body, {"Origin": f"http://localhost:{port}", "Host": f"localhost:{port}"})
     assert code == 200 and r["ok"], r
     assert wait(lambda: dash(s) == ["power_on"])
     with urllib.request.urlopen(base + "/api/info", timeout=5) as r:

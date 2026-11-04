@@ -30,17 +30,23 @@ const PROBLEM = /FAILED|refused|error|cannot|STOP|lost|fault/i;
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 
 // ------------------------------------------------------------------ session
-const CLIENT = sessionStorage.getItem("client") ||
-  (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
-sessionStorage.setItem("client", CLIENT);
-let INFO = null, S = null, holds = false, connected = false;
+// The lease token is a secret the server hands out on "Take control". A reload keeps control (pagehide stores it,
+// the next load takes it out again); a duplicated tab copies sessionStorage but finds nothing, because we remove
+// the token as soon as we have read it.
+let TOKEN = null, MYID = null;
+try {
+  const saved = JSON.parse(sessionStorage.getItem("lease") || "null");
+  if (saved && saved.token) ({ token: TOKEN, id: MYID } = saved);
+  sessionStorage.removeItem("lease");
+} catch (e) { /* no sessionStorage: no reload-keeps-control */ }
+let INFO = null, S = null, holds = false, connected = false, netBad = false, srvError = "";
 const logs = [];
 
 async function post(path, body = {}, silent = false) {
   let r, data;
   try {
     r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ client: CLIENT, ...body }) });
+                            body: JSON.stringify({ token: TOKEN, ...body }) });
     data = await r.json();
   } catch (e) {
     data = { ok: false, msg: `no answer from the robot PC (${e.message})` };
@@ -100,6 +106,7 @@ function operatorName(ask) {
 }
 let leaseAt = 0;
 function lostControl(why) {
+  TOKEN = MYID = null;
   if (!holds) return;
   holds = false;
   toast(`You lost control of the robot: ${why}. Take control again to operate.`, false, true);
@@ -108,21 +115,39 @@ function lostControl(why) {
 async function takeLease() {
   const r = await post("/api/lease", { name: operatorName(false) });
   holds = !!r.ok;
+  if (holds) { TOKEN = r.lease.token; MYID = r.lease.client; hbFailsSince = 0; }
   if (holds) document.querySelectorAll(".toast").forEach((x) => /lost control/.test(x.dataset.msg) && x.remove());
   leaseAt = Date.now();
   render();
 }
-async function releaseLease() { await post("/api/release"); holds = false; render(); }
-setInterval(async () => {
-  if (!holds) return;
-  const r = await post("/api/heartbeat");
-  if (!r.holds) lostControl(S && S.lease && S.lease.client && S.lease.client !== CLIENT ? `${S.lease.name} took over`
-    : "the robot PC stopped hearing from this browser");
-}, 1000);
+async function releaseLease() { await post("/api/release"); holds = false; TOKEN = MYID = null; render(); }
+// Heartbeat: every 500 ms, never two at once, with a timeout. Control is lost ONLY when the server answers
+// holds:false. A failed or slow request is a connection problem (banner, keeps trying), not a lost lease: the server
+// decides after LEASE_TIMEOUT_S, and any answer that arrives in time keeps it.
+let hbBusy = false, hbFailsSince = 0;
+async function heartbeat() {
+  if (hbBusy || !TOKEN) return;
+  hbBusy = true;
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), 2000);
+  try {
+    const r = await fetch("/api/heartbeat", { method: "POST", headers: { "Content-Type": "application/json" },
+                                              body: JSON.stringify({ token: TOKEN }), signal: ac.signal });
+    const d = await r.json();
+    hbFailsSince = 0;
+    if (netBad) { netBad = false; render(); }
+    if (d.holds) { if (!holds) { holds = true; render(); } }
+    else lostControl(S && S.lease && S.lease.client && S.lease.client !== MYID ? `${S.lease.name} took over`
+      : "the robot PC stopped hearing from this browser (see the log there)");
+  } catch (e) {
+    hbFailsSince = hbFailsSince || Date.now();
+    if (!netBad && Date.now() - hbFailsSince > 800) { netBad = true; render(); }
+  } finally { clearTimeout(timer); hbBusy = false; }
+}
+setInterval(heartbeat, 500);
 window.addEventListener("pagehide", () => {
-  if (holds) navigator.sendBeacon("/api/release",
-    new Blob([JSON.stringify({ client: CLIENT })], { type: "application/json" }));
+  if (TOKEN) try { sessionStorage.setItem("lease", JSON.stringify({ token: TOKEN, id: MYID })); } catch (e) { /* ignore */ }
 });
+window.addEventListener("pageshow", (e) => { if (e.persisted) try { sessionStorage.removeItem("lease"); } catch (x) { /* ignore */ } });
 
 // ------------------------------------------------------------------- pages
 const pages = {};
@@ -2829,7 +2854,7 @@ function renderHeader(s) {
   // lease
   const L = s.lease;
   // (states sent just before our own takeover still name the old holder: ignore them for 2 s)
-  if (L.client && L.client !== CLIENT && holds && Date.now() - leaseAt > 2000) lostControl(`${L.name} took over`);
+  if (L.client && L.client !== MYID && holds && Date.now() - leaseAt > 2000) lostControl(`${L.name} took over`);
   $("#lease-who").textContent = holds ? `Control: you (${L.name.split(" @ ")[0]})` : L.client ? `Viewing · ${L.name} has control` : "Viewing";
   $("#lease-who").title = "Click to change your name";
   $("#lease-who").onclick = () => { operatorName(true); if (holds) takeLease(); };
@@ -2852,8 +2877,10 @@ function renderHeader(s) {
     ? `The robot is inside keep-out zone ${s.keepout.inside.join(", ")}: MoveIt will refuse every plan. ` +
       "Jog or freedrive out of it, or untick the box in SETUP." : "";
   const warn = actBanner || inside;
-  banner.className = !connected || s.unknown ? "on" : warn ? "on warn" : "";
+  banner.className = !connected || s.unknown || srvError || netBad ? "on" : warn ? "on warn" : "";
   banner.textContent = !connected ? "Connection to the robot PC lost. Reconnecting… (the robot stops if this browser had control)"
+    : netBad ? "Connection problem: the robot PC answers slowly or not at all. Still trying; if it lasts the robot stops and control is released."
+    : srvError ? `The robot PC reports an error: ${srvError} (showing the last good state)`
     : s.unknown ? "CONTROL STATE UNKNOWN: GUI motion is disabled. " + (s.unknown_reason || "") : warn;
   document.body.classList.toggle("stale", !connected);
 }
@@ -2886,19 +2913,26 @@ async function boot() {
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") post("/api/stop"); });
 
   const es = new EventSource("/api/events");
-  let boot = null;
+  let boot = null, logSeq = 0;
   es.addEventListener("state", (e) => {
-    connected = true; S = JSON.parse(e.data); if (S.error) return;
+    connected = true;
+    const next = JSON.parse(e.data);
+    if (next.error) { srvError = String(next.error); if (S) render(); return; }   // keep the last good state
+    srvError = ""; S = next;
     if (S.boot && boot && S.boot !== boot && !$("#reload-bar")) {     // the GUI restarted: this page is old code
       document.body.prepend(h("div", { id: "reload-bar", class: "reload-bar" },
         "The GUI was restarted (maybe updated). This page still runs the old version. ",
         h("button", { class: "btn primary", onclick: () => location.reload() }, "Reload page")));
     }
+    if (S.boot && boot && S.boot !== boot) logSeq = 0;               // sequence numbers restart with the server
     boot = boot || S.boot;
     render();
   });
   es.addEventListener("log", (e) => {
-    const lines = JSON.parse(e.data);
+    const fresh = JSON.parse(e.data).filter(([seq]) => seq > logSeq);   // a reconnect resends the last 200 lines
+    if (!fresh.length) return;
+    logSeq = fresh[fresh.length - 1][0];
+    const lines = fresh.map(([, line]) => line);
     logs.push(...lines);
     if (logs.length > 3000) logs.splice(0, logs.length - 3000);
     const last = lines[lines.length - 1];

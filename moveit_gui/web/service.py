@@ -12,9 +12,11 @@ Long actions run as jobs in a worker thread; their outcome comes back as a "resu
 """
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import math
+import secrets
 import threading
 import time
 from collections import deque
@@ -26,6 +28,7 @@ import numpy as np
 import yaml
 
 from .. import transforms as tf
+from ..bridge_api import wrench_fresh
 from ..calibration import CalibrationError, FixtureDef, TcpDef, config_dir
 from ..core import RobotCore
 from ..ft_payload import PayloadCalibration, PayloadCalibrationError
@@ -44,6 +47,7 @@ from ..vials import VialLibrary, VialProfileError
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
 LEASE_TIMEOUT_S = 2.5
+LOG_EVERY_S = 30.0          # rate limit for repeated watchdog / tick errors
 VIAL_POINTS = ("Rim 1", "Rim 2", "Rim 3", "Bottom")
 KEEPOUT_TCP_CLEARANCE_MM = 5.0      # "Under TCP": the box top stays this far below the touching TCP
 
@@ -74,16 +78,24 @@ def _choice(*allowed):
 
 
 class Lease:
+    """Who controls the robot. `token` is the secret the holder's page sends with every request (returned only by
+    take_lease, never broadcast); `id` is public and only lets the holder's page recognise itself in the state."""
+
     def __init__(self):
-        self.client: Optional[str] = None
+        self.token: Optional[str] = None
+        self.id: Optional[str] = None
         self.name = ""
         self.seen = 0.0
 
-    def holds(self, client: Optional[str]) -> bool:
-        return bool(client) and client == self.client
+    @property
+    def client(self) -> Optional[str]:               # truthy while somebody holds the lease
+        return self.token
+
+    def holds(self, token: Optional[str]) -> bool:
+        return bool(token) and bool(self.token) and secrets.compare_digest(str(token), self.token)
 
     def view(self) -> dict:
-        return {"client": self.client, "name": self.name}
+        return {"client": self.id, "name": self.name}
 
 
 class WebService:
@@ -91,7 +103,10 @@ class WebService:
         self.core = core
         self.clock = clock
         self.lease = Lease()
+        self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
         self._lock = threading.RLock()
+        self._edit_lock = threading.RLock()               # program edits + undo/redo: snapshot, handler, compare
+        self._last_err: Dict[str, float] = {}
         self._jobs = ThreadPoolExecutor(max_workers=4, thread_name_prefix="web-job")
         self._job_ids = itertools.count(1)
         self.results: deque = deque(maxlen=50)            # {id, cmd, ok, msg, t}
@@ -122,53 +137,92 @@ class WebService:
             self.payload_progress["error"] = str(e)
 
     # ================================================================= polling
+    def _log_error(self, what: str, e: BaseException):
+        """Log a watchdog / tick failure, at most once per LOG_EVERY_S per kind (tick runs at 10 Hz)."""
+        now = time.monotonic()
+        if now - self._last_err.get(what, -1e9) >= LOG_EVERY_S:
+            self._last_err[what] = now
+            self.core.bridge.log(f"web: {what} failed: {type(e).__name__}: {e}")
+
     def tick(self):
-        """Call at ~10 Hz from one thread: refresh the core, collect logs, enforce the lease."""
-        self.core.update()
-        with self._lock:
-            h = self._hold
-            if h is not None and self.clock() - h["seen"] > HOLD_TIMEOUT_S:
-                self._hold = None
-                self.core.stop_all()
-                self.core.bridge.log(f"web: {h['label']} stopped: hold-to-run button released")
+        """Call at ~10 Hz from one thread: enforce the watchdogs, refresh the core, collect logs.
+        The watchdogs come first and each has its own try: a failing core.update() must never disable them."""
+        for name, fn in (("hold-to-run watchdog", self._check_hold), ("lease watchdog", self._check_lease)):
+            try:
+                fn()
+            except Exception as e:
+                self._log_error(name, e)
+        try:
+            self.core.update()
+        except Exception as e:
+            self._log_error("core.update", e)
         for line in self.core.bridge.drain_logs():
             self.logs.append((next(self._log_seq), line))
+
+    def _check_hold(self):
         with self._lock:
-            if self.lease.client and self.clock() - self.lease.seen > LEASE_TIMEOUT_S:
-                who = self.lease.name or self.lease.client
-                active = not self.core.idle() or self.core.last_snap.freedrive or self.payload_progress["running"]
-                self.lease = Lease()
-                if active:
-                    self.core.stop_all()
-                    if self.payload:
-                        self.payload.cancel()
-                    if self.core.last_snap.freedrive:
-                        self._submit("freedrive", lambda: self.core.freedrive(False))
-                    self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {LEASE_TIMEOUT_S:.1f} s): "
-                                         "STOPPED")
-                else:
-                    self.core.bridge.log(f"web: lost contact with {who} (no heartbeat): control released")
+            h = self._hold
+            expired = h is not None and self.clock() - h["seen"] > HOLD_TIMEOUT_S
+            if expired:
+                self._hold = None
+        if expired:                                       # act outside the lock
+            self.core.stop_all()
+            self.core.bridge.log(f"web: {h['label']} stopped: hold-to-run button released")
+
+    def _check_lease(self):
+        with self._lease_lock:
+            lease = self.lease
+            silent = self.clock() - lease.seen
+            if not (lease.token and silent > LEASE_TIMEOUT_S):
+                return
+            self.lease = Lease()
+        who = lease.name or lease.id
+        try:
+            active = not self.core.idle() or self.core.last_snap.freedrive or self.payload_progress["running"]
+        except Exception:
+            active = True                                 # cannot tell: be safe
+        if not active:
+            self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
+                                 f"{LEASE_TIMEOUT_S:.1f} s): control released")
+            return
+        self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
+                             f"{LEASE_TIMEOUT_S:.1f} s): STOPPING")
+        for what, fn in (("stop_all", self.core.stop_all),
+                         ("payload cancel", lambda: self.payload and self.payload.cancel()),
+                         ("freedrive off", lambda: self.core.last_snap.freedrive and
+                          self._submit("freedrive", lambda: self.core.freedrive(False)))):
+            try:
+                fn()
+            except Exception as e:
+                self._log_error(f"lease stop ({what})", e)
 
     # =================================================================== lease
-    def take_lease(self, client: str, name: str = "") -> dict:
-        with self._lock:
-            if self.lease.client and not self.lease.holds(client):
+    def take_lease(self, client: str = "", name: str = "", presented: str = "") -> dict:
+        """Returns {client: public id, name, token: secret}. The token is shown only here; keep it out of logs.
+        client: the token to install (in-process callers and tests); empty = a random one, which is what the HTTP
+        layer always uses. presented: the token the caller already holds, so the holder may take again."""
+        with self._lease_lock:
+            cur = self.lease
+            if cur.token and not (cur.holds(client) or cur.holds(presented)):
                 if not self.core.idle() or self.core.last_snap.freedrive:
-                    raise CommandError(f"{self.lease.name or 'another browser'} is controlling a moving robot")
-                self.core.bridge.log(f"web: {name or client[:8]} took over control from {self.lease.name or self.lease.client}")
-            self.lease.client, self.lease.name, self.lease.seen = client, name or client[:8], self.clock()
-            return self.lease.view()
+                    raise CommandError(f"{cur.name or 'another browser'} is controlling a moving robot")
+                self.core.bridge.log(f"web: {name or 'a browser'} took over control from {cur.name or cur.id}")
+            lease = Lease()
+            lease.token, lease.id = client or secrets.token_urlsafe(24), secrets.token_urlsafe(6)
+            lease.name, lease.seen = name or "browser", self.clock()
+            self.lease = lease
+            return {**lease.view(), "token": lease.token}
 
-    def heartbeat(self, client: str) -> bool:
-        with self._lock:
-            if self.lease.holds(client):
+    def heartbeat(self, token: str) -> bool:
+        with self._lease_lock:
+            if self.lease.holds(token):
                 self.lease.seen = self.clock()
                 return True
             return False
 
-    def release(self, client: str):
-        with self._lock:
-            if self.lease.holds(client):
+    def release(self, token: str):
+        with self._lease_lock:
+            if self.lease.holds(token):
                 self.lease = Lease()
 
     def stop(self, who: str = "") -> dict:
@@ -188,30 +242,31 @@ class WebService:
         if getattr(handler, "local_only", False) and not local:
             raise CommandError("only from a browser on the robot PC, where you can see the robot "
                                "(or on the teach pendant)")
-        if not getattr(handler, "read_only", False) and not self.lease.holds(client):
+        read_only = getattr(handler, "read_only", False)
+        holds = self.heartbeat(client)                    # any request with the valid token is also a heartbeat
+        if not read_only and not holds:
             raise CommandError("take control first: another browser or nobody holds the control lease")
-        if not getattr(handler, "read_only", False):
-            self.heartbeat(client)
         args = dict(args or {})
         rev = args.pop("rev", None)
-        if cmd.startswith("program_") and rev is not None and not getattr(handler, "read_only", False) \
-                and int(rev) != self.program_rev:
-            raise CommandError("the program was changed (another browser or an undo): it has been reloaded, "
-                               "check your selection and try again")
-        before = self._snapshot() if cmd in PROGRAM_EDITS or cmd in ("program_undo", "program_redo") else None
-        try:
-            out = handler(**args)
-        except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                GainsError, FtBiasError) as e:
-            raise CommandError(str(e)) from None
-        if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
-            self.program_rev += 1
-            if cmd in PROGRAM_EDITS:
-                self._undo.append(before)
-                del self._undo[:-UNDO_DEPTH]
-                self._redo.clear()
-            if isinstance(out, dict) and "program" in out:
-                out["program"].update(self._history_view(), rev=self.program_rev)
+        edits = cmd in PROGRAM_EDITS or cmd in ("program_undo", "program_redo")
+        with (self._edit_lock if edits else contextlib.nullcontext()):    # snapshot, handler, compare: one at a time
+            if cmd.startswith("program_") and rev is not None and not read_only and int(rev) != self.program_rev:
+                raise CommandError("the program was changed (another browser or an undo): it has been reloaded, "
+                                   "check your selection and try again")
+            before = self._snapshot() if edits else None
+            try:
+                out = handler(**args)
+            except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
+                    GainsError, FtBiasError) as e:
+                raise CommandError(str(e)) from None
+            if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
+                self.program_rev += 1
+                if cmd in PROGRAM_EDITS:
+                    self._undo.append(before)
+                    del self._undo[:-UNDO_DEPTH]
+                    self._redo.clear()
+                if isinstance(out, dict) and "program" in out:
+                    out["program"].update(self._history_view(), rev=self.program_rev)
         return out
 
     def _submit(self, cmd: str, fn: Callable[[], tuple]) -> dict:
@@ -1362,7 +1417,8 @@ class WebService:
             s = c.bridge.snapshot()
             qd = s.joint_velocities
             still = qd is None or max((abs(v) for v in qd), default=0.0) <= still_v
-            return (list(s.wrench) if s.wrench else None), still and not s.freedrive
+            w = wrench_fresh(s)                      # a frozen sensor must not become the bias
+            return (list(w) if w else None), still and not s.freedrive
         return self._submit("zero F/T", lambda: b.zero(
             sample, stopped=lambda: getattr(c.bridge, "stop_epoch", 0) != epoch, plain=bool(plain)))
 
