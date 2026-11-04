@@ -410,8 +410,10 @@ class WebService(WorkcellCommands):
         q = self.core.last_snap.joints
         if not q:
             raise CommandError("no joint state: the preview starts from where the robot is")
+        walls = {n: (float(fx.meta["radius_m"]), float(fx.meta["height_m"]) if fx.meta.get("height_m") else None)
+                 for n, fx in self.core.store.fixtures.items() if fx.meta.get("radius_m")}   # vials of known size
         out = simulate(self.program, self.core.profile, self.core.geo, m, list(q), self.core.store.active_tcp,
-                       assume_missing=bool(assume_missing))
+                       assume_missing=bool(assume_missing), vials=walls)
         return self._ok(out.get("note") or f"{len(out['points']) - 1} moves", **out)
     cmd_program_preview_path.read_only = True
 
@@ -1627,6 +1629,10 @@ class WebService(WorkcellCommands):
             raise CommandError(f"no example '{name}' in this profile")
         T = tf.mm_deg_to_T(list(e.get("xyz_mm", [0, 0, 0])), list(e.get("rpy_deg", [0, 0, 0])))
         meta = {"source": f"example: {e.get('source', 'profile')}"}
+        if e.get("radius_mm"):
+            meta["radius_m"] = float(e["radius_mm"]) / 1000.0
+        if e.get("height_mm"):
+            meta["height_m"] = float(e["height_mm"]) / 1000.0
         store = self.core.store
         store.put_fixture(FixtureDef(name, e.get("parent", self.core.profile.base_link), T, meta),
                           replace=name in store.fixtures)

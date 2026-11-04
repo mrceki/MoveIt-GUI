@@ -6,7 +6,10 @@ would (loops repeated, folders inlined) and returns the TCP positions in the bas
 
 Kinematics only: forward kinematics from the URDF for joint targets, the planned end pose for everything else.
 It does not plan (a MoveJ draws a straight line between its ends, not the joint-space arc), and contact, forces
-and failed moves are not simulated: Move until contact is drawn to its full distance.
+and failed moves are not simulated. Move until contact stops where it meets the wall or the floor of a vial of
+known size (a fixture with a radius: taught by touch, from a vial profile, the example vial; or the profile's
+example vial while it is assumed); anywhere
+else it is drawn to its full distance.
 """
 from __future__ import annotations
 
@@ -113,6 +116,24 @@ def _assume_missing(program: Program, geometry, T_tcp: np.ndarray, examples: Opt
     return extra
 
 
+def _contact_t(p: np.ndarray, d: np.ndarray, radius: float, height: Optional[float]) -> Optional[float]:
+    """Distance along the unit direction d (vial frame) from p to the vial's inside (wall or floor), or None if p is
+    not inside the vial or the ray leaves through the open top first."""
+    r0 = math.hypot(p[0], p[1])
+    if r0 >= radius or p[2] < 0.0 or (height is not None and p[2] > height + 0.01):
+        return None
+    hits = []
+    a = d[0] ** 2 + d[1] ** 2
+    if a > 1e-12:                                      # |p_xy + t d_xy| = radius, the positive root
+        b = p[0] * d[0] + p[1] * d[1]
+        t = (-b + math.sqrt(b * b - a * (r0 * r0 - radius * radius))) / a
+        if height is None or p[2] + t * d[2] <= height + 0.01:
+            hits.append(t)
+    if d[2] < -1e-9:                                   # the floor (z = 0)
+        hits.append(-p[2] / d[2])
+    return min(hits) if hits else None
+
+
 def _tcp_to_tcp(geometry, a: str, b: str) -> np.ndarray:
     """T_a_b between two TCPs on the same rigid tool (through the planning link)."""
     try:
@@ -127,9 +148,12 @@ def _pose7(T) -> List[float]:
 
 
 def simulate(program: Program, profile, geometry, model: dict, joints: List[float], tcp: str,
-             max_points: int = MAX_POINTS, assume_missing: bool = False) -> dict:
+             max_points: int = MAX_POINTS, assume_missing: bool = False,
+             vials: Optional[Dict[str, tuple]] = None) -> dict:
     """{points: [[x, y, z] mm in base], poses: [[x, y, z mm, qx, qy, qz, qw]], joints: [q rad | None] (known for
-    MoveJ targets), steps: [path label per point], what: [step title + summary], loops: [[[loop label, iteration, times]]], assumed: {frame: [x, y, z] mm}, note} from the current joints."""
+    MoveJ targets), steps: [path label per point], what: [step title + summary], loops: [[[loop label, iteration, times]]], assumed: {frame: [x, y, z] mm}, note} from the current joints.
+    vials: {fixture: (radius_m, height_m | None)}, where a Move until contact meets a wall (the example vial's
+    size is added while it is assumed)."""
     names = list(profile.joint_names)
     link, _, T_link_tcp = geometry.tcp_anchor(tcp)
     base = profile.base_link
@@ -147,8 +171,18 @@ def simulate(program: Program, profile, geometry, model: dict, joints: List[floa
         examples = set(getattr(profile, "example_fixtures", None) or {}) & set(extra)
         if extra:
             geometry = _AssumedFrames(geometry, extra)
+            vials = dict(vials or {})
+            for f in examples:
+                e = profile.example_fixtures[f]
+                if e.get("radius_mm") and f not in vials:
+                    vials[f] = (float(e["radius_mm"]) / 1000.0,
+                                float(e["height_mm"]) / 1000.0 if e.get("height_mm") else None)
             assumed = {f: [round(float(v) * 1000.0, 1) for v in E[:3, 3]] for f, E in extra.items()}
     pts, labels, note = [T[:3, 3].tolist()], [""], ""
+    hit = None
+
+    def vf_txt(h):
+        return f"{h[1]} wall / floor after {h[0] * 1000.0:.1f} mm"
     poses, qs, linear = [_pose7(T)], [list(joints)], [False]
     what, loops = ["start: where the robot is now"], [[]]     # per point, for stepping through the preview
     for path, st, iters in unroll_iters(program.steps):
@@ -181,13 +215,25 @@ def simulate(program: Program, profile, geometry, model: dict, joints: List[floa
                     out[:3, 3] = Tr[:3, 3] + d
                     out[:3, :3] = R_off @ Tr[:3, :3]
                 T2 = ref @ out
-            else:                              # move_until_contact: drawn to its full distance
+            else:                              # move_until_contact: to a known vial's wall, else its full distance
                 frame = p.get("frame", "tool")
                 dvec = np.asarray([float(x) for x in p.get("direction", [0, 0, 1])], float)
-                dvec = dvec / (np.linalg.norm(dvec) or 1.0) * float(p.get("distance_mm", 0)) / 1000.0
+                dvec = dvec / (np.linalg.norm(dvec) or 1.0)
                 ref = np.eye(4) if frame in ("tool", "base") else geometry.T_base_frame(frame)
+                u = T[:3, :3] @ dvec if frame == "tool" else ref[:3, :3] @ dvec          # unit, base frame
+                dist = float(p.get("distance_mm", 0)) / 1000.0
+                hit = None
+                for vf, (rad, hgt) in (vials or {}).items():
+                    try:
+                        Tv = geometry.T_base_frame(vf)
+                    except Exception:
+                        continue
+                    pv = (tf.inv(Tv) @ np.r_[T[:3, 3], 1.0])[:3]
+                    t = _contact_t(pv, Tv[:3, :3].T @ u, float(rad), hgt)
+                    if t is not None and t <= dist and (hit is None or t < hit[0]):
+                        hit = (t, vf)
                 T2 = T.copy()
-                T2[:3, 3] = T[:3, 3] + (T[:3, :3] @ dvec if frame == "tool" else ref[:3, :3] @ dvec)
+                T2[:3, 3] = T[:3, 3] + u * (hit[0] if hit else dist)
         except Exception as e:                 # an unknown frame or waypoint: the program check says so
             note = f"preview stops at step {path_label(path)}: {e}"
             break
@@ -202,7 +248,10 @@ def simulate(program: Program, profile, geometry, model: dict, joints: List[floa
         linear.append(st.type in ("move_relative", "move_until_contact") or
                       (st.type == "move_pose" and bool(p.get("cartesian", False))))
         labels.append(path_label(path))
-        what.append(f"{st.title}  {st.summary()}".strip())
+        extra_what = ""
+        if st.type == "move_until_contact":
+            extra_what = (f"  (contact: {vf_txt(hit)})" if hit else "  (no known wall: drawn to its full distance)")
+        what.append(f"{st.title}  {st.summary()}{extra_what}".strip())
         loops.append([[path_label(lp), k, n] for lp, k, n in iters])
         if len(pts) >= max_points:
             note = f"preview shows the first {max_points} moves"

@@ -261,3 +261,38 @@ def test_an_untaught_vial_is_one_clear_preflight_line(s):
     assert "Vial profiles" in probs[0]
     assert cmd(s, "vial_use_example")["ok"]
     assert s.program.validate(s.core.profile, s.core.geo, live=True, bridge=s.core.bridge) == []
+
+
+def test_the_preview_stops_a_contact_search_at_a_known_vial_wall(s):
+    """Move until contact is drawn to the wall of a vial of known size, not its full distance (no spiral)."""
+    s.core.bridge.fake_robot_description = _chain_urdf(s.core.profile.joint_names)
+    s.core.bridge._q = [0.0] * 6
+    s.tick()
+    d = {"version": 2, "name": "t", "waypoints": {"in": {"pose": {
+            "frame": "vial", "tcp": "active", "position": [-0.014, 0.0, 0.03], "quat_xyzw": [1, 0, 0, 0]}}},
+         "steps": [{"type": "move_pose", "target": "in", "cartesian": True},
+                   {"type": "loop", "times": 3, "steps": [
+                       {"type": "move_until_contact", "direction": [-1, 0, 0], "frame": "vial", "distance_mm": 8,
+                        "force_n": 2},
+                       {"type": "move_relative", "offset_mm": [3, 0, 0], "frame": "vial"},
+                       {"type": "move_relative", "offset_mm": [0, 0, 0], "rotate_deg": [0, 0, 10], "frame": "vial",
+                        "pivot": "frame"}]},
+                   {"type": "move_until_contact", "direction": [0, 0, -1], "frame": "vial", "distance_mm": 50,
+                    "force_n": 2}]}
+    cmd(s, "program_set_yaml", text=yaml.safe_dump(d))
+
+    def radii(r, vial_xyz):
+        P = np.asarray(r["points"]) - vial_xyz
+        return [round(float(np.hypot(*P[k][:2])), 1) for k, w in enumerate(r["what"]) if "Move until contact" in w], P
+
+    ex = np.asarray(s.core.profile.example_fixtures["vial"]["xyz_mm"])
+    r = cmd(s, "program_preview_path")                                   # example vial (17 mm) while assumed
+    rs, P = radii(r, ex)
+    assert rs[:3] == [17.0, 17.0, 17.0] and "contact: vial wall" in r["what"][2]
+    assert P[-1][2] == pytest.approx(0.0, abs=0.01)                      # the downward search stops on the floor
+    s.core.store.put_fixture(FixtureDef("vial", "base_link", tf.mm_deg_to_T(list(ex), [0, 0, 0])))
+    r = cmd(s, "program_preview_path")                                   # taught without a size: full distance
+    rs = radii(r, ex)[0][:3]
+    assert rs[0] == 22.0 and rs[0] < rs[1] < rs[2] and "no known wall" in r["what"][2]   # 8 mm out, 3 back: grows
+    cmd(s, "vial_profile_save", name="wide", xyz_mm=list(ex), radius_mm=20, height_mm=40, source="typed", use=True)
+    assert radii(cmd(s, "program_preview_path"), ex)[0][:3] == [20.0, 20.0, 20.0]
