@@ -5,6 +5,8 @@
 #   3. starts the robot stack (gui.launch.py) in the container
 #   4. starts the GUI. Ctrl-C stops the GUI and the robot stack
 #      gracefully (GUI: SIGINT, 10 s grace; stack: SIGINT, 30 s grace; nothing is SIGKILLed unless it hangs).
+#   The GUI can ask for a restart (SETUP > Parts / Setups): exit code 76 restarts the GUI, 75 the robot stack too.
+#   Parts made in the GUI (~/ur7e_data/config/moveit_gui/parts/generated) go into the robot model at stack start.
 #
 #   ur7e_gui.sh                         # real robot, web GUI on http://<tailscale ip>:8180/
 #   ur7e_gui.sh --desktop               # real robot, desktop (Qt) GUI on this PC
@@ -65,6 +67,15 @@ docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$WS:/
   > "$DATA/logs/ws_build.log" 2>&1 || { tail -30 "$DATA/logs/ws_build.log"; exit 1; }
 
 # ---------------------------------------------------------------- 3. robot stack
+PARTS=/data/config/moveit_gui/parts/generated      # in the container; GUI parts for the robot's URDF / SRDF
+parts_env() {                                       # -e options for the parts files that exist now
+  local f
+  for f in "URDF robot_parts.urdf.xacro" "SRDF robot_parts.srdf.xacro"; do
+    set -- $f
+    [ -f "$DATA/config/moveit_gui/parts/generated/$2" ] && printf -- '-e UR7E_USER_PARTS_%s=%s/%s ' "$1" "$PARTS" "$2"
+  done
+  return 0
+}
 if docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
   echo "A container called $NAME is already running (another terminal?). Stop it first:"
   echo "    docker stop $NAME"
@@ -92,42 +103,52 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-xhost +local:root >/dev/null 2>&1 || true
-stamp=$(date +%Y%m%d_%H%M%S)
-if [ "$FAKE" = 1 ]; then
-  STACK='exec sleep infinity'
-else
-  # exec: ros2 launch is the container's main process (under --init), so the stop signal reaches it directly.
-  # The log goes through a process substitution for the same reason (a `| tee` pipeline would keep bash in between).
-  STACK="exec > >(tee /data/logs/launch_$stamp.log) 2>&1; exec ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]}"
-fi
-docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" \
-  -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v "$DATA:/data" -v "$WS:/ws" \
-  "$IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && $STACK" >/dev/null
-
-ENV='source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && source /ws/install/setup.bash && export XDG_CONFIG_HOME=/data/config'
-
-if [ "$FAKE" = 0 ]; then
-  say "Robot stack starting (robot $ROBOT_IP). Log: ~/ur7e_data/logs/launch_$stamp.log"
-  ok=0
-  for _ in $(seq 1 45); do
-    docker ps --format '{{.Names}}' | grep -qx "$NAME" || { echo "The robot stack exited:"; tail -30 "$DATA/logs/launch_$stamp.log"; exit 1; }
-    if docker exec "$NAME" bash -c "$ENV && timeout 5 ros2 control list_controllers" 2>/dev/null | grep -qE "^joint_state_broadcaster +[^ ]+ +active"; then ok=1; break; fi
-    sleep 2
-  done
-  if [ "$ok" = 1 ]; then
-    say "Controllers are up"
+start_stack() {
+  xhost +local:root >/dev/null 2>&1 || true
+  stamp=$(date +%Y%m%d_%H%M%S)
+  if [ "$FAKE" = 1 ]; then
+    STACK='exec sleep infinity'
   else
-    echo "Controllers not up after 90 s: starting the GUI anyway (it shows what is missing)."
-    echo "Last launch log lines:"; tail -15 "$DATA/logs/launch_$stamp.log"
+    # exec: ros2 launch is the container's main process (under --init), so the stop signal reaches it directly.
+    # The log goes through a process substitution for the same reason (a `| tee` pipeline would keep bash in between).
+    STACK="exec > >(tee /data/logs/launch_$stamp.log) 2>&1; exec ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]}"
   fi
-  echo "    On the pendant: load and PLAY the External Control program, unless you passed headless_mode:=true."
-fi
+  docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" $(parts_env) \
+    -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v "$DATA:/data" -v "$WS:/ws" \
+    "$IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && $STACK" >/dev/null
+
+  ENV='source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && source /ws/install/setup.bash && export XDG_CONFIG_HOME=/data/config'
+
+  if [ "$FAKE" = 0 ]; then
+    say "Robot stack starting (robot $ROBOT_IP). Log: ~/ur7e_data/logs/launch_$stamp.log"
+    ok=0
+    for _ in $(seq 1 45); do
+      docker ps --format '{{.Names}}' | grep -qx "$NAME" || { echo "The robot stack exited:"; tail -30 "$DATA/logs/launch_$stamp.log"; return 1; }
+      if docker exec "$NAME" bash -c "$ENV && timeout 5 ros2 control list_controllers" 2>/dev/null | grep -qE "^joint_state_broadcaster +[^ ]+ +active"; then ok=1; break; fi
+      sleep 2
+    done
+    if [ "$ok" = 1 ]; then
+      say "Controllers are up"
+    else
+      echo "Controllers not up after 90 s: starting the GUI anyway (it shows what is missing)."
+      echo "Last launch log lines:"; tail -15 "$DATA/logs/launch_$stamp.log"
+    fi
+    echo "    On the pendant: load and PLAY the External Control program, unless you passed headless_mode:=true."
+  fi
+}
 
 # ---------------------------------------------------------------- 4. GUI
 GUI_ARGS="--programs-dir /data/programs --policies-dir /data/policies"
 [ "$FAKE" = 1 ] && GUI_ARGS="$GUI_ARGS --fake"
+if [ "$FAKE" = 1 ]; then
+  # the 3D view gets the real robot model, with the GUI parts in it (as the stack would after a restart)
+  FAKE_URDF='xacro $(ros2 pkg prefix ur7e_robotiq_bringup)/share/ur7e_robotiq_bringup/urdf/ur7e_robotiq.urdf.xacro name:=ur7e_robotiq ur_type:=ur7e use_mock_hardware:=true robot_ip:=0.0.0.0 > /tmp/fake_robot.urdf'
+  GUI_PRE="{ [ -f /data/config/moveit_gui/parts/generated/robot_parts.urdf.xacro ] && export UR7E_USER_PARTS_URDF=$PARTS/robot_parts.urdf.xacro; $FAKE_URDF || echo 'robot model for the 3D view failed'; } && "
+  GUI_ARGS="$GUI_ARGS --urdf /tmp/fake_robot.urdf"
+else
+  GUI_PRE=""
+fi
 if [ "$MODE" = web ]; then
   HOST=$(tailscale ip -4 2>/dev/null | head -1)
   if [ -z "$HOST" ]; then
@@ -142,5 +163,26 @@ else
 fi
 # In the background + wait, so Ctrl-C reaches the cleanup at once. The GUI records its pid and is exec'd, so
 # cleanup (stop_gui) can signal it by itself before the container is stopped.
-docker exec "$NAME" bash -c "$ENV && echo \$\$ > $GUI_PIDFILE && exec $GUI_CMD" &
-wait $!
+run_gui() {
+  docker exec "$NAME" bash -c "$ENV && $GUI_PRE echo \$\$ > $GUI_PIDFILE && exec $GUI_CMD" &
+  local rc=0
+  wait $! || rc=$?
+  return $rc
+}
+start_stack
+while true; do
+  rc=0
+  run_gui || rc=$?
+  case "$rc" in
+    76) say "Restarting the GUI (asked from the GUI)" ;;
+    75) if [ "$FAKE" = 1 ]; then
+          say "Restarting the GUI (fake robot: there is no robot stack to restart)"
+        else
+          say "Restarting the robot stack and the GUI (asked from the GUI; up to ~45 s)"
+          docker stop "$NAME" >/dev/null 2>&1 || true
+          for _ in $(seq 1 40); do docker ps -a --format '{{.Names}}' | grep -qx "$NAME" || break; sleep 1; done
+          start_stack
+        fi ;;
+    *) exit "$rc" ;;
+  esac
+done
