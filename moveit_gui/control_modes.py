@@ -25,6 +25,7 @@ ROS-free: talks to the robot only through the `bridge` object.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -406,3 +407,32 @@ class ControlModeManager:
         mode = mode or self.current_mode()
         m = self.profile.modes.get(mode)
         return bool(m and m.supports_moveit)
+
+
+class ReferenceShiftError(ValueError):
+    pass
+
+
+def shift_to_reference(points: List[List[float]], names: List[str], reference: Dict[str, float],
+                       max_shift_rad: float) -> Tuple[List[List[float]], List[float]]:
+    """Shift a planned joint trajectory so it starts at the trajectory controller's reference.
+
+    In a chained admittance mode the arm stands at reference + the admittance offset (a force pushes it). MoveIt
+    plans from the measured joints, so its first point is the pushed pose; the trajectory controller jumps its
+    reference there and the admittance controller adds the offset again: the push doubles at the start of every
+    move (reproduced on the real controller chain: 20 mm under 5 N becomes 40 mm). Shifting every point by
+    (reference - first point) keeps the reference continuous: the arm follows the planned path offset by the push
+    it already has, so the press stays as it is. Returns (shifted points, shift per joint)."""
+    if not points:
+        raise ReferenceShiftError("empty trajectory")
+    missing = [n for n in names if n not in reference]
+    if missing:
+        raise ReferenceShiftError(f"no reference for {', '.join(missing)}")
+    d = [float(reference[n]) - float(points[0][i]) for i, n in enumerate(names)]
+    worst = max(abs(v) for v in d)
+    if worst > max_shift_rad:
+        k = max(range(len(d)), key=lambda i: abs(d[i]))
+        raise ReferenceShiftError(
+            f"the arm is {math.degrees(worst):.1f} deg ({names[k]}) off its reference (pushed by a force or "
+            f"blocked); limit {math.degrees(max_shift_rad):.1f} deg: release the force before moving")
+    return [[float(p[i]) + d[i] for i in range(len(names))] for p in points], d

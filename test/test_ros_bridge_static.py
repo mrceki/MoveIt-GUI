@@ -72,14 +72,72 @@ def test_trajectory_goal_names_the_controller_of_the_active_mode(ros_bridge_modu
     rb = ros_bridge_module
     b = _bare_bridge(rb)
     b.log = lambda *_: None
-    b.list_controllers = lambda: {"admittance_controller": "active", "admittance_trajectory_controller": "active",
-                                  "scaled_joint_trajectory_controller": "inactive"}
+    b.list_controllers = lambda: {"admittance_controller": "inactive", "admittance_trajectory_controller": "inactive",
+                                  "scaled_joint_trajectory_controller": "active"}
     b._execute_cli = mock.MagicMock()
     rb.ExecuteTrajectory = mock.MagicMock()
     b._wait_future = mock.MagicMock(return_value=None)     # goal rejected after being sent: enough to inspect it
     assert b._execute_on_active_controller(mock.MagicMock()) is False
     goal = b._execute_cli.send_goal_async.call_args[0][0]
-    assert goal.controller_names == ["admittance_trajectory_controller"]
+    assert goal.controller_names == ["scaled_joint_trajectory_controller"]
+
+
+def _admittance_bridge(rb, ref):
+    b = _bare_bridge(rb)
+    logs = []
+    b.log = logs.append
+    b.list_controllers = lambda: {"admittance_controller": "active", "admittance_trajectory_controller": "active",
+                                  "scaled_joint_trajectory_controller": "inactive"}
+    b._execute_cli = mock.MagicMock()
+    b._follow_clients = {"admittance_trajectory_controller": mock.MagicMock()}
+    b._ctrl_ref = {} if ref is None else {"admittance_trajectory_controller": (time.monotonic(), ref)}
+    b.stop_epoch = 0
+    b._execute_handle = None
+    b._snap.speed_scaling = 1.0
+    return b, logs
+
+
+def _traj(rb, names, rows):
+    from types import SimpleNamespace
+    return SimpleNamespace(joint_names=list(names), points=[SimpleNamespace(positions=list(r)) for r in rows])
+
+
+def test_admittance_moves_start_at_the_controller_reference(ros_bridge_module):
+    """A force pushes the arm off the trajectory controller's reference; a move must start at the reference (a
+    start at the measured joints doubles the push), so it goes to the controller shifted, not through MoveIt."""
+    rb = ros_bridge_module
+    from moveit_gui.profile import RobotProfile
+    J = RobotProfile.load(ROOT / "profiles" / "ur7e_lab.yaml").joint_names
+    ref = {j: 0.1 * i for i, j in enumerate(J)}
+    measured = [0.1 * i + (0.02 if i == 1 else 0.0) for i in range(len(J))]       # pushed 0.02 rad on joint 1
+    b, logs = _admittance_bridge(rb, ref)
+    client = b._follow_clients["admittance_trajectory_controller"]
+    b._wait_future = mock.MagicMock(return_value=None)
+    rb.FollowJointTrajectory = mock.MagicMock()
+    rb.FollowJointTrajectory.Goal = lambda: mock.MagicMock()
+    assert b._execute_on_active_controller(_traj(rb, J, [measured, [v + 0.1 for v in measured]])) is False
+    b._execute_cli.send_goal_async.assert_not_called()                          # not through MoveIt
+    goal = client.send_goal_async.call_args[0][0]
+    pts = [list(p.positions) for p in goal.trajectory.points]
+    assert pts[0] == [ref[j] for j in J]                                        # starts at the reference
+    assert abs(pts[1][1] - (measured[1] + 0.1 - 0.02)) < 1e-9                   # the whole path shifted
+    assert any("a force is pushing the arm" in line for line in logs)
+
+
+def test_admittance_move_refused_without_a_reference_or_when_pushed_far(ros_bridge_module):
+    rb = ros_bridge_module
+    from moveit_gui.profile import RobotProfile
+    J = RobotProfile.load(ROOT / "profiles" / "ur7e_lab.yaml").joint_names
+    b, logs = _admittance_bridge(rb, None)
+    assert b._execute_on_active_controller(_traj(rb, J, [[0.0] * 6])) is False
+    assert any("no fresh reference" in line for line in logs)
+    b, logs = _admittance_bridge(rb, {j: 0.0 for j in J})
+    b._ctrl_ref["admittance_trajectory_controller"] = (time.monotonic() - 5.0, {j: 0.0 for j in J})   # stale
+    assert b._execute_on_active_controller(_traj(rb, J, [[0.0] * 6])) is False
+    b, logs = _admittance_bridge(rb, {j: 0.0 for j in J})
+    assert b._execute_on_active_controller(_traj(rb, J, [[0.0, 0.3, 0, 0, 0, 0]])) is False
+    assert any("off its reference" in line for line in logs)
+    b._follow_clients["admittance_trajectory_controller"].send_goal_async.assert_not_called()
 
 
 def test_trajectory_is_refused_when_no_active_mode_takes_moveit(ros_bridge_module):

@@ -40,6 +40,9 @@ class ControlMode:
     # Cartesian force target of this mode's controller (OPERATE > Force): topic, frame (the frame the vector is
     # sent in), point (the link the wrench acts about), params_node (optional, read for selected_axes).
     wrench: dict = field(default_factory=dict)
+    # Chained position modes (admittance): start every MoveIt trajectory at the trajectory controller's REFERENCE,
+    # not the measured joints. {state_topic: .../controller_state, max_shift_rad}. See ros_bridge.
+    reference_start: dict = field(default_factory=dict)
 
     @property
     def domain(self) -> str:
@@ -142,6 +145,7 @@ class RobotProfile:
                     reference_check=dict(m.get("reference_check", {}) or {}),
                     hardware=[str(h) for h in (m.get("hardware") or [])],
                     wrench=dict(m.get("wrench") or {}),
+                    reference_start=dict(m.get("reference_start") or {}),
                 )
             managed = list(cm.get("managed", []))
             # Every controller a mode activates is implicitly managed.

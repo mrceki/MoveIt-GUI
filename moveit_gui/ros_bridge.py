@@ -44,7 +44,7 @@ from . import transforms as tf
 from .bridge_api import (DASHBOARD_COMMANDS, DASHBOARD_TIMEOUT_S, Snapshot, WrenchHistory, dashboard_lost,
                          dashboard_with_reconnect, gripper_status_dict, reconnect_gripper)
 from .camera import IMAGE as IMAGE_TYPE, IMAGE_TYPES, ImageWatch
-from .control_modes import moveit_controller_for
+from .control_modes import ReferenceShiftError, moveit_controller_for, shift_to_reference
 from .profile import RobotProfile, reorder_joints
 
 try:  # UR-specific messages: optional so the GUI also works with non-UR profiles
@@ -235,6 +235,21 @@ class RosBridge:
         self.moveit = None
         self._follow_clients: Dict = {}
         self._execute_handle = None
+        # Chained admittance: the trajectory controller's REFERENCE joints (controller_state), so a move starts there
+        # and not at the pushed, measured joints (see control_modes.shift_to_reference). {controller: (t, {joint: q})}
+        self._ctrl_ref: Dict[str, tuple] = {}
+        try:
+            from control_msgs.msg import JointTrajectoryControllerState
+        except ImportError:  # pragma: no cover
+            JointTrajectoryControllerState = None
+        for m in profile.modes.values():
+            rs = m.reference_start
+            if rs and m.moveit_controller and JointTrajectoryControllerState is not None:
+                topic = rs.get("state_topic") or f"/{m.moveit_controller}/controller_state"
+
+                def on_state(msg, c=m.moveit_controller):
+                    self._ctrl_ref[c] = (time.monotonic(), dict(zip(msg.joint_names, msg.reference.positions)))
+                n.create_subscription(JointTrajectoryControllerState, topic, on_state, 10, callback_group=self.cb)
         # Bumped by every cancel_motion. A move remembers it when it starts (before planning) and refuses to send,
         # or cancels, its ExecuteTrajectory goal if a STOP came in meanwhile: pymoveit2 cannot cancel a plan() in
         # progress and cancel_motion alone only reaches a goal that is already executing.
@@ -723,6 +738,10 @@ class RosBridge:
         if self._execute_cli is None or not self._execute_cli.wait_for_server(timeout_sec=1.0):
             self.log("execute_trajectory action server is not available")
             return False
+        mode = next((m for m in self.profile.modes.values()
+                     if m.moveit_controller == controller and m.reference_start), None)
+        if mode is not None:
+            return self._execute_from_reference(controller, mode.reference_start, trajectory, epoch)
         goal = ExecuteTrajectory.Goal()
         goal.trajectory.joint_trajectory = trajectory
         goal.controller_names = [controller]
@@ -753,6 +772,68 @@ class RosBridge:
         if not ok:
             self.log(f"{controller}: execution failed (MoveIt error {result.result.error_code.val})")
         return ok
+
+    def _execute_from_reference(self, controller: str, cfg: dict, trajectory, epoch: int) -> bool:
+        """Chained admittance: shift the plan so it starts at the trajectory controller's reference and send it
+        to that controller directly. (MoveIt's execution would refuse a start away from the measured joints, and
+        starting at the measured joints doubles the push of an applied force.) STOP cancels it like any goal
+        (cancel_motion: the controller's cancel service and this handle)."""
+        got = self._ctrl_ref.get(controller)
+        if got is None or time.monotonic() - got[0] > float(cfg.get("max_age_s", 0.5)):
+            self.log(f"motion refused: no fresh reference from {controller} (controller_state)")
+            return False
+        names = list(trajectory.joint_names)
+        pts = [list(p.positions) for p in trajectory.points]
+        try:
+            shifted, d = shift_to_reference(pts, names, got[1], float(cfg.get("max_shift_rad", math.radians(5.0))))
+        except ReferenceShiftError as e:
+            self.log(f"motion refused: {e}")
+            return False
+        worst = max(abs(v) for v in d)
+        if worst > 1e-4:
+            self.log(f"starting at the {controller} reference ({math.degrees(worst):.2f} deg from the measured "
+                     "joints: a force is pushing the arm)")
+        for p, q in zip(trajectory.points, shifted):
+            p.positions = [float(v) for v in q]
+        traj = JointTrajectory()
+        traj.joint_names = names                       # header stamp 0: start now
+        traj.points = list(trajectory.points)
+        client = self._follow_clients.get(controller)
+        if client is None:
+            client = ActionClient(self.node, FollowJointTrajectory, f"/{controller}/follow_joint_trajectory",
+                                  callback_group=self.cb)
+            self._follow_clients[controller] = client
+        if not client.wait_for_server(timeout_sec=1.0):
+            self.log(f"{controller}: follow_joint_trajectory is not available")
+            return False
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = traj
+        if self.stop_epoch != epoch:
+            self.log("motion not started: STOP was pressed while it was being planned")
+            return False
+        self.log(f"executing through {controller} (from its reference)")
+        handle = self._wait_future(client.send_goal_async(goal), 5.0)
+        if handle is None or not handle.accepted:
+            self.log(f"{controller}: trajectory goal was rejected")
+            return False
+        self._execute_handle = handle
+        if self.stop_epoch != epoch:
+            self.log("STOP was pressed while the motion was being sent: cancelling it")
+            handle.cancel_goal_async()
+        try:
+            result = self._wait_future(handle.get_result_async(), self._execution_timeout(traj))
+        finally:
+            self._execute_handle = None
+        if result is None:
+            handle.cancel_goal_async()
+            self.log(f"{controller}: no execution result; treating the motion as failed")
+            return False
+        code = result.result.error_code               # FollowJointTrajectory: 0 = SUCCESSFUL
+        if code != 0 or result.status != 4:            # GoalStatus.STATUS_SUCCEEDED
+            self.log(f"{controller}: execution failed (error {code} {result.result.error_string!r}, status "
+                     f"{result.status})")
+            return False
+        return True
 
     def _plan_timeout(self) -> float:
         """Give up on a plan when move_group does not answer (it died mid-plan): the GUI must not stay busy."""

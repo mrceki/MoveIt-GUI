@@ -209,6 +209,14 @@ AUTOMATION then shows a **Controller gains** readiness check (2 % tolerance). It
   Wait step gives it time). Move relative can **rotate about the frame's origin** (an orbit: with the vial fixture,
   rotate Z 10° goes to the next scraping angle, the tool facing the wall the same way; the travel is limited like an
   offset). Motion steps can **skip on failure** (`on_fail: continue`; the run ends "finished, N skipped").
+* **Moves under a force (Admittance) start at the controller's reference.** A force pushes the arm off the
+  trajectory controller's reference (about F / stiffness: 5 N at 250 N/m = 20 mm in free air). MoveIt plans from
+  the measured joints, so a move sent as planned would jump the reference to the pushed pose and the admittance
+  controller would add the push again: the push doubled at the start of every move (reproduced on the real
+  controller chain). The GUI therefore shifts every plan in Admittance so it starts at the reference
+  (`/admittance_trajectory_controller/controller_state`) and sends it to that controller directly; the push
+  stays as it is and the path keeps its shape. STOP cancels it like any move. A move is refused when the arm is
+  more than 5° (any joint) off its reference, or the reference is not fresh (profile: `reference_start`).
 * **Typed waypoints**: the editor of a MoveJ / Move to pose step shows its waypoint's numbers as fields (joints in
   degrees; or frame + XYZ mm + RPY ° of the TCP, e.g. in the vial frame) and a **Go to** list to point the step at
   another waypoint (e.g. back to `home`). Teaching (Set waypoint here) still works.
