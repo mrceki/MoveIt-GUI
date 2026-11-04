@@ -99,6 +99,7 @@ class FtBias:
         self._lock = threading.Lock()
         self._last_poll = 0.0
         self._polling = False
+        self._blocked = ""                               # last reason an automatic restore waited (logged once)
         s = self._load()
         self.presets: Dict[str, dict] = dict(s.get("presets") or {})
         self.last: Optional[dict] = s.get("last")        # {bias, at, how}: the last bias this GUI applied
@@ -187,9 +188,13 @@ class FtBias:
         Keeps how it was made (a Zero now stays "payload kept"). Not while anything uses the reading."""
         if not self.lost():
             return False, "nothing to restore"
-        why = self.why_not()
+        why = self.why_not() or self._reading_in_use()
         if why:
+            if why != self._blocked:                  # fail closed: wait and retry on the next poll, say so once
+                self._blocked = why
+                self.log(f"F/T bias restore waits: {why}")
             return False, why
+        self._blocked = ""
         last = dict(self.last)
         ok, msg = self._send(list(last["bias"]), last.get("how", "restored"))
         if ok:
@@ -199,6 +204,18 @@ class FtBias:
             self.log(f"F/T bias restored after the F/T broadcaster restarted (set {last.get('at')}, "
                      f"{last.get('how')}): {_fmt(last['bias'])}")
         return ok, msg
+
+    def _reading_in_use(self) -> Optional[str]:
+        """Why the bias must not be stepped by an automatic restore: only a fresh controller list that shows no F/T
+        mode controller active (and a profile to tell which are F/T modes) proves nothing uses the reading."""
+        profile = getattr(self.bridge, "profile", None)
+        states = self.bridge.list_controllers()
+        if profile is None or states is None:
+            return "the controller state is unknown (no fresh controller list)"
+        for m in profile.modes.values():
+            if m.requires_ft and any(states.get(c) == "active" for c in m.activate):
+                return f"{m.label} is active and uses the F/T reading"
+        return None
 
     def set(self, bias, how: str = "typed") -> Tuple[bool, str]:
         v = self.check(bias)

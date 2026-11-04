@@ -233,6 +233,7 @@ class Gains:
         self.restored_at: Dict[str, float] = {}
         self._last_poll = 0.0
         self._polling = False
+        self._blocked: Dict[str, str] = {}               # mode -> last reason an automatic restore waited (logged once)
 
     @classmethod
     def from_profile(cls, profile_gains: dict, *args, **kw) -> "Gains":
@@ -469,12 +470,30 @@ class Gains:
             diff.update({k: v for k, v in gs.enable.items() if not _eq(got.get(k), v)})
         return diff
 
+    def _not_confirmed_inactive(self, mode: str) -> Optional[str]:
+        """None only if a fresh controller list says the mode's controller is inactive; else why we can't tell."""
+        name = self.sets[mode].node.rstrip("/").rsplit("/", 1)[-1]
+        states = self.bridge.list_controllers()
+        if states is None:
+            return "the controller list is unavailable, so it is not known that the controller is inactive"
+        state = states.get(name)
+        if state != "inactive":
+            return f"controller {name} is {state or 'not listed'}, not confirmed inactive"
+        return None
+
     def restore(self, mode: str, why: str) -> Tuple[bool, str]:
         """Put the saved values back on an INACTIVE controller. Active: refused (the operator decides)."""
         if mode not in self.sets or not self.saved.get(mode):
             return True, "nothing saved"
         if self.current_mode() == mode:
             return False, f"{mode} is active: restore it from SETUP > Controller gains"
+        why_not = self._not_confirmed_inactive(mode)
+        if why_not:                                   # fail closed: unknown / stale state is not "inactive"
+            if self._blocked.get(mode) != why_not:
+                self._blocked[mode] = why_not
+                self.log(f"gains {mode}: restore waits ({why_not})")
+            return False, why_not
+        self._blocked.pop(mode, None)
         if not self._lock.acquire(blocking=False):
             return False, "a gain change is running"
         try:

@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -184,6 +185,26 @@ class RecordingOptions:
         return out
 
 
+def _load_prctl():
+    """libc prctl, resolved once in the parent: after fork only async-signal-safe work may run (no imports)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except Exception:
+        return None
+
+
+_PRCTL = _load_prctl()
+
+
+def _die_with_parent():
+    """preexec_fn: the child gets SIGTERM if the GUI thread that started it dies (PR_SET_PDEATHSIG). Linux only."""
+    if _PRCTL is not None:
+        _PRCTL(1, signal.SIGTERM, 0, 0, 0)
+
+
 class PolicyLibrary:
     def __init__(self, directory: str | Path):
         self.directory = Path(directory)
@@ -231,21 +252,28 @@ class PolicyLibrary:
                 log("a policy is already running")
                 return False
             log(f"policy '{name}' start: {' '.join(cmd)}")
-            self._proc = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True)
+            try:
+                # own session = own process group (killpg reaches the whole tree); PDEATHSIG ends it with the GUI
+                self._proc = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True,
+                                              preexec_fn=_die_with_parent)
+            except Exception as e:      # a failed start must end as a failure, never as an exception or a hang
+                log(f"policy '{name}' failed to start: {e}")
+                return False
             self._current = m
         t0 = time.monotonic()
+        proc = self._proc
         try:
             while True:
-                rc = self._proc.poll()
+                rc = proc.poll()
                 if rc is not None:
                     log(f"policy '{name}' exited with code {rc}")
                     return rc == 0
                 if stop_event is not None and stop_event.is_set():
-                    self._terminate(m)
+                    self._terminate(m, wait=True)
                     log(f"policy '{name}' stopped")
                     return False
                 if duration and time.monotonic() - t0 >= duration:
-                    self._terminate(m)
+                    self._terminate(m, wait=True)
                     log(f"policy '{name}' finished ({duration:.1f} s)")
                     return True
                 time.sleep(0.05)
@@ -253,24 +281,43 @@ class PolicyLibrary:
             self._proc = None
             self._current = None
 
-    def _terminate(self, m: PolicyManifest, grace_s: float = 3.0):
+    def _terminate(self, m: PolicyManifest, grace_s: float = 3.0, wait: bool = False):
+        """Signal the policy's process group at once; escalate (stop signal -> SIGTERM -> SIGKILL) in a
+        background thread so a caller on the tick / STOP path never blocks. wait=True joins it (worker thread)."""
         proc = self._proc
         if proc is None or proc.poll() is not None:
             return
         sig = getattr(signal, m.stop_signal, signal.SIGINT)
-        for s in (sig, signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(proc.pid, s)
-            except ProcessLookupError:
-                return
+        with self._lock:
+            t = getattr(proc, "_gui_escalation", None)
+            if t is None:
+                try:
+                    os.killpg(proc.pid, sig)            # immediate, before any waiting
+                except ProcessLookupError:
+                    return
+                t = threading.Thread(target=self._escalate, args=(proc, grace_s), daemon=True)
+                proc._gui_escalation = t
+                t.start()
+        if wait:
+            t.join()
+
+    @staticmethod
+    def _escalate(proc, grace_s):
+        """The stop signal is already sent; give the runner grace_s, then SIGTERM, then SIGKILL."""
+        for s in (signal.SIGTERM, signal.SIGKILL):
             try:
                 proc.wait(grace_s)
                 return
             except subprocess.TimeoutExpired:
-                continue
+                pass
+            try:
+                os.killpg(proc.pid, s)
+            except ProcessLookupError:
+                return
+        proc.wait()
 
     def stop(self):
-        """Thread-safe: called by the GUI Stop button while run() blocks elsewhere."""
+        """Thread-safe and non-blocking: called by the GUI Stop button while run() blocks elsewhere."""
         m = self._current
         if m is not None and self.running:
             self._terminate(m)
