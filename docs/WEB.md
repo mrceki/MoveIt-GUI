@@ -269,7 +269,7 @@ come back here. Recording never moves the robot. Starting needs control, but any
 ## Parts, camera calibration, setups, restart (SETUP)
 
 **Parts** (SETUP › Parts): things bolted to the robot or the cell, without editing URDF. A part is a box, cylinder,
-sphere, STL mesh (upload, mm / m / inch) or a bare frame, on a parent (a robot link, or another part) at an offset in
+sphere, mesh (.stl, .obj or .dae upload) or a bare frame, on a parent (a robot link, or another part) at an offset in
 mm / deg. A shape sits on its frame and grows along +Z, so **+** on a part (or *on far face*) stacks the next piece
 where the previous one ends, like the real tool. Presets: spatula on the gripper, wrist camera bracket, RealSense
 D435, table, frame only.
@@ -287,6 +287,16 @@ D435, table, frame only.
   restart. Once the robot model has a part, the GUI drops its live copy.
 * **TCP at its tip…** makes a virtual TCP at the part's far face (on the planning link). It follows the part when
   you edit it. Refused for a part on something that moves relative to the flange (a finger).
+* **Meshes:** STL and OBJ are in whatever unit the CAD used. The upload guesses it from the size (mm / m / inch can be
+  changed; the size shown in mm must match the real part). A .dae carries its unit and keeps its own colours. *Place
+  it* puts the mesh's origin where you want it on the part frame: *as exported*, *centred*, or *standing on the
+  frame* (centred in X / Y, bottom on the frame, so it stacks like the other shapes). Up to 20 MB and 200 000
+  triangles; textures are not used.
+* **Collision** per part: *as shown*, *convex hull* (default for meshes: light, and MoveIt plans faster with it),
+  *bounding box*, or *none* (shown only: MoveIt ignores it, nothing is attached). The hull is made once per mesh in
+  `parts/generated/hulls/`. The same shape goes live and into the generated URDF.
+* **Visual / Collision** (bottom right of every 3D view): show the robot's visual meshes, its collision shapes
+  (translucent green: what MoveIt checks, robot links and parts), or both. Every 3D view follows the choice.
 * A new tool changes the payload: redo SETUP › F/T + Payload.
 
 Screenshot: `docs/ux/web_setup_parts.png`.
@@ -312,11 +322,21 @@ a stand, board on the tool: gives base → camera).
 MoveIt Calibration (the RViz plugin) is not released for Jazzy; this uses the same board type and OpenCV's solvers.
 Screenshot: `docs/ux/web_setup_handeye.png`.
 
+**Base** (SETUP › Setups): what is on the flange. These are fixed parts of the robot model, built by the robot's own
+xacro: *F/T sensor + gripper* (default), *Gripper* (coupling straight on tool0), *F/T sensor* (your own tool goes on
+it as parts), *Bare arm*. The GUI never edits a base: parts go on top of it. **Switch…** (idle, Position) writes
+`config_dir()/base` and restarts the robot stack: URDF, SRDF (MoveIt's groups and collision pairs) and controllers
+all change together (`UR7E_EE_CONFIG`). On a base without the F/T sensor, Admittance is disabled. Without the
+gripper, the gripper controls and Impedance (its end effector is robotiq_tcp) are disabled. If the active TCP hangs
+on hardware the base does not have, the GUI falls back to tool0. Parts on links the base does not have stay saved
+but are left out of the model (listed as problems). `ur7e_gui.sh --base <name>` does the same from the shell.
+
 **Setups** (SETUP › Setups): one physical configuration by name (e.g. *scraping spatula*, *pick + wrist cam*): parts
 and their meshes and generated URDF, TCPs and fixtures, keep-out zones, F/T bias, gains and payload, vial profiles,
-camera calibrations, the last payload calibration. Programs and policies are shared. **Load…** (idle, Position)
-puts the files in place and restarts the GUI, and the robot stack too when the setup's parts differ from the
-running robot model; the files in use before are kept as an automatic backup (`_before_…`, newest 5). Stored in
+camera calibrations, the last payload calibration, and the base it was saved on. Programs and policies are shared.
+**Load…** (idle, Position) puts the files in place and the setup's base back, and restarts the GUI, and the robot
+stack too when the setup's parts or base differ from the running robot model. So the usual way to change tools is:
+build it in Parts, save it as a setup, and load setups to switch; the files in use before are kept as an automatic backup (`_before_…`, newest 5). Stored in
 `config_dir()/setups/<name>/`.
 
 **Restart** (SETUP › Setups, and the Parts banner): *Restart GUI* (exit code 76) or *Restart robot stack* (75: the

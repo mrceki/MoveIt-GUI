@@ -27,6 +27,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 import yaml
 
+from .. import bases as B
 from .. import transforms as tf
 from ..bridge_api import wrench_fresh
 from ..calibration import CalibrationError, FixtureDef, TcpDef, config_dir
@@ -266,7 +267,7 @@ class WebService(WorkcellCommands):
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError, PartError, HandEyeError, SetupError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, B.BaseError) as e:
                 raise CommandError(str(e)) from None
             if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
                 self.program_rev += 1
@@ -456,6 +457,9 @@ class WebService(WorkcellCommands):
     def cmd_switch_mode(self, mode):
         if mode not in self.core.profile.modes:
             raise CommandError(f"unknown mode '{mode}'")
+        why = self.base_lacks(mode=mode)
+        if why:
+            raise CommandError(why)
         return self._submit(f"switch to {mode}", lambda: self.core.switch_mode(mode))
 
     def cmd_freedrive(self, on):
@@ -598,6 +602,9 @@ class WebService(WorkcellCommands):
         g = self.core.profile.gripper
         if not g.get("enabled"):
             raise CommandError("no gripper in this profile")
+        why = self.base_lacks(gripper=True)
+        if why:
+            raise CommandError(why)
         lo, hi = float(g.get("open_position", 0.0)), float(g.get("closed_position", 0.8))
         if percent is not None:
             pos = lo + (hi - lo) * min(100.0, max(0.0, float(percent))) / 100.0
@@ -1902,18 +1909,23 @@ class WebService(WorkcellCommands):
     # =================================================================== views
     def info(self) -> dict:
         c, p = self.core, self.core.profile
+        base = self.running_base()
+        no_mode = {n: self.base_lacks(mode=n) for n in p.modes}
         return {
+            "base": {"name": base, "label": B.BASES[base][0]},
             "robot": p.display_name, "profile": p.name, "ur_type": p.ur_type, "robot_ip": p.robot_ip,
             "fake": c.fake, "base_link": p.base_link, "joint_names": p.joint_names,
             "modes": [{"name": n, "label": m.label, "interface": m.command_interface, "direct_torque": m.direct_torque,
-                       "experimental": m.experimental, "moveit": m.supports_moveit, "allowed": m.allow_activation,
+                       "experimental": m.experimental, "moveit": m.supports_moveit,
+                       "allowed": m.allow_activation and not no_mode[n],
                        "hidden": getattr(m, "hidden", False), "requires_ft": m.requires_ft,
-                       "disabled_reason": getattr(m, "disabled_reason", "")}
+                       "disabled_reason": no_mode[n] or getattr(m, "disabled_reason", "")}
                       for n, m in p.modes.items()],
             "waypoints": [{"name": n, "joints_deg": [round(math.degrees(v), 3) for v in w.joints]}
                           for n, w in p.waypoints.items() if w.joints is not None],
             "gripper": {**{k: p.gripper.get(k) for k in ("enabled", "model", "open_position", "closed_position",
                                                            "max_effort", "effort_limit")},
+                        **({"enabled": False} if self.base_lacks(gripper=True) else {}),
                         "can_reactivate": bool(p.gripper.get("reactivate_service")),
                         "can_reconnect": bool(p.gripper.get("controller_manager"))},
             "cameras": p.cameras,

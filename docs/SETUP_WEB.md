@@ -74,7 +74,11 @@ by another DNS name (a lab domain name, a CNAME), add `--allow-host robot.lab.ex
 Do these once per tool / workcell. Everything is saved under `~/ur7e_data/config/moveit_gui` and restored on the
 next start.
 
-1. **Parts**: add what is bolted on (spatula, camera bracket, table) so MoveIt plans around it, then **TCP at its
+0. **Base** (SETUP › Setups): check that it matches what is on the flange (F/T sensor + gripper, gripper, F/T
+   sensor, or bare arm). **Switch…** restarts the robot stack with the other base.
+1. **Parts**: add what is bolted on (spatula, camera bracket, table; or a CAD mesh: .stl, .obj, .dae) so MoveIt
+   plans around it. Pick each part's collision (convex hull for meshes, or none for show-only pieces) and tick
+   **Collision** in the 3D view to see what MoveIt sees. Then **TCP at its
    tip…** on the tool part and make that TCP active in the top bar. Parts work at once; **Restart robot stack**
    (banner) also writes them into the robot model. Or **TCPs**: add the tool tip as a plain virtual TCP (e.g.
    `spatula_tip` = `robotiq_tcp` + 150 mm in Z).
@@ -87,8 +91,8 @@ next start.
 4. **Keep-out zones**: add the table first (or make it a part).
 5. **Camera calibration** (if a camera is used): print the board, Start, Plan 12 poses, Collect all, Solve, Save +
    add to robot.
-6. **Setups**: save the whole configuration under a name. When you change the tool, save a new one; Load switches
-   back (the GUI restarts by itself).
+6. **Setups**: save the whole configuration under a name (it remembers the base too). When you change the tool,
+   save a new one; Load switches back, base included (the GUI, and the stack if needed, restart by themselves).
 
 ## 6. Move to another PC / back up
 

@@ -52,7 +52,8 @@ def _geometry(g) -> Optional[dict]:
 
 
 def parse_urdf(xml: str) -> dict:
-    """{root, links: {name: [visual]}, joints: [{name, type, parent, child, xyz, rpy, axis, mimic}]}"""
+    """{root, links: {name: [visual]}, collisions: {name: [collision]}, joints: [{name, type, parent, child, xyz,
+    rpy, axis, mimic}]}"""
     try:
         robot = ET.fromstring(xml)
     except ET.ParseError as e:
@@ -63,7 +64,14 @@ def parse_urdf(xml: str) -> dict:
         if c is not None and m.get("name"):
             materials[m.get("name")] = _floats(c.get("rgba"), 4, 1.0)
     links: Dict[str, list] = {}
+    collisions: Dict[str, list] = {}
     for link in robot.findall("link"):
+        cols = []
+        for c in link.findall("collision"):
+            geo = _geometry(c.find("geometry"))
+            if geo is not None:
+                cols.append({"geometry": geo, **_origin(c), "rgba": None})
+        collisions[link.get("name")] = cols
         vis = []
         for v in link.findall("visual"):
             geo = _geometry(v.find("geometry"))
@@ -100,7 +108,7 @@ def parse_urdf(xml: str) -> dict:
     roots = [n for n in links if n not in children]
     if not roots:
         raise ModelError("the URDF has no root link")
-    return {"root": roots[0], "links": links, "joints": joints}
+    return {"root": roots[0], "links": links, "collisions": collisions, "joints": joints}
 
 
 def default_share_lookup(package: str) -> Optional[Path]:

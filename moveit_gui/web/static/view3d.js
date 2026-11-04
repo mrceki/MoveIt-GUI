@@ -34,14 +34,36 @@ export function matrixToPose(m) {
   return { xyz_mm: [p.x * 1000, p.y * 1000, p.z * 1000], rpy_deg: [e.x / D2R, e.y / D2R, e.z / D2R] };
 }
 
+// Wavefront OBJ: positions and faces only (polygons as fans), the way the GUI's Python side reads it.
+function parseObj(text) {
+  const v = [], out = [];
+  for (const line of text.split("\n")) {
+    const p = line.trim().split(/\s+/);
+    if (p[0] === "v" && p.length >= 4) v.push([+p[1], +p[2], +p[3]]);
+    else if (p[0] === "f" && p.length >= 4) {
+      const idx = p.slice(1).map((t) => { const k = parseInt(t, 10); return k > 0 ? k - 1 : v.length + k; });
+      for (let i = 1; i < idx.length - 1; i++)
+        for (const k of [idx[0], idx[i], idx[i + 1]]) { const q = v[k]; if (q) out.push(q[0], q[1], q[2]); else out.push(0, 0, 0); }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(out, 3));
+  g.computeVertexNormals();
+  return g;
+}
+
 class MeshCache {
   constructor() { this.stl = new STLLoader(); this.dae = new ColladaLoader(); this.cache = new Map(); }
   url(uri) {
     const m = /^package:\/\/([^/]+)\/(.+)$/.exec(uri);
     if (m) return `/mesh/${m[1]}/${m[2]}`;
-    const f = /^file:\/\/.*\/parts\/meshes\/([^/]+)$/.exec(uri);     // an STL uploaded in SETUP > Parts
-    return f ? `/mesh/_parts/${f[1]}` : null;
+    const f = /^file:\/\/.*\/parts\/meshes\/([^/]+)$/.exec(uri);     // a mesh uploaded in SETUP > Parts
+    if (f) return `/mesh/_parts/${f[1]}`;
+    const c = /^file:\/\/.*\/parts\/generated\/hulls\/([^/]+)$/.exec(uri); // its collision hull
+    return c ? `/mesh/_parts/hulls/${c[1]}` : null;
   }
+  // uploaded meshes can be replaced under the same name: forget them when the model changes
+  forgetParts() { for (const k of [...this.cache.keys()]) if (k.startsWith("/mesh/_parts/")) this.cache.delete(k); }
   load(uri) {
     const url = this.url(uri);
     if (!url) return Promise.resolve(null);
@@ -55,6 +77,9 @@ class MeshCache {
             d.scene.rotation.set(0, 0, 0);    // keep the file's own (z-up) axes, as RViz does; unit scale stays
             resolve({ kind: "dae", scene: d.scene });
           }, undefined, () => resolve(null));
+        } else if (ext === "obj") {
+          fetch(url).then((r) => (r.ok ? r.text() : Promise.reject())).then((t) => resolve({ kind: "stl", geometry: parseObj(t) }))
+            .catch(() => resolve(null));
         } else resolve(null);
       }));
     }
@@ -63,14 +88,16 @@ class MeshCache {
 }
 
 // One posable instance of the robot. ghost: one translucent material for everything.
+// layer "collision": the links' collision shapes instead of their visuals (MoveIt's view of the robot)
 class RobotInstance {
-  constructor(model, meshes, ghost, color = 0x5b8def) {
+  constructor(model, meshes, ghost, color = 0x5b8def, layer = "visual") {
     this.model = model;
     this.stubbed = new Set();
     this.root = new THREE.Group();
     this.links = {};
     this.joints = {};                       // name -> {def, motion: Group}
     this.ghost = ghost;
+    this.layer = layer;
     this.material = ghost ? new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.35,
                                                              depthWrite: false }) : null;
     const linkGroup = (name) => {
@@ -92,7 +119,8 @@ class RobotInstance {
       linkGroup(j.parent).add(origin);
       this.joints[j.name] = { def: j, motion, axis: new THREE.Vector3(...j.axis).normalize() };
     }
-    for (const [name, visuals] of Object.entries(model.links)) {
+    const shapes = layer === "collision" ? (model.collisions || {}) : model.links;
+    for (const [name, visuals] of Object.entries(shapes)) {
       for (const v of visuals) this.addVisual(linkGroup(name), v, meshes);
     }
   }
@@ -113,7 +141,7 @@ class RobotInstance {
       holder.add(c);
     } else if (g.type === "mesh") {
       meshes.load(g.uri).then((r) => {
-        if (!r) { this.stub(parent, mat); return; }
+        if (!r) { if (this.layer === "visual") this.stub(parent, mat); return; }
         let obj;
         if (r.kind === "stl") obj = new THREE.Mesh(r.geometry, mat);
         else {
@@ -181,6 +209,8 @@ export class View3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio || 1);
     el.append(this.renderer.domElement);
+    this.show = View3D.savedShow();
+    this.showBar();
     this.orbit = new OrbitControls(this.camera, this.renderer.domElement);
     this.orbit.target.set(0.15, 0, 0.4);
     this.orbit.update();
@@ -229,8 +259,55 @@ export class View3D {
     this.resize();
   }
 
+  // What of the robot to draw: its visual meshes, its collision shapes (translucent green, what MoveIt checks),
+  // or both. Shared by every 3D view of the GUI (localStorage), switched from the corner of each view.
+  showBar() {
+    const bar = document.createElement("div");
+    bar.className = "v3show";
+    for (const [k, label, tip] of [["visual", "Visual", "The robot's visual meshes"],
+      ["collision", "Collision", "The collision shapes MoveIt plans with (robot links and parts)"]]) {
+      const l = document.createElement("label");
+      l.title = tip;
+      const c = document.createElement("input");
+      c.type = "checkbox";
+      c.checked = this.show[k];
+      c.dataset.k = k;
+      c.onchange = () => this.setShow({ [k]: c.checked });
+      l.append(c, " " + label);
+      bar.append(l);
+    }
+    this.el.append(bar);
+    this.showEl = bar;
+    window.addEventListener("storage", (e) => { if (e.key === "v3-show") this.setShow(View3D.savedShow(), false); });
+    window.addEventListener("v3-show", (e) => { if (e.detail !== this) this.setShow(View3D.savedShow(), false); });
+  }
+  static savedShow() {
+    try { return { visual: true, collision: false, ...JSON.parse(localStorage.getItem("v3-show") || "{}") }; }
+    catch { return { visual: true, collision: false }; }
+  }
+  setShow(s, save = true) {
+    this.show = { ...this.show, ...s };
+    if (save) {                                            // every 3D view of the GUI follows (this tab and others)
+      localStorage.setItem("v3-show", JSON.stringify(this.show));
+      window.dispatchEvent(new CustomEvent("v3-show", { detail: this }));
+    }
+    if (this.showEl) for (const c of this.showEl.querySelectorAll("input")) c.checked = this.show[c.dataset.k];
+    if (this.robot) {
+      if (this.show.collision && !this.colBot) {           // built on first use (it loads the collision meshes)
+        this.colBot = new RobotInstance(this.model, this.meshes, true, 0x2fbf71, "collision");
+        this.colBot.material.opacity = 0.45;
+        this.scene.add(this.colBot.root);
+        if (this.robot.values) this.colBot.setJoints(this.robot.values);
+      }
+      this.robot.root.visible = this.show.visual;
+      if (this.colBot) this.colBot.root.visible = this.show.collision;
+    }
+    this.draw();
+  }
+
   async load(model) {
     if (this.robot) return;
+    this.model = model;
     this.robot = new RobotInstance(model, this.meshes, false);
     this.ghost = new RobotInstance(model, this.meshes, true);
     this.ghost.root.visible = false;
@@ -238,6 +315,7 @@ export class View3D {
     this.goalBot = new RobotInstance(model, this.meshes, true, 0xf28c28);
     this.goalBot.root.visible = false;
     this.scene.add(this.robot.root, this.ghost.root, this.goalBot.root);
+    this.setShow({}, false);
     this.draw();
   }
 
@@ -246,11 +324,14 @@ export class View3D {
     if (!this.robot) return this.load(model);
     const vis = [this.ghost.root.visible, this.goalBot.root.visible];
     const q = this.robot.values || null;
-    for (const r of [this.robot, this.ghost, this.goalBot]) {
+    for (const r of [this.robot, this.ghost, this.goalBot, this.colBot]) {
+      if (!r) continue;
       this.scene.remove(r.root);
       r.root.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
     }
     this.robot = null;
+    this.colBot = null;
+    this.meshes.forgetParts();
     await this.load(model);
     [this.ghost.root.visible, this.goalBot.root.visible] = vis;
     if (q) this.robot.setJoints(q);
@@ -282,6 +363,8 @@ export class View3D {
   setJoints(values, tcpOff) {
     if (!this.robot) return;
     this.robot.setJoints(values);
+    this.robot.values = values;
+    if (this.colBot) this.colBot.setJoints(values);
     if (tcpOff !== undefined) {
       const ok = tcpOff && this.robot.links[tcpOff.link];
       this.tcpOff = ok ? { link: tcpOff.link, M: poseToMatrix(tcpOff.xyz_mm, tcpOff.rpy_deg) } : null;

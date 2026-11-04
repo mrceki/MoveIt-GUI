@@ -305,3 +305,64 @@ def test_http_upload_and_mesh_route(env):
             assert r.read() == data
     finally:
         srv.stop()
+
+
+# ================================================================== end-effector bases
+def test_base_from_model_gates_modes_and_gripper(env, monkeypatch):
+    s, b, tmp = env
+    monkeypatch.delenv("UR7E_EE_CONFIG", raising=False)
+    assert s.running_base() == "gripper"                     # the test URDF: Robotiq, no ATI
+    assert "F/T" in s.base_lacks(mode="admittance")
+    assert s.base_lacks(mode="impedance") is None            # robotiq_tcp is there
+    info = s.info()
+    assert info["base"]["name"] == "gripper"
+    assert not next(m for m in info["modes"] if m["name"] == "admittance")["allowed"]
+    with pytest.raises(CommandError, match="F/T"):
+        run(s, "switch_mode", mode="admittance")
+    monkeypatch.setenv("UR7E_EE_CONFIG", "ft")               # the launcher's word wins over the model
+    assert s.running_base() == "ft"
+    with pytest.raises(CommandError, match="no gripper"):
+        run(s, "gripper", percent=0)
+    assert not s.info()["gripper"]["enabled"]
+
+
+def test_base_switch_and_setups_remember_their_base(env, monkeypatch):
+    s, b, tmp = env
+    monkeypatch.setenv("UR7E_EE_CONFIG", "ft_gripper")
+    cfg = tmp / "cfg" / "moveit_gui"
+    with pytest.raises(CommandError, match="launcher"):
+        run(s, "base_switch", base="gripper", confirm=True)
+    restarts = []
+    s.on_restart = lambda: restarts.append(s.restart_code)
+    with pytest.raises(CommandError, match="one of"):
+        run(s, "base_switch", base="robot_with_hat", confirm=True)
+    with pytest.raises(CommandError, match="confirm"):
+        run(s, "base_switch", base="gripper")
+    assert "already" in run(s, "base_switch", base="ft_gripper")["msg"]
+    run(s, "setup_save", name="full")
+    assert s.setups.list()[0]["base"] == "ft_gripper"
+    r = run(s, "base_switch", base="gripper", confirm=True)
+    assert r["restart"] == "stack" and (cfg / "base").read_text().strip() == "gripper"
+    assert wait(lambda: restarts == [RESTART_STACK], 3)
+    # ... the stack came back on the gripper base; loading "full" puts the F/T + gripper base back
+    monkeypatch.setenv("UR7E_EE_CONFIG", "gripper")
+    s.restart_code = None
+    v = run(s, "setup_list")
+    assert v["base"]["running"] == "gripper" and v["base"]["next"] == "gripper"
+    r = run(s, "setup_load", name="full")
+    assert r["restart"] == "stack" and "F/T sensor + gripper" in r["msg"]
+    assert (cfg / "base").read_text().strip() == "ft_gripper"
+    auto = next(x for x in s.setups.list() if x["auto"])
+    assert auto["base"] == "gripper"                          # the backup remembers what ran before
+
+
+def test_active_tcp_falls_back_when_its_link_is_gone(env, monkeypatch):
+    s, b, _ = env
+    monkeypatch.setenv("UR7E_EE_CONFIG", "none")
+    run(s, "tcp_save", name="tip", parent="robotiq_tcp", xyz_mm=[0, 0, 20], rpy_deg=[0, 0, 0])
+    s.core.set_active_tcp("tip")
+    s.tick()
+    assert s.core.store.active_tcp == "tip"                   # robotiq_tcp is in this model: kept
+    b.fake_robot_description = URDF.replace('<link name="robotiq_85_base_link"/><link name="robotiq_tcp"/><link name="finger"/>', "") \
+        .split('<joint name="grip"')[0] + "</robot>"
+    assert wait(lambda: (s.tick() or True) and s.core.store.active_tcp == "tool0", 5)

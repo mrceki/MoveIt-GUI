@@ -12,6 +12,12 @@
 #   ur7e_gui.sh --desktop               # real robot, desktop (Qt) GUI on this PC
 #   ur7e_gui.sh --fake                  # no robot: simulated arm (web; add --desktop for Qt)
 #   ur7e_gui.sh --robot-ip 10.6.203.101 -- rviz:=true servo:=true    # extra gui.launch.py args after --
+#   ur7e_gui.sh --base gripper          # switch the end-effector base (kept for the next starts; see below)
+#
+# Base = what is on the flange, a fixed part of the robot model the GUI cannot edit (parts go on top of it):
+#   ft_gripper (default)  F/T sensor + Robotiq gripper     ft        F/T sensor only (your own tool on it)
+#   gripper               Robotiq gripper on tool0          none      the bare arm
+# Kept in ~/ur7e_data/config/moveit_gui/base; SETUP > Setups switches it too (and restarts the stack).
 #
 # Saved data (programs, TCPs, fixtures, payload/vial results, logs) goes to ~/ur7e_data.
 set -eo pipefail
@@ -31,8 +37,9 @@ while [ $# -gt 0 ]; do
     --desktop)  MODE=desktop; shift ;;
     --fake)     FAKE=1; shift ;;
     --port)     PORT="$2"; shift 2 ;;
+    --base)     NEW_BASE="$2"; shift 2 ;;
     --)         shift; LAUNCH_ARGS=("$@"); break ;;
-    -h|--help)  sed -n 2,16p "$0"; exit 0 ;;
+    -h|--help)  sed -n 2,22p "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
@@ -67,6 +74,23 @@ docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$WS:/
   > "$DATA/logs/ws_build.log" 2>&1 || { tail -30 "$DATA/logs/ws_build.log"; exit 1; }
 
 # ---------------------------------------------------------------- 3. robot stack
+BASES="none gripper ft ft_gripper"
+BASE_FILE="$DATA/config/moveit_gui/base"
+valid_base() { case " $BASES " in *" $1 "*) return 0 ;; esac; return 1; }
+if [ -n "$NEW_BASE" ]; then
+  valid_base "$NEW_BASE" || { echo "--base must be one of: $BASES"; exit 1; }
+  # ~/ur7e_data belongs to root (the containers write it): write the file the same way
+  docker run --rm --network none -v "$DATA:/data" "$IMAGE" \
+    bash -c "mkdir -p /data/config/moveit_gui && printf '%s\n' '$NEW_BASE' > /data/config/moveit_gui/base"
+fi
+read_base() {                                       # the base for this start (file written by --base or the GUI)
+  local b
+  b=$(tr -d ' \t\r\n' < "$BASE_FILE" 2>/dev/null || true)
+  if [ -z "$b" ]; then b=ft_gripper
+  elif ! valid_base "$b"; then echo "$BASE_FILE says '$b' (not one of: $BASES): using ft_gripper" >&2; b=ft_gripper
+  fi
+  printf '%s' "$b"
+}
 PARTS=/data/config/moveit_gui/parts/generated      # in the container; GUI parts for the robot's URDF / SRDF
 parts_env() {                                       # -e options for the parts files that exist now
   local f
@@ -105,6 +129,7 @@ trap 'exit 130' INT TERM
 
 start_stack() {
   xhost +local:root >/dev/null 2>&1 || true
+  BASE=$(read_base)
   stamp=$(date +%Y%m%d_%H%M%S)
   if [ "$FAKE" = 1 ]; then
     STACK='exec sleep infinity'
@@ -113,7 +138,7 @@ start_stack() {
     # The log goes through a process substitution for the same reason (a `| tee` pipeline would keep bash in between).
     STACK="exec > >(tee /data/logs/launch_$stamp.log) 2>&1; exec ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]}"
   fi
-  docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" $(parts_env) \
+  docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" -e UR7E_EE_CONFIG="$BASE" $(parts_env) \
     -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$DATA:/data" -v "$WS:/ws" \
     "$IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && $STACK" >/dev/null
@@ -121,7 +146,7 @@ start_stack() {
   ENV='source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && source /ws/install/setup.bash && export XDG_CONFIG_HOME=/data/config'
 
   if [ "$FAKE" = 0 ]; then
-    say "Robot stack starting (robot $ROBOT_IP). Log: ~/ur7e_data/logs/launch_$stamp.log"
+    say "Robot stack starting (robot $ROBOT_IP, base $BASE). Log: ~/ur7e_data/logs/launch_$stamp.log"
     ok=0
     for _ in $(seq 1 45); do
       docker ps --format '{{.Names}}' | grep -qx "$NAME" || { echo "The robot stack exited:"; tail -30 "$DATA/logs/launch_$stamp.log"; return 1; }
@@ -175,14 +200,11 @@ while true; do
   run_gui || rc=$?
   case "$rc" in
     76) say "Restarting the GUI (asked from the GUI)" ;;
-    75) if [ "$FAKE" = 1 ]; then
-          say "Restarting the GUI (fake robot: there is no robot stack to restart)"
-        else
-          say "Restarting the robot stack and the GUI (asked from the GUI; up to ~45 s)"
-          docker stop "$NAME" >/dev/null 2>&1 || true
-          for _ in $(seq 1 40); do docker ps -a --format '{{.Names}}' | grep -qx "$NAME" || break; sleep 1; done
-          start_stack
-        fi ;;
+    75) # fake robot: the container is restarted too, so a new base (UR7E_EE_CONFIG) reaches the robot model
+        say "Restarting the robot stack and the GUI (asked from the GUI; up to ~45 s)"
+        docker stop "$NAME" >/dev/null 2>&1 || true
+        for _ in $(seq 1 40); do docker ps -a --format '{{.Names}}' | grep -qx "$NAME" || break; sleep 1; done
+        start_stack ;;
     *) exit "$rc" ;;
   esac
 done

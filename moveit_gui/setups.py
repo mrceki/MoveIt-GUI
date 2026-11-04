@@ -6,6 +6,9 @@ with setup.yaml describing it). Loading one puts its files back in place and res
 them fresh; when its parts differ from the running robot model the robot stack restarts too (the GUI offers it).
 Before a load, the current files are kept as an automatic setup ("_before_<name>_<time>", the newest 5 kept).
 
+A setup also remembers the end-effector base it was made on (bases.py: gripper, F/T + gripper, ...): loading it
+puts that base back, so the robot stack restarts when the base differs from the running one.
+
 Programs, policies and recordings are not part of a setup: they are shared by every setup.
 """
 from __future__ import annotations
@@ -71,10 +74,11 @@ class Setups:
                 info = {"error": str(e)}
             out.append({"name": d.name, "auto": d.name.startswith(AUTO_PREFIX), "note": info.get("note", ""),
                         "saved": info.get("saved", ""), "holds": info.get("holds", []),
-                        "profile": info.get("profile", ""), "error": info.get("error", "")})
+                        "profile": info.get("profile", ""), "base": info.get("base", ""),
+                        "error": info.get("error", "")})
         return out
 
-    def _copy_in(self, dest: Path, note: str) -> List[str]:
+    def _copy_in(self, dest: Path, note: str, base: Optional[str] = None) -> List[str]:
         tmp = dest.with_name(dest.name + ".partial")
         if tmp.exists():
             shutil.rmtree(tmp)
@@ -95,9 +99,11 @@ class Setups:
             (tmp / "files" / "ft_payload").mkdir(parents=True, exist_ok=True)
             shutil.copy2(pf[-1], tmp / "files" / "ft_payload" / pf[-1].name)
             holds.append("last payload calibration")
-        (tmp / "setup.yaml").write_text(yaml.safe_dump(
-            {"version": 1, "profile": self.profile, "note": str(note or "")[:300],
-             "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}, sort_keys=False))
+        info = {"version": 1, "profile": self.profile, "note": str(note or "")[:300],
+                "saved": time.strftime("%Y-%m-%d %H:%M"), "holds": holds}
+        if base:
+            info["base"] = str(base)
+        (tmp / "setup.yaml").write_text(yaml.safe_dump(info, sort_keys=False))
         if dest.exists():
             old = dest.with_name(dest.name + ".old")
             if old.exists():
@@ -109,14 +115,14 @@ class Setups:
             tmp.rename(dest)
         return holds
 
-    def save(self, name: str, note: str = "", replace: bool = False) -> List[str]:
+    def save(self, name: str, note: str = "", replace: bool = False, base: Optional[str] = None) -> List[str]:
         d = self._path(name)
         if d.name.startswith(AUTO_PREFIX):
             raise SetupError(f"names starting with {AUTO_PREFIX} are kept for automatic backups")
         if d.exists() and not replace:
             raise SetupError(f"a setup '{d.name}' exists (save again to replace it)")
         self.dir.mkdir(parents=True, exist_ok=True)
-        return self._copy_in(d, note)
+        return self._copy_in(d, note, base)
 
     def delete(self, name: str):
         d = self._path(name)
@@ -124,8 +130,9 @@ class Setups:
             raise SetupError(f"no setup '{name}'")
         shutil.rmtree(d)
 
-    def load(self, name: str) -> dict:
-        """Put the setup's files in place. Returns {"backup": name, "holds": [...]}; the caller restarts."""
+    def load(self, name: str, base: Optional[str] = None) -> dict:
+        """Put the setup's files in place (base: the running one, kept in the automatic backup).
+        Returns {"backup": name, "holds": [...], "base": the setup's base or ""}; the caller restarts."""
         d = self._path(name)
         files = d / "files"
         if not (d / "setup.yaml").is_file():
@@ -135,7 +142,7 @@ class Setups:
             raise SetupError(f"setup '{name}' is for robot profile {info['profile']}, this GUI runs {self.profile}")
         backup = f"{AUTO_PREFIX}{re.sub(r'[^A-Za-z0-9_.-]', '_', d.name)[:16]}_{time.strftime('%m%d_%H%M%S')}"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._copy_in(self.dir / backup, f"automatic: the files in use before '{d.name}' was loaded")
+        self._copy_in(self.dir / backup, f"automatic: the files in use before '{d.name}' was loaded", base)
         for rel in members(self.profile).values():
             dst, src = self.cfg / rel.rstrip("/"), files / rel.rstrip("/")
             if dst.is_dir():
@@ -152,7 +159,9 @@ class Setups:
             # a new name, so it is the newest file (the one SETUP shows as the last calibration)
             shutil.copy2(p, self.cfg / "ft_payload" / f"{self.profile}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         self._prune()
-        return {"backup": backup, "holds": info.get("holds", [])}
+        b = str(info.get("base") or "")
+        from .bases import BASES
+        return {"backup": backup, "holds": info.get("holds", []), "base": b if b in BASES else ""}
 
     def _prune(self):
         autos = sorted((d for d in self.dir.iterdir() if d.name.startswith(AUTO_PREFIX) and d.is_dir()),

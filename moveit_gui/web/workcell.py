@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .. import bases as B
 from .. import handeye as he
 from .. import parts as P
 from .. import transforms as tf
@@ -38,6 +39,7 @@ class WorkcellCommands:
         self._parts_sent: Dict[str, str] = {}               # object id -> attached link ("" = world)
         self._parts_sig = None
         self._parts_busy = False
+        self._tcp_checked = None
         self.he: dict = {"topic": "", "info_topic": "", "mount": "eye_in_hand", "K": None, "D": None,
                          "frame": "", "samples": [], "result": None, "poses": [], "last": None,
                          "progress": {"running": False, "done": 0, "total": 0, "error": ""}}
@@ -51,9 +53,17 @@ class WorkcellCommands:
         return self._model
 
     def part_mesh_file(self, rel: str) -> Optional[Path]:
-        if not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.stl$", rel or "", re.I):
-            return None
-        p = self.parts.mesh_dir / rel
+        """/mesh/_parts/<file>: an uploaded mesh; /mesh/_parts/hulls/<file>.hull.stl: its collision hull."""
+        rel = rel or ""
+        if rel.startswith("hulls/"):
+            f = rel[len("hulls/"):]
+            if not f.endswith(".hull.stl") or not P.MESH_FILE.match(f[:-len(".hull.stl")]):
+                return None
+            p = self.parts.generated_dir / "hulls" / f
+        else:
+            if not P.MESH_FILE.match(rel):
+                return None
+            p = self.parts.mesh_dir / rel
         return p if p.is_file() else None
 
     def _parts_tick(self):
@@ -65,6 +75,9 @@ class WorkcellCommands:
         if not m.get("ok"):
             self.parts_sync.update(state="waiting", msg="waiting for the robot model")
             return
+        if self._tcp_checked != self.model_rev and self.core.idle():
+            self._tcp_checked = self.model_rev
+            self._tcp_check(m)
         frames, objects = P.live_plan(self.parts, m)
         sig = repr([(a, b, np.round(T, 6).tolist()) for a, b, T in frames] +
                    [(o["id"], o["link"], np.round(o["T_link_obj"], 6).tolist(), o["geom"], o["attach"]) for o in objects])
@@ -142,7 +155,8 @@ class WorkcellCommands:
         links = sorted(self._robot_links())
         arm = [l for l in links if m.get("ok") and P.rides_on_arm(m, l)]
         return {"parts": out, "removed": removed, "restart_for": restart, "links": links, "arm_links": arm,
-                "meshes": self.parts.meshes(), "presets": {k: v for k, v in P.PRESETS.items()},
+                "meshes": self.parts.meshes(), "mesh_info": {f: self.parts.mesh_info(f) for f in self.parts.meshes()},
+                "presets": {k: v for k, v in P.PRESETS.items()},
                 "problems": P.problems(self.parts, m) if m.get("ok") else [], "error": self.parts.error,
                 "sync": {k: v for k, v in self.parts_sync.items() if k != "sent"},
                 "model_ok": bool(m.get("ok")), "model_msg": m.get("msg", "")}
@@ -162,7 +176,7 @@ class WorkcellCommands:
         return self._ok(what, parts=self.parts_view())
 
     def cmd_parts_save(self, name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base", color="#9aa0a6",
-                       collision=True, kind="part", note="", replace=None):
+                       collision=None, kind="part", note="", replace=None):
         old = self.parts.parts.get(replace or name)
         meta = dict(old.meta) if old else {}
         if old and meta.get("source") == "handeye" and (list(map(float, xyz_mm or [])) != old.xyz_mm or
@@ -183,8 +197,16 @@ class WorkcellCommands:
         except Exception:
             raise P.PartError("the upload is not base64") from None
         f = self.parts.add_mesh(filename, data)
-        lo, hi = self.parts.mesh_bounds(f)
-        return self._ok(f"mesh {f} uploaded", file=f, size_file_units=[round(float(v), 4) for v in hi - lo],
+        info = self.parts.mesh_info(f)
+        users = [n for n, p in self.parts.parts.items() if p.shape.get("file") == f]
+        if users:                                            # replaced a mesh parts use: regenerate the model
+            m = self._base_model()
+            if m.get("ok"):
+                P.write_generated(self.parts, m)
+            self._parts_sig = None
+            self.model_rev += 1
+        return self._ok(f"mesh {f} uploaded" + (f" (used by {', '.join(users)})" if users else ""),
+                        mesh=info, file=f, size_file_units=[round(float(v), 4) for v in info.get("size", [])],
                         parts=self.parts_view())
 
     def cmd_parts_make_tcp(self, name, tcp, at="far_face"):
@@ -264,19 +286,95 @@ class WorkcellCommands:
         return self._ok("restarting the robot stack and the GUI: this page reconnects by itself (about a minute)"
                         if code == RESTART_STACK else "restarting the GUI: this page reconnects by itself")
 
+    def _tcp_link(self, name: str) -> Optional[str]:
+        """The robot-model link (a profile TCP's link) a TCP hangs on in the end, None when its chain ends on some
+        other TF frame (a camera's, say: not the robot model's business)."""
+        tcps, seen = self.core.store.tcps, set()
+        while name in tcps and name not in seen:
+            seen.add(name)
+            t = tcps[name]
+            if t.builtin:
+                return t.link
+            name = t.parent
+        return None
+
+    def _tcp_check(self, m: dict):
+        """After a base switch the active TCP may hang on a link the robot no longer has (robotiq_tcp without the
+        gripper): fall back to the flange, so motion never plans for a frame that is not there."""
+        st = self.core.store
+        link = self._tcp_link(st.active_tcp)
+        have = set(P.merged_model(self.parts, m).get("links", {}))
+        if not link or link in have:
+            return
+        flange = next((n for n, t in st.tcps.items() if t.builtin and t.link == self.core.profile.planning_link), None)
+        if flange:
+            old = st.active_tcp
+            st.set_active_tcp(flange)
+            self.core.bridge.log(f"active TCP '{old}' is on {link}, which this robot model does not have "
+                                 f"(base '{B.running(m)}'): using '{flange}'")
+
+    # ------------------------------------------------------------------ end-effector base (bases.py)
+    def base_view(self) -> dict:
+        m = self._base_model()
+        return B.view(config_dir(), m if m.get("ok") else None)
+
+    def running_base(self) -> str:
+        m = self._base_model()
+        return B.running(m if m.get("ok") else None)
+
+    def base_lacks(self, mode: Optional[str] = None, gripper: bool = False) -> Optional[str]:
+        """Why a mode (or the gripper) cannot work on the running base, None when it can."""
+        b = self.running_base()
+        label = B.BASES[b][0]
+        if gripper and not B.has_gripper(b):
+            return f"the robot runs the '{label}' base: no gripper (switch it in SETUP › Setups)"
+        if mode:
+            md = self.core.profile.modes.get(mode)
+            if md is None:
+                return None
+            if md.requires_ft and not B.has_ft(b):
+                return f"{md.label} needs the F/T sensor, and the robot runs the '{label}' base"
+            m = self._base_model()
+            links = m.get("links", {}) if m.get("ok") else None
+            need = {md.wrench.get("frame"), md.wrench.get("point")} - {None, "", "world", self.core.profile.base_link}
+            gone = sorted(l for l in need if links is not None and l not in links)
+            if gone:
+                return f"{md.label} works at {', '.join(gone)}, which the '{label}' base does not have"
+        return None
+
+    def cmd_base_switch(self, base, confirm=False):
+        """Make `base` the end-effector base and restart the robot stack with it (new URDF, SRDF, controllers)."""
+        base = B.check(base)
+        if base == self.running_base() and (B.read_next(config_dir()) or B.DEFAULT) == base:
+            return self._ok(f"the robot already runs the '{B.BASES[base][0]}' base")
+        why = self._restart_refusal()
+        if why:
+            raise P.PartError(why)
+        if self.core.mode not in ("unknown",) and not self.core.modes.mode_supports_moveit(self.core.mode):
+            raise P.PartError(f"change to Position first (now '{self.core.mode}')")
+        if self.on_restart is None:
+            raise P.PartError("switching the base restarts the robot stack, and this GUI was not started by the "
+                              "launcher (ur7e_gui.sh): run  ur7e_gui.sh --base " + base)
+        if not confirm:
+            raise P.PartError("confirm the switch (the robot stack restarts)")
+        B.write_next(config_dir(), base)
+        self._restart(RESTART_STACK, f"base switched to {base}")
+        return self._ok(f"base '{B.BASES[base][0]}': restarting the robot stack and the GUI (about a minute)",
+                        restart="stack")
+
     # ------------------------------------------------------------------ setups
     def cmd_setup_list(self):
-        return self._ok(setups=self.setups.list())
+        return self._ok(setups=self.setups.list(), base=self.base_view())
     cmd_setup_list.read_only = True
 
     def cmd_setup_save(self, name, note="", replace=False):
-        holds = self.setups.save(str(name), str(note or ""), bool(replace))
+        holds = self.setups.save(str(name), str(note or ""), bool(replace), base=self.running_base())
         self.core.bridge.log(f"setup '{name}' saved: {', '.join(holds) or 'nothing to save yet'}")
-        return self._ok(f"setup '{name}' saved ({len(holds)} item(s))", setups=self.setups.list())
+        return self._ok(f"setup '{name}' saved ({len(holds)} item(s))", setups=self.setups.list(), base=self.base_view())
 
     def cmd_setup_delete(self, name):
         self.setups.delete(str(name))
-        return self._ok(f"setup '{name}' deleted", setups=self.setups.list())
+        return self._ok(f"setup '{name}' deleted", setups=self.setups.list(), base=self.base_view())
 
     def cmd_setup_load(self, name):
         why = self._restart_refusal()
@@ -287,14 +385,21 @@ class WorkcellCommands:
         if self.on_restart is None:
             raise P.PartError("loading a setup restarts the GUI, and this GUI was not started by the launcher "
                               "(ur7e_gui.sh)")
-        r = self.setups.load(str(name))
-        # the new files are in place: does the running robot model have the setup's parts?
+        r = self.setups.load(str(name), base=self.running_base())
+        # the new files are in place: does the running robot model have the setup's parts, on the setup's base?
         new = P.PartStore(self.parts.path)
         m = self._base_model()
         stack = bool(m.get("ok")) and any(s != "in_model" for s in P.status(new, m).values())
+        base = r.get("base")
+        if base and base != self.running_base():
+            B.write_next(config_dir(), base)
+            stack = True
+        elif base:
+            B.write_next(config_dir(), base)                 # keep the next start on it too
         self._restart(RESTART_STACK if stack else RESTART_GUI, f"setup '{name}' loaded")
         return self._ok(f"setup '{name}' loaded (the files in use before are kept as '{r['backup']}'): restarting "
-                        f"{'the robot stack and ' if stack else ''}the GUI", restart="stack" if stack else "gui")
+                        f"{'the robot stack and ' if stack else ''}the GUI" +
+                        (f" on the '{B.BASES[base][0]}' base" if base else ""), restart="stack" if stack else "gui")
 
     # ------------------------------------------------------------------ hand-eye
     def he_view(self) -> dict:

@@ -933,10 +933,10 @@ class RosBridge:
             c.pose = pose(np.eye(4))
             g = o["geom"]
             if g["type"] == "mesh":
-                from .parts import read_stl
+                from .parts import read_mesh
                 from urllib.parse import unquote, urlparse
                 try:
-                    tri = read_stl(unquote(urlparse(g["uri"]).path)) * float(g["scale"][0])
+                    tri = read_mesh(unquote(urlparse(g["uri"]).path)) * np.asarray(g["scale"], float)
                 except Exception as e:
                     return False, f"{o['id']}: {e}"
                 mesh = Mesh()

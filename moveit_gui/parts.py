@@ -1,6 +1,6 @@
 """Parts: objects bolted to the robot or the cell (a spatula holder, a camera bracket, a table), without editing URDF.
 
-A part is a simple shape (box, cylinder, sphere, an STL mesh, or none = a frame only) on a parent: a link of the
+A part is a simple shape (box, cylinder, sphere, a mesh (.stl / .obj / .dae), or none = a frame only) on a parent: a link of the
 robot model or another part, at an offset in mm / deg. Parts stack: by default a shape sits on its frame and grows
 along +Z (anchor "base"), and a part put on another part starts at that part's far face, so a tool is built like
 the real one, piece on piece.
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import math
 import re
-import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +30,7 @@ from xml.sax.saxutils import quoteattr
 import numpy as np
 import yaml
 
+from . import meshes as M
 from . import transforms as tf
 
 NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
@@ -38,8 +38,10 @@ SHAPES = ("box", "cylinder", "sphere", "mesh", "none")
 KINDS = ("part", "camera")
 JOINT_PREFIX, JOINT_SUFFIX = "gui_part_", "_joint"
 OBJECT_PREFIX = "gui_part/"
-MESH_MAX_BYTES = 20 * 1024 * 1024
-MESH_MAX_TRIANGLES = 200_000
+MESH_MAX_BYTES = M.MESH_MAX_BYTES
+MESH_FILE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.(stl|obj|dae)$", re.I)
+COLLISIONS = ("visual", "box", "hull", "none")     # visual: the shape itself; box: its bounding box;
+                                                   # hull: a mesh's convex hull (light for MoveIt); none: show only
 GENERATED_URDF, GENERATED_SRDF = "robot_parts.urdf.xacro", "robot_parts.srdf.xacro"
 POS_TOL_M, ANG_TOL_RAD = 1e-5, 1e-4
 
@@ -60,33 +62,16 @@ def part_of_joint(joint: str) -> Optional[str]:
 
 # ===================================================================== meshes
 def read_stl(path: Path) -> np.ndarray:
-    """Triangles of a binary or ASCII STL, (n, 3, 3) float, file units. Raises PartError."""
-    data = Path(path).read_bytes()
-    if len(data) > MESH_MAX_BYTES:
-        raise PartError(f"mesh over {MESH_MAX_BYTES // 2**20} MB")
-    if len(data) >= 84:
-        n = struct.unpack_from("<I", data, 80)[0]
-        if 84 + 50 * n == len(data):
-            if n > MESH_MAX_TRIANGLES:
-                raise PartError(f"mesh has {n} triangles (at most {MESH_MAX_TRIANGLES}): simplify it")
-            rec = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
-            return np.frombuffer(data, rec, n, 84)["v"].astype(float)
+    """Triangles of any supported mesh file (kept under its old name). Raises PartError."""
+    return read_mesh(path)
+
+
+def read_mesh(path: Path) -> np.ndarray:
+    """Triangles (n, 3, 3) of an .stl / .obj / .dae (a .dae in metres, the others in file units). Raises PartError."""
     try:
-        text = data.decode("ascii")
-    except UnicodeDecodeError:
-        raise PartError("not an STL file (binary size does not match, and it is not ASCII)") from None
-    if not text.lstrip().lower().startswith("solid"):
-        raise PartError("not an STL file")
-    v = [[float(x) for x in m.groups()] for m in
-         re.finditer(r"vertex\s+(\S+)\s+(\S+)\s+(\S+)", text)]
-    if not v or len(v) % 3:
-        raise PartError("STL without complete triangles")
-    if len(v) // 3 > MESH_MAX_TRIANGLES:
-        raise PartError(f"mesh has {len(v) // 3} triangles (at most {MESH_MAX_TRIANGLES}): simplify it")
-    tri = np.asarray(v, float).reshape(-1, 3, 3)
-    if not np.isfinite(tri).all():
-        raise PartError("STL with non-finite vertices")
-    return tri
+        return M.read_mesh(path)
+    except M.MeshError as e:
+        raise PartError(str(e)) from None
 
 
 # ===================================================================== data
@@ -99,7 +84,7 @@ class Part:
     shape: dict = field(default_factory=lambda: {"type": "none"})
     anchor: str = "base"                            # base: the shape starts at the frame and grows along +Z
     color: str = "#9aa0a6"
-    collision: bool = True
+    collision: str = "visual"                      # one of COLLISIONS
     kind: str = "part"                              # camera: a camera's frame (hand-eye calibration result)
     note: str = ""
     meta: dict = field(default_factory=dict)        # saved, source (typed / handeye / preset)
@@ -119,17 +104,20 @@ class Part:
             h = 2 * s["radius_mm"] / 1000.0
         elif t == "mesh" and mesh_bounds is not None:
             lo, hi = mesh_bounds
-            return float(lo[2]) * s.get("scale", 1.0), float(hi[2]) * s.get("scale", 1.0)
+            z = s.get("offset_mm", [0, 0, 0])[2] / 1000.0
+            return float(lo[2]) * s.get("scale", 1.0) + z, float(hi[2]) * s.get("scale", 1.0) + z
         else:
             return 0.0, 0.0
         return (0.0, h) if self.anchor == "base" else (-h / 2, h / 2)
 
     def T_part_geom(self) -> np.ndarray:
-        """Where the primitive's centre is (URDF primitives are centred). Meshes keep their own origin."""
-        lo, hi = self.extent_m()
+        """Where the primitive's centre is (URDF primitives are centred); a mesh's origin, moved by its offset_mm."""
         T = np.eye(4)
         if self.shape.get("type") in ("box", "cylinder", "sphere"):
+            lo, hi = self.extent_m()
             T[2, 3] = (lo + hi) / 2
+        elif self.shape.get("type") == "mesh":
+            T[:3, 3] = [v / 1000.0 for v in self.shape.get("offset_mm", [0, 0, 0])]
         return T
 
     def to_yaml(self) -> dict:
@@ -153,8 +141,26 @@ def _num(v, what, lo=-1e9, hi=1e9) -> float:
     return x
 
 
+def collision_mode(collision, shape_type: str) -> str:
+    """visual / box / hull / none; True / False (older files) are visual / none. A frame has none; only a mesh has
+    a hull (for a primitive, hull is the shape itself)."""
+    if collision is None:
+        c = "hull" if shape_type == "mesh" else "visual"
+    elif isinstance(collision, bool):
+        c = "visual" if collision else "none"
+    else:
+        c = str(collision).strip().lower()
+    if c not in COLLISIONS:
+        raise PartError(f"collision is one of {', '.join(COLLISIONS)}")
+    if shape_type == "none":
+        return "none"
+    if c == "hull" and shape_type != "mesh":
+        return "visual"
+    return c
+
+
 def make_part(name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base", color="#9aa0a6",
-              collision=True, kind="part", note="", meta=None) -> Part:
+              collision=None, kind="part", note="", meta=None) -> Part:
     name = str(name).strip()
     if not NAME.match(name):
         raise PartError("a part name is lower_snake_case: a-z, 0-9, _ (up to 40, starting with a letter)")
@@ -178,9 +184,15 @@ def make_part(name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base"
         s = {"type": "sphere", "radius_mm": _num(s.get("radius_mm"), "radius", 0.1, 1500)}
     elif t == "mesh":
         f = str(s.get("file", ""))
-        if not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\.stl$", f, re.I):
-            raise PartError("a mesh part needs an uploaded STL file")
-        s = {"type": "mesh", "file": f, "scale": _num(s.get("scale", 0.001), "mesh scale", 1e-6, 10)}
+        if not MESH_FILE.match(f):
+            raise PartError("a mesh part needs an uploaded .stl, .obj or .dae file")
+        off = [_num(v, "mesh offset", -3000, 3000) for v in (s.get("offset_mm") or [0, 0, 0])]
+        if len(off) != 3:
+            raise PartError("a mesh offset is x, y, z in mm")
+        dflt = 1.0 if M.unit_metres(f) else 0.001                  # a .dae carries its unit; STL / OBJ: CAD mm
+        s = {"type": "mesh", "file": f, "scale": _num(s.get("scale", dflt), "mesh scale", 1e-6, 10)}
+        if any(off):
+            s["offset_mm"] = off
     else:
         s = {"type": "none"}
     if anchor not in ("base", "center"):
@@ -189,7 +201,7 @@ def make_part(name, parent, xyz_mm=None, rpy_deg=None, shape=None, anchor="base"
         raise PartError("colour is #rrggbb")
     if kind not in KINDS:
         raise PartError(f"kind is one of {', '.join(KINDS)}")
-    return Part(name, str(parent).strip(), xyz, rpy, s, anchor, str(color), bool(collision) and t != "none",
+    return Part(name, str(parent).strip(), xyz, rpy, s, anchor, str(color), collision_mode(collision, s["type"]),
                 kind, str(note or "")[:200], dict(meta or {}))
 
 
@@ -201,7 +213,7 @@ class PartStore:
         self.generated_dir = self.path.parent / "generated"
         self.parts: Dict[str, Part] = {}
         self.error = ""
-        self._bounds: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        self._bounds: Dict[str, tuple] = {}            # file -> ((file, mtime), (lo, hi))
         self.load()
 
     def load(self):
@@ -287,34 +299,68 @@ class PartStore:
 
     # ---- meshes
     def add_mesh(self, filename: str, data: bytes) -> str:
-        base = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(str(filename)).name)
-        if not base.lower().endswith(".stl"):
-            raise PartError("upload an .stl file (export it from CAD as STL)")
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(str(filename)).name).lstrip(".-") or "mesh"
+        if not MESH_FILE.match(base):
+            raise PartError("upload an .stl, .obj or .dae file (export it from CAD as one of these)")
         if len(data) > MESH_MAX_BYTES:
             raise PartError(f"mesh over {MESH_MAX_BYTES // 2**20} MB")
+        try:
+            M.read_mesh_bytes(data, base)
+        except M.MeshError as e:
+            raise PartError(str(e)) from None
         self.mesh_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.mesh_dir / (base + ".upload")
         tmp.write_bytes(data)
-        try:
-            read_stl(tmp)
-        except PartError:
-            tmp.replace(self.mesh_dir / ".rejected_upload")
-            raise
         tmp.replace(self.mesh_dir / base)
         self._bounds.pop(base, None)
         return base
 
     def meshes(self) -> List[str]:
-        return sorted(p.name for p in self.mesh_dir.glob("*.stl")) if self.mesh_dir.is_dir() else []
+        if not self.mesh_dir.is_dir():
+            return []
+        return sorted(p.name for p in self.mesh_dir.iterdir() if p.is_file() and MESH_FILE.match(p.name))
+
+    def mesh_info(self, f: str) -> dict:
+        """Size of a mesh as read (a .dae in m, others in file units) and a guess of the unit, for the upload."""
+        b = self.mesh_bounds(f)
+        if b is None:
+            return {"file": f, "error": "cannot read it"}
+        size = [float(v) for v in b[1] - b[0]]
+        metres = M.unit_metres(f)
+        hint = "m" if metres else M.unit_hint(size)
+        return {"file": f, "min": [float(v) for v in b[0]], "max": [float(v) for v in b[1]], "size": size,
+                "unit": "m" if metres else "file", "hint": hint,
+                "scale": 1.0 if metres or hint == "m" else 0.001}
 
     def mesh_bounds(self, f: str) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        if f not in self._bounds:
+        p = self.mesh_dir / f
+        try:
+            key = (f, p.stat().st_mtime_ns)
+        except OSError:
+            return None
+        if self._bounds.get(f, (None,))[0] != key:
             try:
-                tri = read_stl(self.mesh_dir / f).reshape(-1, 3)
-                self._bounds[f] = (tri.min(axis=0), tri.max(axis=0))
+                tri = read_mesh(p).reshape(-1, 3)
             except (OSError, PartError):
                 return None
-        return self._bounds[f]
+            self._bounds[f] = (key, (tri.min(axis=0), tri.max(axis=0)))
+        return self._bounds[f][1]
+
+    def hull_file(self, f: str) -> Path:
+        """The convex hull of mesh f as an STL (same units as f reads), made once per mesh version."""
+        src = self.mesh_dir / f
+        out = self.generated_dir / "hulls" / (f + ".hull.stl")
+        if out.is_file() and out.stat().st_mtime_ns >= src.stat().st_mtime_ns:
+            return out
+        try:
+            tri = M.convex_hull(read_mesh(src))
+        except M.MeshError as e:
+            raise PartError(f"{f}: no hull ({e})") from None
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp")
+        M.write_stl(tmp, tri)
+        tmp.replace(out)
+        return out
 
     def extent_m(self, part: Part) -> Tuple[float, float]:
         mb = self.mesh_bounds(part.shape["file"]) if part.shape.get("type") == "mesh" else None
@@ -422,12 +468,67 @@ def _rgba(color: str) -> List[float]:
     return [int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5)] + [1.0]
 
 
+def _keeps_colours(p: Part) -> bool:
+    """A .dae shows its own colours (RViz and the 3D view): the part colour is not put over it."""
+    return p.shape.get("type") == "mesh" and M.unit_metres(p.shape["file"])
+
+
 def _visual(store: PartStore, p: Part) -> Optional[dict]:
     g = _geom_m(store, p)
     if g is None:
         return None
     T = p.T_part_geom()
-    return {"geometry": g, "xyz": [float(v) for v in T[:3, 3]], "rpy": [0.0, 0.0, 0.0], "rgba": _rgba(p.color)}
+    return {"geometry": g, "xyz": [float(v) for v in T[:3, 3]], "rpy": [0.0, 0.0, 0.0],
+            "rgba": None if _keeps_colours(p) else _rgba(p.color)}
+
+
+def _collision(store: PartStore, p: Part) -> Optional[Tuple[dict, np.ndarray]]:
+    """(geometry in metres, T_part_geom) MoveIt and the URDF collide with, None for collision none."""
+    g = _geom_m(store, p)
+    if g is None or p.collision == "none":
+        return None
+    T = p.T_part_geom()
+    if p.collision == "box":
+        if g["type"] == "mesh":
+            b = store.mesh_bounds(p.shape["file"])
+            if b is None:
+                return None
+            lo, hi = b[0] * p.shape["scale"], b[1] * p.shape["scale"]
+            C = np.eye(4)
+            C[:3, 3] = (lo + hi) / 2
+            return {"type": "box", "size": [max(float(v), 1e-4) for v in hi - lo]}, T @ C
+        if g["type"] == "cylinder":
+            return {"type": "box", "size": [2 * g["radius"], 2 * g["radius"], g["length"]]}, T
+        if g["type"] == "sphere":
+            return {"type": "box", "size": [2 * g["radius"]] * 3}, T
+        return g, T
+    if p.collision == "hull" and g["type"] == "mesh":
+        try:
+            return {**g, "uri": store.hull_file(p.shape["file"]).resolve().as_uri()}, T
+        except (OSError, PartError):
+            return g, T                                        # no hull (flat mesh): the mesh itself
+    return g, T
+
+
+def collision_geom(store: PartStore, p: Part) -> Optional[dict]:
+    """The collision shape as a visual-like dict {geometry, xyz, rpy} (for the 3D views), None for none."""
+    c = _collision(store, p)
+    if c is None:
+        return None
+    g, T = c
+    return {"geometry": g, "xyz": [float(v) for v in T[:3, 3]],
+            "rpy": list(tf.quat_to_rpy(tf.matrix_to_quat(T[:3, :3]))), "rgba": None}
+
+
+def _same_geom(a: Optional[dict], b: Optional[dict]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    ga, gb = a["geometry"], b["geometry"]
+    if ga.get("type") != gb.get("type") or not np.allclose(a.get("xyz", [0, 0, 0]), b["xyz"], atol=POS_TOL_M):
+        return False
+    if ga.get("type") == "mesh" and Path(str(ga.get("uri", ""))).name != Path(str(gb.get("uri", ""))).name:
+        return False
+    return all(np.allclose(ga.get(k), gb[k], atol=1e-6) for k in ("size", "radius", "length", "scale") if k in gb)
 
 
 def status(store: PartStore, model: dict) -> Dict[str, str]:
@@ -443,12 +544,10 @@ def status(store: PartStore, model: dict) -> Dict[str, str]:
             continue
         same = j["parent"] == p.parent and _same_T(_joint_T(j), p.T_parent_part())
         vis, mine = links.get(n) or [], _visual(store, p)
-        if same and (len(vis) == (1 if mine else 0)) and mine:
-            v = vis[0]
-            same = v["geometry"].get("type") == mine["geometry"]["type"] and \
-                np.allclose(v.get("xyz", [0, 0, 0]), mine["xyz"], atol=POS_TOL_M) and all(
-                    np.allclose(v["geometry"].get(k), mine["geometry"][k], atol=1e-6)
-                    for k in ("size", "radius", "length", "scale") if k in mine["geometry"])
+        same = same and len(vis) == (1 if mine else 0) and (not mine or _same_geom(vis[0], mine))
+        if same and "collisions" in model:                   # the model knows its collision shapes: compare those
+            col, cmine = model["collisions"].get(n) or [], collision_geom(store, p)
+            same = len(col) == (1 if cmine else 0) and (not cmine or _same_geom(col[0], cmine))
         out[n] = "in_model" if same else "changed"
     for n in have:
         if n not in store.parts:
@@ -460,17 +559,20 @@ def merged_model(store: PartStore, model: dict) -> dict:
     """The robot model plus the live parts (for the 3D views and FK). Parts already in the model stay as they are."""
     st = status(store, model)
     links = dict(model.get("links", {}))
+    cols = dict(model.get("collisions", {}))
     joints = list(model.get("joints", []))
     for n, p in store.ordered().items():
         if st.get(n) != "live" or (p.parent not in links):
             continue
         v = _visual(store, p)
         links[n] = [v] if v else []
+        c = collision_geom(store, p)
+        cols[n] = [c] if c else []
         T = p.T_parent_part()
         joints.append({"name": joint_name(n), "type": "fixed", "parent": p.parent, "child": n,
                        "xyz": [float(x) for x in T[:3, 3]], "rpy": list(tf.quat_to_rpy(tf.matrix_to_quat(T[:3, :3]))),
                        "axis": [1.0, 0, 0], "limit": None, "mimic": None})
-    return {**model, "links": links, "joints": joints}
+    return {**model, "links": links, "collisions": cols, "joints": joints}
 
 
 def anchor(store: PartStore, model: dict, name: str) -> Tuple[str, np.ndarray]:
@@ -506,11 +608,10 @@ def live_plan(store: PartStore, model: dict) -> Tuple[List[Tuple[str, str, np.nd
             continue                                         # parent missing from this model: shown as a problem
         if p.parent in links or p.parent in store.parts:
             frames.append((p.parent, n, p.T_parent_part()))
-        g = _geom_m(store, p)
-        if g is None or not p.collision:
+        c = _collision(store, p)
+        if c is None:
             continue
-        objects.append({"id": OBJECT_PREFIX + n, "link": link, "T_link_obj": T_link_part @ p.T_part_geom(),
-                        "geom": g, "attach": rides_on_arm(model, link),
+        objects.append({"id": OBJECT_PREFIX + n, "link": link, "T_link_obj": T_link_part @ c[1], "geom": c[0], "attach": rides_on_arm(model, link),
                         "touch_links": sorted(neighbourhood(model, link) | {
                             q for q in store.parts if q != n and _anchor_link(store, model, q) == link})})
     return frames, objects
@@ -581,10 +682,13 @@ def generate_urdf(store: PartStore, model: Optional[dict] = None) -> str:
         if g is not None:
             o = _origin_xml(p.T_part_geom())
             rgba = " ".join(_f(v) for v in _rgba(p.color))
-            lines.append(f'    <visual>{o}<geometry>{_geometry_xml(g)}</geometry>'
-                         f'<material name="gui_part_{n}_colour"><color rgba="{rgba}"/></material></visual>')
-            if p.collision:
-                lines.append(f'    <collision>{o}<geometry>{_geometry_xml(g)}</geometry></collision>')
+            mat = "" if _keeps_colours(p) else \
+                f'<material name="gui_part_{n}_colour"><color rgba="{rgba}"/></material>'
+            lines.append(f'    <visual>{o}<geometry>{_geometry_xml(g)}</geometry>{mat}</visual>')
+            c = _collision(store, p)
+            if c is not None:
+                lines.append(f'    <collision>{_origin_xml(c[1])}<geometry>{_geometry_xml(c[0])}</geometry>'
+                             '</collision>')
         lines.append('  </link>')
         lines.append(f'  <joint name="{joint_name(n)}" type="fixed"><parent link="{p.parent}"/><child link="{n}"/>'
                      f'{_origin_xml(p.T_parent_part())}</joint>')

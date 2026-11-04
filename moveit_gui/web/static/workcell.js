@@ -28,6 +28,8 @@ export function workcell(ctx) {
     if (s.type === "mesh") return `mesh ${s.file}`;
     return "frame only";
   }
+  const COLL = { visual: "collides as shown", box: "collides as its bounding box", hull: "collides as its convex hull",
+    none: "no collision (shown only)" };
 
   function buildParts(onChange) {
     const P = { editing: null, data: null };
@@ -35,7 +37,24 @@ export function workcell(ctx) {
       ["box", "cylinder", "sphere", "mesh", "none"].map((t) => h("option", { value: t }, t === "none" ? "none (frame only)" : t)));
     const fields = h("div", { class: "row wrap", id: "pt-dims" });
     const meshSel = h("select", { id: "pt-mesh", style: "min-width:140px" });
-    const fileIn = h("input", { type: "file", accept: ".stl,.STL", style: "display:none", onchange: (e) => upload(e.target.files[0]) });
+    const fileIn = h("input", { type: "file", accept: ".stl,.STL,.obj,.OBJ,.dae,.DAE", style: "display:none", onchange: (e) => upload(e.target.files[0]) });
+    const isDae = (f) => /\.dae$/i.test(f || "");
+    // where the mesh's own origin goes in the part frame: as exported, centred on the frame, or standing on it
+    function meshPlace(how) {
+      const i = P.data?.mesh_info?.[meshSel.value], k = +$("#pt-scale").value * 1000;
+      if (!i || !i.min) return toast("the mesh cannot be read", false);
+      const c = [0, 1, 2].map((a) => -(i.min[a] + i.max[a]) / 2 * k);
+      if (how === "base") c[2] = -i.min[2] * k;
+      set3("pt-moff", how === "none" ? [0, 0, 0] : c.map((x) => +x.toFixed(2)));
+    }
+    function meshSize() {
+      const i = P.data?.mesh_info?.[meshSel.value], el = $("#pt-msize");
+      if (!el) return;
+      const sc = $("#pt-scale");
+      if (sc) { sc.disabled = isDae(meshSel.value); if (sc.disabled) sc.value = "1"; }
+      el.textContent = i && i.size ? `${i.size.map((x) => +(x * +$("#pt-scale").value * 1000).toFixed(1)).join(" × ")} mm` +
+        (isDae(meshSel.value) ? " (the .dae's own unit)" : "") : "";
+    }
     function shapeFields(sh) {
       const t = shapeSel.value, s = sh || {};
       const kids = [];
@@ -43,26 +62,37 @@ export function workcell(ctx) {
       if (t === "cylinder") kids.push(h("span", { class: "k" }, "radius"), num("pt-d0", s.radius_mm ?? 20, "0.5"), h("span", { class: "k" }, "length mm"), num("pt-d1", s.length_mm ?? 50, "0.5"));
       if (t === "sphere") kids.push(h("span", { class: "k" }, "radius mm"), num("pt-d0", s.radius_mm ?? 15, "0.5"));
       if (t === "mesh") kids.push(meshSel, h("span", { class: "k" }, "units"),
-        h("select", { id: "pt-scale" }, h("option", { value: "0.001" }, "mm"), h("option", { value: "1" }, "m"), h("option", { value: "0.0254" }, "inch")),
-        btn("Upload STL…", "quiet", () => fileIn.click(), "An STL exported from CAD (up to 20 MB). Its own origin is the part frame."));
+        h("select", { id: "pt-scale", onchange: () => meshSize(), title: "The unit the file was exported in (a .dae carries its own)" },
+          h("option", { value: "0.001" }, "mm"), h("option", { value: "1" }, "m"), h("option", { value: "0.0254" }, "inch")),
+        btn("Upload…", "quiet", () => fileIn.click(), "An .stl, .obj or .dae exported from CAD (up to 20 MB). A .dae keeps its colours."),
+        h("span", { class: "muted small", id: "pt-msize", style: "width:100%" }),
+        h("span", { class: "k" }, "mesh origin at X Y Z mm"), v3("pt-moff", s.offset_mm || [0, 0, 0], "0.5"),
+        h("div", { class: "row", style: "width:100%;gap:2px" }, h("span", { class: "muted small" }, "place it:"),
+          btn("as exported", "quiet", () => meshPlace("none"), "The mesh's own origin on the part frame"),
+          btn("centred", "quiet", () => meshPlace("center"), "Its bounding box centred on the part frame"),
+          btn("standing on the frame", "quiet", () => meshPlace("base"), "Centred in X / Y, its lowest point on the frame (stacks like the other shapes)")));
       fields.replaceChildren(...kids);
       if (t === "mesh") {
         meshSel.replaceChildren(...(P.data?.meshes || []).map((m) => h("option", { value: m }, m)));
+        meshSel.onchange = () => meshSize();
         if (s.file) meshSel.value = s.file;
         if (s.scale) fields.querySelector("#pt-scale").value = String(s.scale);
+        meshSize();
       }
     }
     async function upload(f) {
       if (!f) return;
-      if (f.size > 20 * 1024 * 1024) return toast("the STL is over 20 MB: simplify it", false);
+      if (f.size > 20 * 1024 * 1024) return toast("the mesh is over 20 MB: simplify it", false);
       const b64 = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.readAsDataURL(f); });
       const r = await ctx.post("/api/upload", { filename: f.name, data_b64: b64 });
       fileIn.value = "";
       if (!r.ok) return;
       fill(r.parts);
-      shapeSel.value = "mesh"; shapeFields({ file: r.file });
-      const sz = r.size_file_units;
-      toast(`${r.file}: ${sz.join(" × ")} in file units (mm if it measures like the real part)`, true);
+      const i = r.mesh || {};
+      shapeSel.value = "mesh"; shapeFields({ file: r.file, scale: i.scale });
+      if ($("#pt-coll").value === "visual") $("#pt-coll").value = "hull";
+      toast(i.unit === "m" ? `${r.file}: ${i.size.map((x) => +(x * 1000).toFixed(1)).join(" × ")} mm` :
+        `${r.file}: ${r.size_file_units.join(" × ")} in file units, read as ${i.hint === "m" ? "metres" : "mm"}: check the size shown`, true);
     }
     const parentSel = h("select", { id: "pt-parent", style: "min-width:180px", title: "What it is bolted to: a link of the robot, or another part" });
     const presetSel = h("select", { id: "pt-preset", onchange: () => { const k = presetSel.value; presetSel.value = ""; if (k) startFrom(P.data.presets[k], k); } });
@@ -70,7 +100,7 @@ export function workcell(ctx) {
       h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Parts"),
         btn("+ New part", "quiet", () => startFrom({ parent: "tool0", shape: { type: "box", size_mm: [40, 40, 20] } }))),
       note("Things bolted to the robot or the cell, built piece on piece like the real tool. MoveIt plans around them at once.",
-        "A part is a box, cylinder, sphere or STL on a parent (a robot link or another part), at an offset in mm / deg. " +
+        "A part is a box, cylinder, sphere or mesh (.stl, .obj, .dae) on a parent (a robot link or another part), at an offset in mm / deg. " +
         "A shape sits on its frame and grows along +Z, so a part put on another one starts on its far face. Saved parts are " +
         "live at once: a TF frame, a MoveIt collision object (carried by the arm link they ride on) and the 3D views. " +
         "Restart the robot stack to write them into the robot model too (URDF / SRDF: RViz, recordings, self-collision). " +
@@ -96,8 +126,10 @@ export function workcell(ctx) {
         h("span", {}), fields,
         h("span", { class: "k" }, "Shape sits"), h("select", { id: "pt-anchor" }, h("option", { value: "base" }, "on the frame, along +Z"), h("option", { value: "center" }, "centred on the frame")),
         h("span", { class: "k" }, "Colour"), h("div", { class: "row" }, h("input", { type: "color", id: "pt-color", value: "#9aa0a6" }),
-          h("label", { class: "chk", title: "MoveIt avoids it (and carries it with the arm)" }, h("input", { type: "checkbox", id: "pt-coll", checked: true }), "collision"),
           h("label", { class: "chk", title: "A camera's frame (made by Camera calibration)" }, h("input", { type: "checkbox", id: "pt-cam" }), "camera")),
+        h("span", { class: "k" }, "Collision"), h("select", { id: "pt-coll", title: "What MoveIt avoids (and carries with the arm). The 3D views show it with Collision ticked." },
+          h("option", { value: "visual" }, "as shown"), h("option", { value: "hull" }, "convex hull (light; meshes)"),
+          h("option", { value: "box" }, "bounding box"), h("option", { value: "none" }, "none (shown only)")),
         h("span", { class: "k" }, "Note"), h("input", { type: "text", id: "pt-note", placeholder: "optional" })),
       h("div", { class: "row" }, lease(btn("Save part", "primary", () => save())),
         lease(btn("TCP at its tip…", "", () => makeTcp(), "A virtual TCP at the far face of this part (it follows the part when you edit it)")),
@@ -113,7 +145,9 @@ export function workcell(ctx) {
       set3("pt-xyz", d.xyz_mm || [0, 0, 0]); set3("pt-rpy", d.rpy_deg || [0, 0, 0]);
       shapeSel.value = d.shape?.type || "none"; shapeFields(d.shape);
       $("#pt-anchor").value = d.anchor || "base"; $("#pt-color").value = d.color || "#9aa0a6";
-      $("#pt-coll").checked = d.collision !== false; $("#pt-cam").checked = d.kind === "camera"; $("#pt-note").value = d.note || "";
+      $("#pt-coll").value = d.collision === false ? "none" : d.collision === true || !d.collision ?
+        (d.shape?.type === "mesh" ? "hull" : "visual") : d.collision;
+      $("#pt-cam").checked = d.kind === "camera"; $("#pt-note").value = d.note || "";
       $("#pt-name").focus();
     }
     function edit(p) {
@@ -127,13 +161,13 @@ export function workcell(ctx) {
       if (t === "box") return { type: t, size_mm: [d(0), d(1), d(2)] };
       if (t === "cylinder") return { type: t, radius_mm: d(0), length_mm: d(1) };
       if (t === "sphere") return { type: t, radius_mm: d(0) };
-      if (t === "mesh") return { type: t, file: meshSel.value, scale: +$("#pt-scale").value };
+      if (t === "mesh") return { type: t, file: meshSel.value, scale: +$("#pt-scale").value, offset_mm: read3("pt-moff") };
       return { type: "none" };
     }
     async function save() {
       const name = $("#pt-name").value.trim();
       const r = await cmd("parts_save", { name, parent: parentSel.value, xyz_mm: read3("pt-xyz"), rpy_deg: read3("pt-rpy"),
-        shape: shape(), anchor: $("#pt-anchor").value, color: $("#pt-color").value, collision: $("#pt-coll").checked,
+        shape: shape(), anchor: $("#pt-anchor").value, color: $("#pt-color").value, collision: $("#pt-coll").value,
         kind: $("#pt-cam").checked ? "camera" : "part", note: $("#pt-note").value, replace: P.editing });
       if (r.ok) { fill(r.parts); P.editing = name; $("#pt-title").textContent = `Edit ${name}`; onChange(); }
     }
@@ -156,12 +190,13 @@ export function workcell(ctx) {
       parentSel.replaceChildren(...groups.filter(([, ls]) => ls.length).map(([g, ls]) => h("optgroup", { label: g }, ls.map((l) => h("option", { value: l }, l)))));
       if (keep) parentSel.value = keep;
       presetSel.replaceChildren(h("option", { value: "" }, "—"), ...Object.keys(d.presets).map((k) => h("option", { value: k }, k)));
-      if (shapeSel.value === "mesh") { const m = meshSel.value; shapeFields({ file: m, scale: +$("#pt-scale").value }); }
+      if (shapeSel.value === "mesh") { const m = meshSel.value; shapeFields({ file: m, scale: +$("#pt-scale").value, offset_mm: read3("pt-moff") }); }
       $("#pt-list").replaceChildren(...(d.parts.length ? d.parts.map((p) => {
         const [lbl, cls, tip] = STATUS[p.status] || [p.status, "", ""];
         return h("tr", { class: P.editing === p.name ? "on" : "" },
           h("td", {}, h("span", { class: "dot", style: `background:${p.color}` }), " ", p.name, p.kind === "camera" ? " 📷" : ""),
-          h("td", { class: "mono" }, p.parent), h("td", {}, shapeText(p)),
+          h("td", { class: "mono" }, p.parent), h("td", { title: COLL[p.collision] || "" }, shapeText(p),
+            p.collision && p.collision !== "visual" && p.shape.type !== "none" ? h("span", { class: "muted small" }, ` · ${p.collision === "none" ? "no collision" : p.collision}`) : ""),
           h("td", { class: "mono small", style: "white-space:nowrap" }, `${p.xyz_mm.map((x) => +x.toFixed(1)).join(", ")}`, h("br"), `${p.rpy_deg.map((x) => +x.toFixed(1)).join(", ")}°`),
           h("td", {}, chip(lbl, cls, tip), p.meta?.source === "handeye" ? chip("calibrated", "ok", p.note || "") : ""),
           h("td", {}, h("div", { class: "row", style: "flex-wrap:nowrap;gap:2px" }, btn("Edit", "quiet", () => edit(p)),
@@ -350,7 +385,14 @@ export function workcell(ctx) {
         h("input", { type: "text", id: "st-note", placeholder: "note (what is mounted)", style: "flex:1" }),
         lease(btn("Save", "primary", () => save(false)))),
       h("details", {}, h("summary", { class: "muted small" }, "Automatic backups (before each load, newest 5)"), autos));
+    const baseBox = h("div", { class: "list", id: "st-base" });
     const side = h("div", { class: "card", style: "width:320px" },
+      h("div", { class: "section" }, "Base"),
+      note("What is on the flange. Fixed parts of the robot model: parts go on top of them.",
+        "Each base has its own URDF, SRDF (MoveIt's collision rules and groups) and controllers. Switching restarts the robot " +
+        "stack. The usual way: build a tool on a base in SETUP › Parts, save it as a setup here, and switch by loading setups " +
+        "(a setup puts its base back)."),
+      baseBox,
       h("div", { class: "section" }, "Restart"),
       note("After changing parts, or when something is stuck."),
       h("div", { class: "row" }, lease(btn("Restart GUI…", "", () => restart("gui"), "The GUI only: the robot stack keeps running"))),
@@ -361,17 +403,39 @@ export function workcell(ctx) {
       const name = $("#st-name").value.trim();
       const r = await cmd("setup_save", { name, note: $("#st-note").value, replace });
       if (!r.ok && /exists/.test(r.msg || "") && window.confirm(`Replace setup "${name}" with the current configuration?`)) return save(true);
-      if (r.ok) fill(r.setups);
+      if (r.ok) { fillBase(r.base); fill(r.setups); }
+    }
+    let B = null;
+    const baseLabel = (n) => (B?.choices.find((c) => c.name === n) || { label: n || "?" }).label;
+    function fillBase(b) {
+      if (!b) return;
+      B = b;
+      baseBox.replaceChildren(...b.choices.map((c) => h("div", { class: "item" + (c.name === b.running ? " on" : "") },
+        h("div", { class: "grow" }, h("div", {}, c.label, c.name === b.running ? h("span", { class: "chip ok" }, " running") : "",
+          c.name === b.next && c.name !== b.running ? h("span", { class: "chip warn" }, " next start") : ""),
+          h("div", { class: "muted small" }, c.text)),
+        c.name === b.running ? "" : lease(btn("Switch…", "quiet", () => switchBase(c))))));
+    }
+    async function switchBase(c) {
+      if (!window.confirm(`Switch the base to "${c.label}"?\n\n${c.text}.\n\nCheck first that this is what is really on the robot. ` +
+        "The robot stack restarts with its URDF, SRDF and controllers. Your parts stay; parts on links this base does not have " +
+        "are left out (SETUP › Parts lists them). If the active TCP is on the removed hardware, the GUI falls back to tool0.\n\n" +
+        "Save the current configuration as a setup first if you want to come back to it.")) return;
+      const r = await cmd("base_switch", { base: c.name, confirm: true });
+      if (r.ok) toast(r.msg, true, true);
     }
     async function load(s) {
-      if (!window.confirm(`Load setup "${s.name}"?\n\n${s.holds.join(", ")}\n\nThe GUI restarts (and the robot stack too if its parts ` +
-        "differ from the running robot model). The current files are kept as an automatic backup. Afterwards: check the TCP, " +
+      const sw = s.base && B && s.base !== B.running ? `\n\nBase: ${baseLabel(B.running)} → ${baseLabel(s.base)} (check the hardware on the robot).` : "";
+      if (!window.confirm(`Load setup "${s.name}"?\n\n${s.holds.join(", ")}${sw}\n\nThe GUI restarts (and the robot stack too if its parts ` +
+        "or base differ from the running robot model). The current files are kept as an automatic backup. Afterwards: check the TCP, " +
         "and on the pendant press Play again if the stack restarted.")) return;
       const r = await cmd("setup_load", { name: s.name });
       if (r.ok) toast(r.msg, true, true);
     }
     const row = (s) => h("div", { class: "item" },
-      h("div", { class: "grow" }, h("div", {}, s.name, s.note ? h("span", { class: "muted" }, " · " + s.note) : ""),
+      h("div", { class: "grow" }, h("div", {}, s.name, s.base ? h("span", { class: "chip" + (B && s.base !== B.running ? " warn" : ""),
+          title: B && s.base !== B.running ? "a different base from the running one: loading switches it" : "base" }, baseLabel(s.base)) : "",
+          s.note ? h("span", { class: "muted" }, " · " + s.note) : ""),
         h("div", { class: "muted small" }, `${s.saved} · ${s.holds.join(", ") || "empty"}`), s.error ? h("div", { class: "error small" }, s.error) : ""),
       lease(btn("Load…", "", () => load(s))),
       lease(btn("✕", "quiet", () => window.confirm(`Delete setup "${s.name}"?`) && cmd("setup_delete", { name: s.name }).then((r) => r.ok && fill(r.setups)))));
@@ -381,7 +445,7 @@ export function workcell(ctx) {
       autos.replaceChildren(...(auto.length ? auto.map(row) : [h("div", { class: "muted small" }, "None.")]));
     }
     roots.push(card, side);
-    W.setups = { card, side, load: () => cmd("setup_list").then((r) => r.ok && fill(r.setups)) };
+    W.setups = { card, side, load: () => cmd("setup_list").then((r) => { if (r.ok) { fillBase(r.base); fill(r.setups); } }) };
     return W.setups;
   }
 

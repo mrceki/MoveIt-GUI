@@ -300,7 +300,7 @@ def make_handler(hub: Hub, allow_hosts=()):
             """/mesh/<package>/<path>: a mesh or texture from that package's share directory, nothing else.
             Relative texture references inside a .dae resolve to the same route."""
             pkg, _, rel = rest.partition("/")
-            if pkg == "_parts":                                   # an STL uploaded in SETUP > Parts
+            if pkg == "_parts":                                   # a mesh uploaded in SETUP > Parts (or its hull)
                 p = service.part_mesh_file(rel)
             else:
                 p = mesh_path(pkg, rel)
