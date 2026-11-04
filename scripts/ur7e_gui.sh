@@ -3,7 +3,8 @@
 #   1. rebuilds the ur7e_robotiq:jazzy image if ~/ur7e_robotiq changed since it was built
 #   2. builds the GUI workspace (~/ws: moveit_gui + pymoveit2)
 #   3. starts the robot stack (gui.launch.py) in the container
-#   4. starts the GUI. Ctrl-C stops the GUI and the robot stack.
+#   4. starts the GUI. Ctrl-C stops the GUI and the robot stack
+#      gracefully (GUI: SIGINT, 10 s grace; stack: SIGINT, 30 s grace; nothing is SIGKILLed unless it hangs).
 #
 #   ur7e_gui.sh                         # real robot, web GUI on http://<tailscale ip>:8180/
 #   ur7e_gui.sh --desktop               # real robot, desktop (Qt) GUI on this PC
@@ -29,7 +30,7 @@ while [ $# -gt 0 ]; do
     --fake)     FAKE=1; shift ;;
     --port)     PORT="$2"; shift 2 ;;
     --)         shift; LAUNCH_ARGS=("$@"); break ;;
-    -h|--help)  sed -n 2,14p "$0"; exit 0 ;;
+    -h|--help)  sed -n 2,16p "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
@@ -69,18 +70,38 @@ if docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
   echo "    docker stop $NAME"
   exit 1
 fi
-cleanup() { say "Stopping the robot stack"; docker stop -t 10 "$NAME" >/dev/null 2>&1 || true; }
+# Graceful shutdown, in this order: (1) the GUI gets SIGINT (it runs stop_all), waits up to 10 s, then SIGTERM, then
+# SIGKILL; (2) the container is stopped with SIGINT (--stop-signal), so `ros2 launch` shuts the driver and the
+# recorders down cleanly (MCAP files finalised), with 30 s before docker's SIGKILL (--stop-timeout).
+GUI_PIDFILE=/tmp/moveit_gui.pid
+stop_gui() {
+  docker exec "$NAME" bash -c '
+    p=$(cat '"$GUI_PIDFILE"' 2>/dev/null); [ -n "$p" ] || exit 0
+    for step in "INT 10" "TERM 5" "KILL 2"; do
+      set -- $step
+      kill -$1 "$p" 2>/dev/null || exit 0
+      for _ in $(seq 1 $(( $2 * 10 ))); do kill -0 "$p" 2>/dev/null || exit 0; sleep 0.1; done
+    done' >/dev/null 2>&1 || true
+}
+cleanup() {
+  trap '' INT TERM            # a second Ctrl-C must not cut the graceful stop short
+  say "Stopping the GUI, then the robot stack (up to ~45 s; please wait)"
+  stop_gui
+  docker stop "$NAME" >/dev/null 2>&1 || true     # uses the container's --stop-signal / --stop-timeout
+}
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 xhost +local:root >/dev/null 2>&1 || true
 stamp=$(date +%Y%m%d_%H%M%S)
 if [ "$FAKE" = 1 ]; then
-  STACK='sleep infinity'
+  STACK='exec sleep infinity'
 else
-  STACK="ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]} 2>&1 | tee /data/logs/launch_$stamp.log"
+  # exec: ros2 launch is the container's main process (under --init), so the stop signal reaches it directly.
+  # The log goes through a process substitution for the same reason (a `| tee` pipeline would keep bash in between).
+  STACK="exec > >(tee /data/logs/launch_$stamp.log) 2>&1; exec ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]}"
 fi
-docker run -d --rm --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" \
+docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" \
   -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v "$DATA:/data" -v "$WS:/ws" \
   "$IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && $STACK" >/dev/null
@@ -119,6 +140,7 @@ else
   say "Desktop GUI (closing the window stops the robot stack)"
   GUI_CMD="ros2 run moveit_gui moveit_gui $GUI_ARGS"
 fi
-# In the background + wait, so Ctrl-C reaches the cleanup at once; stopping the container ends the GUI.
-docker exec "$NAME" bash -c "$ENV && $GUI_CMD" &
+# In the background + wait, so Ctrl-C reaches the cleanup at once. The GUI records its pid and is exec'd, so
+# cleanup (stop_gui) can signal it by itself before the container is stopped.
+docker exec "$NAME" bash -c "$ENV && echo \$\$ > $GUI_PIDFILE && exec $GUI_CMD" &
 wait $!
