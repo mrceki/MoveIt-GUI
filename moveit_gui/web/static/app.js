@@ -1485,15 +1485,10 @@ pages.PROGRAMS = {
       f.l = h("input", { type: "checkbox", checked: p.cartesian !== false });
       field("Offset X Y Z mm", h("div", { class: "row v3in" }, f.o)); field("Rotate X Y Z °", h("div", { class: "row v3in" }, f.r));
       f.pv = sel([["tcp", "the TCP (turn the tool in place)"], ["frame", "the frame's origin (orbit, e.g. around the vial axis)"]], p.pivot || "tcp");
-      f.st = sel([["here", "where the arm is now"], ["planned", "where the previous move was aimed (ignores a force's push)"]],
-        p.start || "here");
-      f.st.title = "In Admittance a force pushes the arm off its path. 'Planned' moves from where the previous move " +
-        "aimed instead, so e.g. scrape down + back up returns to the same place however far the press pushed.";
-      field("Axes of", f.fr); field("Rotate about", f.pv); field("Start from", f.st);
+      field("Axes of", f.fr); field("Rotate about", f.pv);
       field("Linear", h("label", { class: "chk" }, f.l, "straight line (MoveL)")); field("Velocity %", f.v);
       this.get = () => ({ offset_mm: f.o.map((x) => +x.value), rotate_deg: f.r.map((x) => +x.value), frame: f.fr.value,
-        pivot: f.pv.value === "tcp" ? null : "frame", start: f.st.value === "here" ? null : "planned",
-        cartesian: f.l.checked, velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)) });
+        pivot: f.pv.value === "tcp" ? null : "frame", cartesian: f.l.checked, velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)) });
     } else if (T === "move_until_contact") {
       const k = dirKey(p.direction);
       f.d = sel([...AXIS_DIRS.map(([n]) => [n, n.toUpperCase()]), ...(k ? [] : [["custom", `[${(p.direction || []).join(", ")}]`]])], k || "custom");

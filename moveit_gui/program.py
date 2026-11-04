@@ -27,9 +27,6 @@ Schema v2 (written by this version):
       - {type: move_until_contact, direction: [0, 0, 1], frame: tool, distance_mm: 20, force_n: 3, velocity: 0.02}
       - {type: force, wrench: [0, 0, 5, 0, 0, 0], frame: tool}     # N / Nm the tool exerts, ramped in
       - {type: move_relative, offset_mm: [0, 0, -15], frame: vial, cartesian: true, velocity: 0.02}
-      # start: planned = from where the previous move was AIMED, not where the arm is (a force pushes it off its
-      # path in Admittance): down + up comes back to the same place however far the press pushed the tool
-      - {type: move_relative, offset_mm: [0, 0, 15], frame: vial, start: planned}
       - {type: force_off}                                    # ramped out; also at the end, STOP or a failed step
 
 Every Cartesian pose carries its reference frame and TCP (T_frame_tcp).
@@ -69,14 +66,6 @@ TITLES = {"movej": "MoveJ", "gripper": "Gripper", "wait": "Wait", "controller": 
 AXIS_NAMES = ("X", "Y", "Z")
 MAX_RELATIVE_MM = 300.0
 MAX_CONTACT_MM = 200.0
-
-
-PLANNED_GAP_MM = 30.0       # start: planned refuses when the arm is further than this from the planned pose
-
-
-def tf_inv(T):
-    from . import transforms as tf
-    return tf.inv(T)
 
 
 class ProgramError(ValueError):
@@ -181,8 +170,7 @@ class Step:
             r = f" rot [{', '.join(f'{float(x):g}' for x in rot)}]°" if rot and any(float(x) for x in rot) else ""
             if r and p.get("pivot") == "frame" and p.get("frame", "tool") != "tool":
                 r += " about its origin"
-            st = " · from planned" if p.get("start") == "planned" else ""
-            return f"[{off}] mm{r} in {p.get('frame', 'tool')}{' (linear)' if p.get('cartesian', True) else ''}{st}{v}"
+            return f"[{off}] mm{r} in {p.get('frame', 'tool')}{' (linear)' if p.get('cartesian', True) else ''}{v}"
         if self.type == "move_until_contact":
             d = p.get("direction", [0, 0, 1])
             return (f"along [{', '.join(f'{float(x):g}' for x in d)}] {p.get('frame', 'tool')}, "
@@ -438,9 +426,6 @@ class Program:
                         problems.append(f"step {i}: move_relative with no offset")
                     if p.get("pivot", "tcp") not in ("tcp", "frame"):
                         problems.append(f"step {i}: move_relative pivot is tcp (turn in place) or frame (about its origin)")
-                    if (p.get("start") or "here") not in ("here", "planned"):
-                        problems.append(f"step {i}: move_relative start is here (where the arm is) or planned "
-                                        "(where the previous move was aimed)")
                     problems.extend(f"step {i}: {m}" for m in _frame_problems(p.get("frame", "tool"), geometry, live))
                 elif s.type == "move_until_contact":
                     d = [float(x) for x in p.get("direction", [])]
@@ -588,8 +573,6 @@ class ProgramRunner:
         self._step_memo: dict = {}                              # targets of the step now: kept over a pause
         self._force_params = None                               # (wrench, frame) of the force applied now
         self._was_paused = False                                # paused since the last resume check
-        # (T_base_tcp, tcp): where the last move AIMED the active TCP (start: planned), None = unknown
-        self._planned: Optional[tuple] = None
         self._fail_msg = ""
         self.skipped: List[str] = []
         self.loop_progress: list = []                           # [(loop label, iteration, times)] of the step now
@@ -645,7 +628,6 @@ class ProgramRunner:
             return
         self.pause_reason = reason
         self._was_paused = True
-        self._planned = None             # the arm may be jogged or stopped off its path while paused
         self._resume.clear()
         self._set_state(RunState.PAUSED)
         if self._current_type in MOTION_STEPS:
@@ -695,7 +677,6 @@ class ProgramRunner:
         self._force_on = False
         self._step_memo, self.pause_reason, self._force_params = {}, "", None
         self._was_paused, self._fail_msg = False, ""
-        self._planned = None
         self.skipped: List[str] = []           # steps that failed with on_fail: continue
         self._set_state(RunState.RUNNING)
         ok, msg = True, "finished"
@@ -719,7 +700,6 @@ class ProgramRunner:
                     self.on_step(path[0])
                     self._current_type = step.type
                     done = self._execute(program, step)
-                    self._note_planned(program, step, done)
                     self._current_type = None
                     if done and self._force_on and self.hooks.force_progress() is None and not self._was_paused:
                         # e.g. the controller stopped or the mode changed: never carry on as if still pressing
@@ -889,21 +869,16 @@ class ProgramRunner:
         return False
 
     # ------------------------------------------------------------ force work
-    def _target_from(self, frame: str, offset_m, rot_deg, pivot: str = "tcp",
-                     T_base_start=None) -> PoseSpec:
+    def _target_from(self, frame: str, offset_m, rot_deg, pivot: str = "tcp") -> PoseSpec:
         """The active TCP moved by offset (m) and rotated (deg) along `frame`'s axes: tool = the TCP's own axes,
         base = the robot base, anything else = that frame (e.g. a fixture). pivot "tcp" turns the tool in place;
         "frame" turns it ABOUT the frame's origin: with a vial fixture, rotate Z 10° steps around the vial axis
-        to the next scraping angle, the tool facing the wall the same way (an orbit).
-        T_base_start: start from this active-TCP pose (base frame) instead of where the TCP is now."""
+        to the next scraping angle, the tool facing the wall the same way (an orbit)."""
         import numpy as np
         from . import transforms as tf
         tcp = self.hooks.active_tcp()
         ref = self.profile.base_link if frame in ("tool", "base") else frame
-        if T_base_start is None:
-            T = self.geometry.current_pose(ref, tcp).T()
-        else:
-            T = tf.inv(self.geometry.T_base_frame(ref)) @ np.asarray(T_base_start, float)
+        T = self.geometry.current_pose(ref, tcp).T()
         R_off = tf.mm_deg_to_T([0, 0, 0], [float(a) for a in rot_deg])[:3, :3]
         d = np.asarray(offset_m, float)
         out = T.copy()
@@ -930,24 +905,9 @@ class ProgramRunner:
         import numpy as np
         off = [float(x) / 1000.0 for x in p.get("offset_mm", [0, 0, 0])]
         if "pose" not in self._step_memo:      # from where the step STARTED: a resume after a pause finishes it
-            start = None
-            if p.get("start") == "planned":
-                start = self._planned_start()
-                if start is None:
-                    self.on_log("move relative: no planned pose to start from (first move, after a pause, a failed "
-                                "move or a TCP change): from where the arm is")
-                else:
-                    here_T = self.geometry.current_T_base_tcp(self.hooks.active_tcp())
-                    gap = float(np.linalg.norm(here_T[:3, 3] - start[:3, 3])) * 1000.0
-                    if gap > PLANNED_GAP_MM:
-                        self.on_log(f"move relative refused: the arm is {gap:.0f} mm from the planned pose (limit "
-                                    f"{PLANNED_GAP_MM:g} mm): pushed that far? Use start: here")
-                        return False
-                    self.on_log(f"move relative from the planned pose ({gap:.1f} mm from where the arm is)")
-            pose = self._target_from(p.get("frame", "tool"), off, p.get("rotate_deg", [0, 0, 0]), p.get("pivot", "tcp"),
-                                     T_base_start=start)
+            pose = self._target_from(p.get("frame", "tool"), off, p.get("rotate_deg", [0, 0, 0]), p.get("pivot", "tcp"))
             # an orbit about a far origin travels far for a small angle: the same limit as a typed offset
-            here = self._target_from(p.get("frame", "tool"), [0, 0, 0], [0, 0, 0], T_base_start=start)
+            here = self._target_from(p.get("frame", "tool"), [0, 0, 0], [0, 0, 0])
             travel = float(np.linalg.norm(np.asarray(pose.position) - np.asarray(here.position))) * 1000.0
             if travel > MAX_RELATIVE_MM:
                 self.on_log(f"move relative refused: it would move the TCP {travel:.0f} mm (limit {MAX_RELATIVE_MM:g} "
@@ -956,36 +916,6 @@ class ProgramRunner:
             self._step_memo["pose"] = pose
         pose = self._step_memo["pose"]
         return self._move_to(pose, bool(p.get("cartesian", True)), vel, acc)
-
-    def _planned_start(self):
-        """The planned active-TCP pose (base frame) if it is for the active TCP now, else None."""
-        if self._planned is None or self._planned[1] != self.hooks.active_tcp():
-            return None
-        return self._planned[0]
-
-    def _note_planned(self, program: "Program", step: Step, done: bool):
-        """After a step: remember where it aimed the active TCP (start: planned). Moves that aim at no pose
-        (MoveJ, Move until contact) leave the measured pose; a failed move or a policy, nothing (unknown)."""
-        t = step.type
-        if t not in MOTION_STEPS and t != "policy":
-            return
-        self._planned = None
-        if not done or t == "policy":
-            return
-        try:
-            tcp = self.hooks.active_tcp()
-            if t == "move_pose":
-                pose = program.pose_target(step)
-                T = (self.geometry.T_base_frame(pose.frame) @ pose.T() @ tf_inv(self.geometry.T_planning_tcp(pose.tcp))
-                     @ self.geometry.T_planning_tcp(tcp))
-            elif t == "move_relative":
-                pose = self._step_memo["pose"]
-                T = self.geometry.T_base_frame(pose.frame) @ pose.T()
-            else:                                   # movej, move_until_contact: where it ended up
-                T = self.geometry.current_T_base_tcp(tcp)
-            self._planned = (T, tcp)
-        except Exception:
-            self._planned = None
 
     def _move_until_contact(self, p: dict, vel: float, acc: float) -> bool:
         """Linear move along `direction` for at most distance_mm; stops as soon as the measured force changes by

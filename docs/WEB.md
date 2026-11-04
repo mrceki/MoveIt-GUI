@@ -209,14 +209,6 @@ AUTOMATION then shows a **Controller gains** readiness check (2 % tolerance). It
   Wait step gives it time). Move relative can **rotate about the frame's origin** (an orbit: with the vial fixture,
   rotate Z 10° goes to the next scraping angle, the tool facing the wall the same way; the travel is limited like an
   offset). Motion steps can **skip on failure** (`on_fail: continue`; the run ends "finished, N skipped").
-* Move relative **Start from** (`start`): *where the arm is now* (default, `here`) or *where the previous move was
-  aimed* (`planned`). In Admittance a force pushes the arm off its path; with `planned` that push is not carried
-  into the move, so e.g. scrape down + back up (+ orbit) returns to the same place every angle. The planned pose is
-  the previous move's target (a MovePose / Move relative), or where a MoveJ / Move until contact ended; after a
-  pause, a failed move, a policy or a TCP change there is none and the step moves from where the arm is (logged).
-  It is refused when the arm is over 30 mm from the planned pose. Only the end of the move changes: the trajectory still
-  starts where the arm is (MoveIt plans from the measured joints), so the start behaves as before. The 3D preview
-  always draws planned poses.
 * **Typed waypoints**: the editor of a MoveJ / Move to pose step shows its waypoint's numbers as fields (joints in
   degrees; or frame + XYZ mm + RPY ° of the TCP, e.g. in the vial frame) and a **Go to** list to point the step at
   another waypoint (e.g. back to `home`). Teaching (Set waypoint here) still works.
