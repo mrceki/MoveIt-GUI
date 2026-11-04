@@ -37,6 +37,7 @@ def _bare_bridge(rb):
     b._joints_received = True
     b._velocities_ok = True
     b._freedrive_on = False
+    b._ctrl_ref, b._follow_clients = {}, {}
     return b
 
 
@@ -286,3 +287,38 @@ def test_pendant_speed_percent_becomes_a_fraction(ros_bridge_module):
     assert b._snap.speed_scaling == 1.0
     b._on_speed(mock.MagicMock(data=25.0))
     assert b._snap.speed_scaling == 0.25
+
+
+def test_pause_in_admittance_holds_at_the_reference_instead_of_cancelling(ros_bridge_module):
+    """A cancelled goal makes the trajectory controller hold at the measured (pushed) joints: the push doubled at
+    every pause. cancel_motion sends a hold at the reference to that controller and does not cancel it."""
+    rb = ros_bridge_module
+    from moveit_gui.profile import RobotProfile
+    J = RobotProfile.load(ROOT / "profiles" / "ur7e_lab.yaml").joint_names
+    ref = {j: 0.1 * i for i, j in enumerate(J)}
+    vel = {j: 0.0 for j in J}
+    b, logs = _admittance_bridge(rb, ref)
+    b._ctrl_ref["admittance_trajectory_controller"] = (time.monotonic(), ref, vel)
+    b._exec_event_pub = mock.MagicMock()
+    b.moveit = None
+    cancels = {c: mock.MagicMock() for c in ("admittance_trajectory_controller", "scaled_joint_trajectory_controller")}
+    b._fjt_cancel = cancels
+    rb.FollowJointTrajectory = mock.MagicMock()
+    rb.FollowJointTrajectory.Goal = lambda: mock.MagicMock()
+    rb.JointTrajectory = lambda: mock.MagicMock()
+    b._execute_handle = mock.MagicMock()
+    b.cancel_motion()
+    client = b._follow_clients["admittance_trajectory_controller"]
+    goal = client.send_goal_async.call_args[0][0]
+    assert goal.trajectory.points[0].positions == [ref[j] for j in J]
+    cancels["admittance_trajectory_controller"].call_async.assert_not_called()   # no cancel: it would hold pushed
+    cancels["scaled_joint_trajectory_controller"].call_async.assert_called()      # other controllers as before
+    b._execute_handle.cancel_goal_async.assert_not_called()                       # the hold preempts it
+    assert any("holding at its reference" in line for line in logs)
+    # no fresh reference (the controller is not active): cancel as before
+    b2, _ = _admittance_bridge(rb, None)
+    b2._exec_event_pub, b2.moveit, b2._fjt_cancel = mock.MagicMock(), None, {"admittance_trajectory_controller": mock.MagicMock()}
+    b2._execute_handle = mock.MagicMock()
+    b2.cancel_motion()
+    b2._fjt_cancel["admittance_trajectory_controller"].call_async.assert_called()
+    b2._execute_handle.cancel_goal_async.assert_called()

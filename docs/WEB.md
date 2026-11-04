@@ -215,8 +215,15 @@ AUTOMATION then shows a **Controller gains** readiness check (2 % tolerance). It
   controller would add the push again: the push doubled at the start of every move (reproduced on the real
   controller chain). The GUI therefore shifts every plan in Admittance so it starts at the reference
   (`/admittance_trajectory_controller/controller_state`) and sends it to that controller directly; the push
-  stays as it is and the path keeps its shape. STOP cancels it like any move. A move is refused when the arm is
-  more than 5° (any joint) off its reference, or the reference is not fresh (profile: `reference_start`).
+  stays as it is and the path keeps its shape. A move is refused when the arm is more than 5° (any joint) off its
+  reference, or the reference is not fresh (profile: `reference_start`).
+  **Pause and STOP** do the same: cancelling the goal would make the controller hold at the measured (pushed)
+  joints and double the push at every pause, so in Admittance they replace the move with a hold at the reference
+  (the arm stops where it is; STOP then releases the force and the arm eases back by the push).
+  Checked on the real controller chain by an opt-in test (mock UR arm, simulated F/T, isolated container):
+  `MOVEIT_GUI_DOCKER_TESTS=1 pytest test/test_admittance_chain_docker.py` (image `ur7e_robotiq:buildtest`, or
+  `MOVEIT_GUI_TEST_IMAGE`). Before the fix: 20 mm jump per move start and per pause, 200 mm walk after 5 pause
+  cycles; after: under 2 mm.
 * **Typed waypoints**: the editor of a MoveJ / Move to pose step shows its waypoint's numbers as fields (joints in
   degrees; or frame + XYZ mm + RPY ° of the TCP, e.g. in the vial frame) and a **Go to** list to point the step at
   another waypoint (e.g. back to `home`). Teaching (Set waypoint here) still works.

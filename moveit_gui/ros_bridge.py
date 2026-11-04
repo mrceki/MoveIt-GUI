@@ -248,8 +248,14 @@ class RosBridge:
                 topic = rs.get("state_topic") or f"/{m.moveit_controller}/controller_state"
 
                 def on_state(msg, c=m.moveit_controller):
-                    self._ctrl_ref[c] = (time.monotonic(), dict(zip(msg.joint_names, msg.reference.positions)))
+                    vel = list(msg.reference.velocities) or [0.0] * len(msg.joint_names)
+                    self._ctrl_ref[c] = (time.monotonic(), dict(zip(msg.joint_names, msg.reference.positions)),
+                                         dict(zip(msg.joint_names, vel)))
                 n.create_subscription(JointTrajectoryControllerState, topic, on_state, 10, callback_group=self.cb)
+                if FollowJointTrajectory is not None:          # ready for a hold from cancel_motion (any thread)
+                    self._follow_clients[m.moveit_controller] = ActionClient(
+                        n, FollowJointTrajectory, f"/{m.moveit_controller}/follow_joint_trajectory",
+                        callback_group=self.cb)
         # Bumped by every cancel_motion. A move remembers it when it starts (before planning) and refuses to send,
         # or cancels, its ExecuteTrajectory goal if a STOP came in meanwhile: pymoveit2 cannot cancel a plan() in
         # progress and cancel_motion alone only reaches a goal that is already executing.
@@ -632,12 +638,18 @@ class RosBridge:
     def cancel_motion(self):
         self.stop_epoch += 1
         self._exec_event_pub.publish(String(data="stop"))
+        # Chained admittance: a cancelled goal makes the trajectory controller hold at the MEASURED joints, which a
+        # force has pushed off the reference: the reference jumps there and the push doubles (every pause added
+        # it again). Replace the goal with a hold at its own reference instead: the arm stops, the push stays.
+        held = {c for c, cfg in self._reference_controllers() if self._hold_at_reference(c, cfg)}
         for name, cli in self._fjt_cancel.items():
+            if name in held:
+                continue
             if cli.service_is_ready():
                 cli.call_async(CancelGoal.Request())      # zero goal id and stamp: cancel all of its goals
         handle = self._execute_handle
-        if handle is not None:
-            handle.cancel_goal_async()
+        if handle is not None and not held:
+            handle.cancel_goal_async()                    # (a hold preempts it; a cancel could beat the hold)
         if self.moveit is not None:
             try:
                 self.moveit.cancel_execution()
@@ -773,19 +785,59 @@ class RosBridge:
             self.log(f"{controller}: execution failed (MoveIt error {result.result.error_code.val})")
         return ok
 
+    def _reference_controllers(self):
+        return [(m.moveit_controller, m.reference_start) for m in self.profile.modes.values()
+                if m.reference_start and m.moveit_controller]
+
+    def _fresh_reference(self, controller: str, cfg: dict):
+        """(positions, velocities, age_s) of the controller's reference, or None when not fresh (not active)."""
+        got = self._ctrl_ref.get(controller)
+        if got is None:
+            return None
+        age = time.monotonic() - got[0]
+        if age > float(cfg.get("max_age_s", 0.5)):
+            return None
+        return got[1], (got[2] if len(got) > 2 else {}), age
+
+    def _hold_at_reference(self, controller: str, cfg: dict) -> bool:
+        """Preempt whatever the controller runs with one point at its reference now (extrapolated over the age of
+        the reading). False when there is no fresh reference (controller not active) or no action server."""
+        got = self._fresh_reference(controller, cfg)
+        client = self._follow_clients.get(controller)
+        if got is None or client is None or FollowJointTrajectory is None or not client.server_is_ready():
+            return False
+        pos, vel, age = got
+        names = [j for j in self.profile.joint_names if j in pos]
+        if len(names) != len(self.profile.joint_names):
+            return False
+        from trajectory_msgs.msg import JointTrajectoryPoint
+        p = JointTrajectoryPoint()
+        a = min(age, 0.05)
+        p.positions = [float(pos[j]) + float(vel.get(j, 0.0)) * a for j in names]
+        p.velocities = [0.0] * len(names)
+        p.time_from_start = DurationMsg(sec=0, nanosec=int(float(cfg.get("hold_s", 0.1)) * 1e9))
+        traj = JointTrajectory()
+        traj.joint_names = names
+        traj.points = [p]
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = traj
+        client.send_goal_async(goal)
+        self.log(f"{controller}: holding at its reference (not at the pushed, measured joints)")
+        return True
+
     def _execute_from_reference(self, controller: str, cfg: dict, trajectory, epoch: int) -> bool:
         """Chained admittance: shift the plan so it starts at the trajectory controller's reference and send it
         to that controller directly. (MoveIt's execution would refuse a start away from the measured joints, and
         starting at the measured joints doubles the push of an applied force.) STOP cancels it like any goal
         (cancel_motion: the controller's cancel service and this handle)."""
-        got = self._ctrl_ref.get(controller)
-        if got is None or time.monotonic() - got[0] > float(cfg.get("max_age_s", 0.5)):
+        got = self._fresh_reference(controller, cfg)
+        if got is None:
             self.log(f"motion refused: no fresh reference from {controller} (controller_state)")
             return False
         names = list(trajectory.joint_names)
         pts = [list(p.positions) for p in trajectory.points]
         try:
-            shifted, d = shift_to_reference(pts, names, got[1], float(cfg.get("max_shift_rad", math.radians(5.0))))
+            shifted, d = shift_to_reference(pts, names, got[0], float(cfg.get("max_shift_rad", math.radians(5.0))))
         except ReferenceShiftError as e:
             self.log(f"motion refused: {e}")
             return False
