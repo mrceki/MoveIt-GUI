@@ -36,6 +36,7 @@ from .service import CommandError, WebService
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 1 << 20
+MAX_UPLOAD = 28 << 20          # /api/upload: an STL for SETUP > Parts (20 MB, base64 in JSON)
 CAMERA_FPS = 10.0
 ERR_EVERY_S = 30.0
 
@@ -236,7 +237,7 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.end_headers()
             self.wfile.write(body)
 
-        def _body(self) -> dict:
+        def _body(self, limit: int = MAX_BODY) -> dict:
             # JSON only: a cross-site HTML form cannot send it without a CORS preflight, which is never granted.
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 raise CommandError("Content-Type must be application/json")
@@ -246,7 +247,7 @@ def make_handler(hub: Hub, allow_hosts=()):
                 n = -1
             if n < 0:
                 raise ValueError("bad Content-Length")
-            if n > MAX_BODY:
+            if n > limit:
                 raise CommandError("request too large")
             data = json.loads(self.rfile.read(n) or b"{}")
             if not isinstance(data, dict):
@@ -299,14 +300,17 @@ def make_handler(hub: Hub, allow_hosts=()):
             """/mesh/<package>/<path>: a mesh or texture from that package's share directory, nothing else.
             Relative texture references inside a .dae resolve to the same route."""
             pkg, _, rel = rest.partition("/")
-            p = mesh_path(pkg, rel)
+            if pkg == "_parts":                                   # an STL uploaded in SETUP > Parts
+                p = service.part_mesh_file(rel)
+            else:
+                p = mesh_path(pkg, rel)
             if p is None:
                 return self._json(404, {"ok": False, "msg": "not found"})
             body = p.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", mimetypes.guess_type(p.name)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "max-age=3600")
+            self.send_header("Cache-Control", "no-cache" if pkg == "_parts" else "max-age=3600")
             self.end_headers()
             self.wfile.write(body)
 
@@ -377,7 +381,7 @@ def make_handler(hub: Hub, allow_hosts=()):
             if not self._host_ok():
                 return
             try:
-                body = self._body()
+                body = self._body(MAX_UPLOAD if path == "/api/upload" else MAX_BODY)
                 client = str(body.get("token") or body.get("client") or "")        # the lease secret; STOP and /api/lease need none
                 if path == "/api/stop":
                     return self._json(200, service.stop(self._who()))
@@ -393,6 +397,9 @@ def make_handler(hub: Hub, allow_hosts=()):
                 if path == "/api/cmd":
                     return self._json(200, service.command(client, str(body.get("cmd", "")), body.get("args") or {},
                                                                    local=self._local()))
+                if path == "/api/upload":
+                    return self._json(200, service.command(client, "parts_mesh_upload", {
+                        "filename": str(body.get("filename", "")), "data_b64": str(body.get("data_b64", ""))}))
                 self._json(404, {"ok": False, "msg": "not found"})
             except CommandError as e:
                 self._json(409, {"ok": False, "msg": str(e)})
@@ -476,19 +483,21 @@ def main(argv=None):
         from ..ros_bridge import RosBridge
         bridge = RosBridge(profile)
     core = RobotCore(bridge, profile, profiles_dir, programs_dir, policies_dir, fake=args.fake)
-    server = Server(WebService(core), args.host, args.port, args.allow_host)
+    service = WebService(core)
+    server = Server(service, args.host, args.port, args.allow_host)
     print(f"MoveIt GUI web: http://{args.host}:{server.port}/  ({profile.display_name}"
           f"{', FAKE robot' if args.fake else ''})", flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    service.on_restart = stop.set           # SETUP > Parts / Setups: the launcher restarts on exit code 75 / 76
     server.start()
     stop.wait()
     core.stop_all()
     core.recorder.stop_and_wait("GUI closed")      # finish the bag file; never leave `ros2 bag record` behind
     server.stop()
     bridge.shutdown()
-    return 0
+    return service.restart_code or 0
 
 
 if __name__ == "__main__":

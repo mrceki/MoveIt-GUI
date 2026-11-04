@@ -44,6 +44,10 @@ from ..program import CONTAINER_STEPS, STEP_TYPES, Program, ProgramError, Progra
 from ..program_path import simulate
 from ..robot_model import model_or_error
 from ..vials import VialLibrary, VialProfileError
+from ..handeye import HandEyeError
+from ..parts import PartError, merged_model as parts_merged
+from ..setups import SetupError
+from .workcell import WorkcellCommands
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
 LEASE_TIMEOUT_S = 2.5
@@ -98,7 +102,7 @@ class Lease:
         return {"client": self.id, "name": self.name}
 
 
-class WebService:
+class WebService(WorkcellCommands):
     def __init__(self, core: RobotCore, clock: Callable[[], float] = time.monotonic):
         self.core = core
         self.clock = clock
@@ -135,6 +139,7 @@ class WebService:
                 self.payload.on_applied = core.gains.remember
         except PayloadCalibrationError as e:
             self.payload_progress["error"] = str(e)
+        self._workcell_init()
 
     # ================================================================= polling
     def _log_error(self, what: str, e: BaseException):
@@ -156,6 +161,10 @@ class WebService:
             self.core.update()
         except Exception as e:
             self._log_error("core.update", e)
+        try:
+            self._parts_tick()
+        except Exception as e:
+            self._log_error("parts", e)
         for line in self.core.bridge.drain_logs():
             self.logs.append((next(self._log_seq), line))
 
@@ -257,7 +266,7 @@ class WebService:
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError) as e:
                 raise CommandError(str(e)) from None
             if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
                 self.program_rev += 1
@@ -281,7 +290,7 @@ class WebService:
                 else:
                     ok, msg = fn()
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, ValueError) as e:
-                ok, msg = False, str(e)
+                ok, msg = False, str(e)                      # PartError, HandEyeError, SetupError are ValueErrors
             except Exception as e:                       # a job must always report back
                 ok, msg = False, f"{type(e).__name__}: {e}"
             if not ok:
@@ -388,10 +397,9 @@ class WebService:
     cmd_force_stop.read_only = True
 
     def robot_model(self) -> dict:
-        xml = self.core.bridge.robot_description()
-        if xml != self._model_xml:
-            self._model_xml, self._model = xml, model_or_error(xml)
-        return self._model
+        """The robot model plus the live parts (SETUP > Parts), for the 3D views and the path preview."""
+        m = self._base_model()
+        return parts_merged(self.parts, m) if m.get("ok") else m
 
     def cmd_program_preview_path(self, assume_missing=True):
         """PROGRAMS 3D preview: the TCP path of the open program from the current joints (kinematics only)."""
@@ -2000,6 +2008,7 @@ class WebService:
             "ft_bias": self.core.ft_bias.view(),
             "calibration": self.calibration_view(),
             "keepout": self.keepout_view(),
+            "workcell": self.workcell_state(),
             "record": self.core.recorder.view(),
             "gains_applying": self.core.gains.applying,
             "lease": self.lease.view(),

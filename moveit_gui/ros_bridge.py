@@ -38,6 +38,7 @@ from trajectory_msgs.msg import JointTrajectory
 from std_srvs.srv import Trigger
 
 import numpy as np
+import yaml
 
 from . import transforms as tf
 from .bridge_api import (DASHBOARD_COMMANDS, DASHBOARD_TIMEOUT_S, Snapshot, WrenchHistory, dashboard_lost,
@@ -876,6 +877,179 @@ class RosBridge:
             T = None if T_frame is None else T_frame @ _pose_to_T(co.pose) @ T_obj_prim
             out[co.id] = {"frame": frame, "size": size, "T": T}
         return out
+
+    # Parts (parts.py): static TF for part frames the robot model does not have yet, and MoveIt collision objects
+    # (attached to the arm link a part rides on, or world objects for the cell). Published on move_group's
+    # collision_object / attached_collision_object topics; parts_scene_ids reads them back. Never moves the robot.
+    def parts_publish(self, frames, objects, remove_ids) -> Tuple[bool, str]:
+        try:
+            from geometry_msgs.msg import Pose, Point, TransformStamped
+            from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
+            from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
+            from tf2_ros import StaticTransformBroadcaster
+        except ImportError as e:
+            return False, f"missing ROS package: {e}"
+        n = self.node
+        if getattr(self, "_parts_pubs", None) is None:
+            latched = QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                 reliability=ReliabilityPolicy.RELIABLE)
+            self._parts_pubs = (n.create_publisher(CollisionObject, "/collision_object", 100),
+                                n.create_publisher(AttachedCollisionObject, "/attached_collision_object", 100))
+            self._parts_static = StaticTransformBroadcaster(n, qos=latched)
+        co_pub, aco_pub = self._parts_pubs
+        if frames:
+            msgs = []
+            for parent, child, T in frames:
+                m = TransformStamped()
+                m.header.frame_id, m.child_frame_id = parent, child
+                p, q = tf.to_pos_quat(T)
+                m.transform.translation.x, m.transform.translation.y, m.transform.translation.z = p
+                (m.transform.rotation.x, m.transform.rotation.y, m.transform.rotation.z,
+                 m.transform.rotation.w) = q
+                msgs.append(m)
+            self._parts_static.sendTransform(msgs)
+
+        def pose(T):
+            p, q = tf.to_pos_quat(T)
+            out = Pose()
+            out.position.x, out.position.y, out.position.z = p
+            out.orientation.x, out.orientation.y, out.orientation.z, out.orientation.w = q
+            return out
+
+        for oid, link in remove_ids:
+            a = AttachedCollisionObject()
+            a.link_name, a.object.id, a.object.operation = link or "", oid, CollisionObject.REMOVE
+            if link:
+                aco_pub.publish(a)                 # detaches (MoveIt puts it in the world) ...
+            c = CollisionObject()
+            c.id, c.operation = oid, CollisionObject.REMOVE
+            c.header.frame_id = self.profile.base_link
+            co_pub.publish(c)                      # ... and this removes it from the world
+        for o in objects:
+            c = CollisionObject()
+            c.id, c.operation = o["id"], CollisionObject.ADD
+            c.header.frame_id = o["link"]
+            c.header.stamp = n.get_clock().now().to_msg()
+            c.pose = pose(np.eye(4))
+            g = o["geom"]
+            if g["type"] == "mesh":
+                from .parts import read_stl
+                from urllib.parse import unquote, urlparse
+                try:
+                    tri = read_stl(unquote(urlparse(g["uri"]).path)) * float(g["scale"][0])
+                except Exception as e:
+                    return False, f"{o['id']}: {e}"
+                mesh = Mesh()
+                mesh.vertices = [Point(x=float(v[0]), y=float(v[1]), z=float(v[2])) for v in tri.reshape(-1, 3)]
+                mesh.triangles = [MeshTriangle(vertex_indices=[3 * k, 3 * k + 1, 3 * k + 2]) for k in range(len(tri))]
+                c.meshes, c.mesh_poses = [mesh], [pose(o["T_link_obj"])]
+            else:
+                prim = SolidPrimitive()
+                if g["type"] == "box":
+                    prim.type, prim.dimensions = SolidPrimitive.BOX, [float(v) for v in g["size"]]
+                elif g["type"] == "cylinder":
+                    prim.type, prim.dimensions = SolidPrimitive.CYLINDER, [float(g["length"]), float(g["radius"])]
+                else:
+                    prim.type, prim.dimensions = SolidPrimitive.SPHERE, [float(g["radius"])]
+                c.primitives, c.primitive_poses = [prim], [pose(o["T_link_obj"])]
+            if o["attach"]:
+                a = AttachedCollisionObject()
+                a.link_name, a.object, a.touch_links = o["link"], c, list(o["touch_links"])
+                aco_pub.publish(a)
+            else:
+                co_pub.publish(c)
+        return True, "published"
+
+    def parts_scene_ids(self) -> Optional[Dict[str, str]]:
+        """{object id: attached link or ""} for the gui_part/ objects in move_group's planning scene; None = unreadable."""
+        try:
+            from moveit_msgs.msg import PlanningSceneComponents
+            from moveit_msgs.srv import GetPlanningScene
+        except ImportError:
+            return None
+        if getattr(self, "_scene_cli", None) is None:
+            self._scene_cli = self.node.create_client(GetPlanningScene, "/get_planning_scene", callback_group=self.cb)
+        if not self._scene_cli.service_is_ready():
+            return None
+        req = GetPlanningScene.Request()
+        req.components.components = (PlanningSceneComponents.WORLD_OBJECT_NAMES |
+                                     PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS)
+        res = self._call(self._scene_cli, req, timeout_s=self.SCENE_READ_TIMEOUT_S)
+        if res is None:
+            return None
+        out = {co.id: "" for co in res.scene.world.collision_objects if co.id.startswith("gui_part/")}
+        for a in res.scene.robot_state.attached_collision_objects:
+            if a.object.id.startswith("gui_part/"):
+                out[a.object.id] = a.link_name
+        return out
+
+    # Camera calibration (handeye.py): one full-resolution frame and the camera's intrinsics, on demand.
+    def grab_image(self, topic: str, timeout_s: float = 3.0):
+        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
+        or (None, why)."""
+        import cv2
+        types = dict(self.node.get_topic_names_and_types()).get(topic, [])
+        t = next((x for x in types if x in IMAGE_TYPES), None)
+        if t is None:
+            return None, f"{topic}: no image publisher"
+        got, ev = {}, threading.Event()
+
+        def on_msg(m):
+            if not ev.is_set():
+                got["m"] = m
+                ev.set()
+        if t == IMAGE_TYPE:
+            from sensor_msgs.msg import Image as Msg
+        else:
+            from sensor_msgs.msg import CompressedImage as Msg
+        sub = self.node.create_subscription(Msg, topic, on_msg, qos_profile_sensor_data, callback_group=self.cb)
+        try:
+            if not ev.wait(timeout_s):
+                return None, f"{topic}: no image within {timeout_s:.0f} s"
+        finally:
+            self.node.destroy_subscription(sub)
+        m = got["m"]
+        try:
+            if t == IMAGE_TYPE:
+                from .camera import to_gray
+                img = to_gray(m.encoding, m.width, m.height, m.step, m.data, bool(m.is_bigendian))
+            else:
+                img = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    return None, f"{topic}: could not decode {m.format}"
+        except Exception as e:
+            return None, f"{topic}: {e}"
+        return img, m.header.frame_id
+
+    def camera_info(self, topic: str, timeout_s: float = 3.0) -> Tuple[Optional[dict], str]:
+        from sensor_msgs.msg import CameraInfo
+        got, ev = {}, threading.Event()
+
+        def on_msg(m):
+            if not ev.is_set():
+                got["m"] = m
+                ev.set()
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        sub = self.node.create_subscription(CameraInfo, topic, on_msg, qos, callback_group=self.cb)
+        try:
+            if not ev.wait(timeout_s):
+                return None, f"{topic}: no CameraInfo within {timeout_s:.0f} s"
+        finally:
+            self.node.destroy_subscription(sub)
+        m = got["m"]
+        return {"K": [float(v) for v in m.k], "D": [float(v) for v in m.d], "model": m.distortion_model,
+                "width": int(m.width), "height": int(m.height), "frame_id": m.header.frame_id}, "ok"
+
+    def tf_parent(self, frame: str) -> Optional[str]:
+        """The TF parent of a frame (e.g. the camera driver's camera_link above its optical frame), or None."""
+        if self._tf is None:
+            return None
+        try:
+            d = yaml.safe_load(self._tf.all_frames_as_yaml()) or {}
+        except Exception:
+            return None
+        p = (d.get(frame) or {}).get("parent")
+        return p if p and p != "NO_PARENT" else None
 
     # ======================================================== transition checks
     def trajectory_action_ready(self, controller: str) -> bool:

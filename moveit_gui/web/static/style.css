@@ -418,3 +418,9 @@ table.gains .hint { color: var(--muted); font-size: 11px; cursor: help; }
 .su-ptable tr.pick:hover td { background: rgba(91, 141, 239, 0.08); }
 .su-ptable tr.pick.on td { background: rgba(91, 141, 239, 0.18); }
 .reload-bar { position: fixed; top: 0; left: 50%; transform: translateX(-50%); z-index: 1000; background: #fff4d6; border: 1px solid #e0b84c; border-radius: 0 0 8px 8px; padding: 8px 14px; display: flex; gap: 12px; align-items: center; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
+
+/* SETUP > Parts / Camera calibration / Setups (workcell.js) */
+.chip.ok { background: #e3f1ea; color: var(--ok); } .chip.warn { background: var(--warn-bg); color: var(--warn); }
+.chip.err { background: var(--danger-bg); color: var(--danger); }
+.chip .x { cursor: pointer; margin-left: 2px; }
+#pt-list tr.on td { background: rgba(91, 141, 239, 0.12); }

@@ -38,7 +38,9 @@ class MeshCache {
   constructor() { this.stl = new STLLoader(); this.dae = new ColladaLoader(); this.cache = new Map(); }
   url(uri) {
     const m = /^package:\/\/([^/]+)\/(.+)$/.exec(uri);
-    return m ? `/mesh/${m[1]}/${m[2]}` : null;
+    if (m) return `/mesh/${m[1]}/${m[2]}`;
+    const f = /^file:\/\/.*\/parts\/meshes\/([^/]+)$/.exec(uri);     // an STL uploaded in SETUP > Parts
+    return f ? `/mesh/_parts/${f[1]}` : null;
   }
   load(uri) {
     const url = this.url(uri);
@@ -236,6 +238,22 @@ export class View3D {
     this.goalBot = new RobotInstance(model, this.meshes, true, 0xf28c28);
     this.goalBot.root.visible = false;
     this.scene.add(this.robot.root, this.ghost.root, this.goalBot.root);
+    this.draw();
+  }
+
+  // The robot model changed (a part saved in SETUP > Parts): rebuild the three instances, keep what was shown.
+  async reload(model) {
+    if (!this.robot) return this.load(model);
+    const vis = [this.ghost.root.visible, this.goalBot.root.visible];
+    const q = this.robot.values || null;
+    for (const r of [this.robot, this.ghost, this.goalBot]) {
+      this.scene.remove(r.root);
+      r.root.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+    }
+    this.robot = null;
+    await this.load(model);
+    [this.ghost.root.visible, this.goalBot.root.visible] = vis;
+    if (q) this.robot.setJoints(q);
     this.draw();
   }
 

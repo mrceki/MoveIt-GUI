@@ -3,6 +3,7 @@
 // this file only shows state and asks.
 
 import { jointMonitor, ftChart } from "/static/monitors.js";
+import { workcell } from "/static/workcell.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 function h(tag, props = {}, ...kids) {
@@ -1780,7 +1781,8 @@ pages.AUTOMATION = {
 pages.SETUP = {
   sub: "TCPs",
   build(el) {
-    const subs = ["TCPs", "Vial Geometry", "Keep-out zones", "F/T + Payload", "Controller gains", "Cameras"];
+    const subs = ["TCPs", "Parts", "Vial Geometry", "Keep-out zones", "F/T + Payload", "Controller gains", "Cameras",
+      "Camera calibration", "Setups"];
     this.nav = h("div", { class: "list subnav" }, subs.map((n) => h("div", { class: "item", onclick: () => this.show(n) }, n)));
     this.body = h("div", { class: "grow col" });
     el.append(h("div", { class: "cols" }, h("div", { class: "card subnav" }, this.nav), this.body));
@@ -1944,9 +1946,16 @@ pages.SETUP = {
       h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3D view"),
         h("span", { class: "muted small", id: "su-v3-what" })),
       h("div", { class: "view3d su-v3", id: "su-v3" }, h("div", { class: "muted v3msg", id: "su-v3-msg" }, "Loading the robot model…")));
+    // Parts, Camera calibration, Setups: workcell.js
+    const lease = (b) => { b.dataset.lease = "1"; return b; };
+    this.wc = workcell({ h, btn, note, cmd, post, $, toast, lease, freedriveButton, fake: () => INFO.fake });
+    const pt = this.wc.buildParts(() => this.svPaint(true)), hc = this.wc.buildCalib(), st = this.wc.buildSetups();
+    this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
+    this.views["Camera calibration"] = h("div", { class: "cols" }, hc.left, hc.right);
+    this.views["Setups"] = h("div", { class: "cols" }, st.card, st.side);
     this.show("TCPs");
   },
-  SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Vial Geometry": "touched points and the fitted rim",
+  SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Parts": "the robot with its parts (saved ones)", "Vial Geometry": "touched points and the fitted rim",
     "Keep-out zones": "keep-out boxes (red = enabled)",
     "F/T + Payload": "calibration poses: the blue ghost is the selected pose" },
   async svInit() {
@@ -2029,6 +2038,9 @@ pages.SETUP = {
     if (n === "Cameras") this.camStatus(true); else this.watch(null, true);
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
     if (n === "Controller gains") this.gLoad(true);
+    if (n === "Parts") this.wc.W.parts.load();
+    if (n === "Camera calibration") this.wc.W.he.load();
+    if (n === "Setups") this.wc.W.setups.load();
   },
   // ---- controller gains: one table per mode, edited fields highlighted, Apply shows the change first
   buildGains() {
@@ -2548,6 +2560,8 @@ pages.SETUP = {
       this.gMark();
     }
     if (this.sub === "Keep-out zones") this.koUpdate(s);
+    if (this.sub === "Parts") this.wc.W.parts.update(s);
+    if (this.sub === "Camera calibration") this.wc.W.he.update(s);
     if (this.sub === "F/T + Payload") {
       this.biasUpdate(s);
       const p = s.payload;
@@ -2885,6 +2899,19 @@ function renderHeader(s) {
   document.body.classList.toggle("stale", !connected);
 }
 
+// SETUP > Parts changed the robot model: every 3D view that has loaded it reloads it (once per change)
+let modelRev = null;
+async function modelWatch(s) {
+  const rev = s.workcell && s.workcell.model_rev;
+  if (rev == null || rev === modelRev) return;
+  const first = modelRev === null;
+  modelRev = rev;
+  if (first) return;
+  const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => null);
+  if (!r || !r.ok) return;
+  for (const p of [pages.OPERATE, pages.PROGRAMS, pages.SETUP]) if (p && p.view && p.view.reload) p.view.reload(r);
+}
+
 function render() {
   if (!S || !INFO) return;
   renderHeader(S);
@@ -2926,6 +2953,7 @@ async function boot() {
     }
     if (S.boot && boot && S.boot !== boot) logSeq = 0;               // sequence numbers restart with the server
     boot = boot || S.boot;
+    modelWatch(S);
     render();
   });
   es.addEventListener("log", (e) => {

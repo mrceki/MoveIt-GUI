@@ -74,19 +74,25 @@ by another DNS name (a lab domain name, a CNAME), add `--allow-host robot.lab.ex
 Do these once per tool / workcell. Everything is saved under `~/ur7e_data/config/moveit_gui` and restored on the
 next start.
 
-1. **TCPs**: add your tool tip as a virtual TCP (e.g. `spatula_tip` = `robotiq_tcp` + 150 mm in Z) and make it
-   active in the top bar.
+1. **Parts**: add what is bolted on (spatula, camera bracket, table) so MoveIt plans around it, then **TCP at its
+   tip…** on the tool part and make that TCP active in the top bar. Parts work at once; **Restart robot stack**
+   (banner) also writes them into the robot model. Or **TCPs**: add the tool tip as a plain virtual TCP (e.g.
+   `spatula_tip` = `robotiq_tcp` + 150 mm in Z).
 2. **F/T + Payload**: with the tool on and nothing touching it, press **Zero now** (F/T bias), collect the
    calibration poses (one at a time, or Collect all poses), Evaluate, then **Apply to admittance**. The
    **Saved** block shows what is kept: the payload restored before every switch to Admittance, and the bias
    restored after a stack restart.
 3. **Vial Geometry**: touch the rim (3 points, optionally the bottom) and save. Or pick a vial in **Vial
    profiles** (built-in `baseline` = scraping.py's position; save your own vials there and switch with Use).
-4. **Keep-out zones**: add the table first.
+4. **Keep-out zones**: add the table first (or make it a part).
+5. **Camera calibration** (if a camera is used): print the board, Start, Plan 12 poses, Collect all, Solve, Save +
+   add to robot.
+6. **Setups**: save the whole configuration under a name. When you change the tool, save a new one; Load switches
+   back (the GUI restarts by itself).
 
 ## 6. Move to another PC / back up
 
-Copy `~/ur7e_data` (TCPs, vials, F/T bias, payload, gains, programs, policies). The folder is created by the
+Copy `~/ur7e_data` (TCPs, parts, camera calibrations, setups, vials, F/T bias, payload, gains, programs, policies). The folder is created by the
 container, so some files belong to root: `sudo cp -a ~/ur7e_data <dest>`.
 
 ## 7. Update
@@ -104,5 +110,9 @@ yours from `~/ws/src/moveit_gui/programs/`.
 * **403 "unknown Host header"**: you reached the GUI by a DNS name it does not know: add `--allow-host NAME`.
 * **Port busy**: `--port <n>`. Find the old process with `ss -ltnp | grep 8180` and stop it by PID.
 * **A container called ur7e_robotiq is already running**: another terminal has the stack. `docker stop ur7e_robotiq`.
+* **Restart from the GUI does nothing**: only a GUI started by `ur7e_gui.sh` can restart (it exits with code 75 / 76
+  and the launcher starts it again). A refusal says why (robot busy).
+* **Robot stack fails after adding a part**: the launch log shows the xacro error. Fix or delete the part in SETUP ›
+  Parts (in a fake GUI: `~/ur7e_gui.sh --fake`), or move `~/ur7e_data/config/moveit_gui/parts/generated` away.
 * **Old UI in the browser after an update**: a banner offers a reload. Otherwise reload the page.
 * **More**: `docs/WEB.md` (every page and button), `README.md` (profiles, programs, architecture).

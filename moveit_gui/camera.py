@@ -67,6 +67,16 @@ def decode_image(encoding: str, width: int, height: int, step: int, data, is_big
     return np.ascontiguousarray(rgb, dtype=np.uint8)
 
 
+def to_gray(encoding: str, width: int, height: int, step: int, data, is_bigendian: bool = False) -> np.ndarray:
+    """sensor_msgs/Image (colour or mono, 8 bit) -> HxW uint8 grey at full resolution, for calibration."""
+    ch, dtype, kind = _channels(encoding)
+    if kind == "depth" or dtype != np.uint8:
+        raise ImageDecodeError(f"{encoding} is a depth image: calibrate on the colour or infrared stream")
+    img = decode_image(encoding, width, height, step, data, is_bigendian, max_width=max(1, int(width)))
+    return np.ascontiguousarray(img[..., 0] if kind == "mono" else
+                                (0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]).astype(np.uint8))
+
+
 @dataclass
 class CameraFrame:
     topic: str

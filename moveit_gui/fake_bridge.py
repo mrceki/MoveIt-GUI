@@ -31,6 +31,14 @@ FAKE_DETECTOR_BIAS = tf.mm_deg_to_T([6, -4, 3], [0, 0, 2.0])     # applied in th
 FAKE_DETECTOR_FRAME = "fake_detector/object"
 FAKE_T_TOOL0_FT = tf.make([0.0, 0.0, 0.0433])
 FAKE_PAYLOAD_MASS = 0.9
+# The simulated RealSense on the wrist (eye-in-hand): its driver tree camera_link -> optical frame, where camera_link
+# truly is on tool0 (what a hand-eye calibration should find), and its intrinsics. The ChArUco board sits 0.45 m in
+# front of the camera at the start pose. Nothing publishes tool0 -> camera_link until a part does (SETUP > Parts).
+FAKE_CAM_TOPIC, FAKE_CAM_INFO = "/camera/camera/color/image_rect_raw", "/camera/camera/color/camera_info"
+FAKE_CAM_LINK, FAKE_CAM_OPTICAL = "camera_link", "camera_color_optical_frame"
+FAKE_T_LINK_OPTICAL = tf.mm_deg_to_T([0, 15, 0], [-90, 0, -90])
+FAKE_T_TOOL0_CAMLINK = tf.mm_deg_to_T([0, -75, 35], [0, -90, 90])
+FAKE_CAM_K = [910.0, 0.0, 640.0, 0.0, 910.0, 360.0, 0.0, 0.0, 1.0]
 FAKE_PAYLOAD_COG = np.array([0.01, 0.005, 0.06])
 
 
@@ -126,6 +134,12 @@ class FakeBridge:
         self.fake_velocities_available = True
         self.stale_frames: set = set()
         self.extra_frames: Dict[str, np.ndarray] = {}   # child of tool0, e.g. a tool frame in TF
+        self.part_frames: Dict[str, Tuple[str, np.ndarray]] = {}     # SETUP > Parts static TF: child -> (parent, T)
+        self.part_objects: Dict[str, dict] = {}                       # SETUP > Parts collision objects by id
+        self.parts_scene_readable = True
+        T_base_opt = self.T_base_tool0 @ FAKE_T_TOOL0_CAMLINK @ FAKE_T_LINK_OPTICAL
+        self.fake_board = None                                       # board spec (handeye.check_board) once used
+        self.fake_T_base_board = T_base_opt @ tf.mm_deg_to_T([-122.5, -87.5, 450], [0, 0, 0])
         self.fake_action_ready = True          # MoveIt action server of the active controller
         self.fake_reference_result: Tuple[bool, str] = (True, "")
         self.fail_rollback = False             # every switch after the first is rejected
@@ -266,6 +280,13 @@ class FakeBridge:
             return T_tool0 @ FAKE_T_TOOL0_FT
         if frame in self.extra_frames:
             return T_tool0 @ self.extra_frames[frame]
+        if frame in self.part_frames:
+            parent, T = self.part_frames[frame]
+            Tp = self._T_base(parent) if parent != frame else None
+            return None if Tp is None else Tp @ T
+        if frame == FAKE_CAM_OPTICAL:
+            Tl = self._T_base(FAKE_CAM_LINK) if FAKE_CAM_LINK in self.part_frames else None
+            return None if Tl is None else Tl @ FAKE_T_LINK_OPTICAL
         if frame == "robotiq_tcp":
             return None if "tool0" in self.stale_frames else T_tool0 @ FAKE_T_TOOL0_ROBOTIQ
         if frame == FAKE_DETECTOR_FRAME:
@@ -278,6 +299,8 @@ class FakeBridge:
         return FAKE_OBJECT_TRUE @ FAKE_DETECTOR_BIAS @ noise
 
     def lookup_transform(self, parent: str, child: str) -> Optional[np.ndarray]:
+        if (parent, child) == (FAKE_CAM_LINK, FAKE_CAM_OPTICAL):          # the camera driver's own static tree
+            return FAKE_T_LINK_OPTICAL.copy()
         Tp, Tc = self._T_base(parent), self._T_base(child)
         if Tp is None or Tc is None:
             return None
@@ -691,6 +714,48 @@ class FakeBridge:
 
     def watched_image(self):
         return self._image_watch
+
+    # ---------------------------------------------------------------- parts (SETUP > Parts)
+    def parts_publish(self, frames, objects, remove_ids):
+        self.calls.append(("parts_publish", len(frames), [o["id"] for o in objects], [i for i, _ in remove_ids]))
+        for parent, child, T in frames:
+            self.part_frames[child] = (parent, np.array(T, dtype=float))
+        for oid, _ in remove_ids:
+            self.part_objects.pop(oid, None)
+        for o in objects:
+            self.part_objects[o["id"]] = dict(o)
+        return True, "published"
+
+    def parts_scene_ids(self):
+        if not self.parts_scene_readable:
+            return None
+        return {i: (o["link"] if o["attach"] else "") for i, o in self.part_objects.items()}
+
+    def tf_parent(self, frame: str) -> Optional[str]:
+        if frame == FAKE_CAM_OPTICAL:
+            return FAKE_CAM_LINK
+        return self.part_frames.get(frame, (None,))[0]
+
+    # ---------------------------------------------------------------- camera calibration
+    def camera_info(self, topic: str, timeout_s: float = 3.0):
+        if topic != FAKE_CAM_INFO:
+            return None, f"{topic}: no CameraInfo within {timeout_s:.0f} s"
+        return {"K": list(FAKE_CAM_K), "D": [0.0] * 5, "model": "plumb_bob", "width": 1280, "height": 720,
+                "frame_id": FAKE_CAM_OPTICAL}, "ok"
+
+    def grab_image(self, topic: str, timeout_s: float = 3.0):
+        """The wrist camera's view of the board from where the fake arm is now (rendered, a little noise)."""
+        from . import handeye as he
+        if topic != FAKE_CAM_TOPIC:
+            return None, f"{topic}: no image within {timeout_s:.0f} s"
+        b = self.fake_board or he.check_board(None)
+        with self._lock:
+            T_base_opt = self.T_base_tool0 @ FAKE_T_TOOL0_CAMLINK @ FAKE_T_LINK_OPTICAL
+        T_cam_board = tf.inv(T_base_opt) @ self.fake_T_base_board
+        if T_cam_board[2, 3] <= 0.05:
+            return np.full((720, 1280), 110, np.uint8), FAKE_CAM_OPTICAL
+        self._grab_n = getattr(self, "_grab_n", 0) + 1
+        return he.render_board(b, FAKE_CAM_K, T_cam_board, (1280, 720), seed=self._grab_n), FAKE_CAM_OPTICAL
 
     def shutdown(self):
         self._image_stop.set()
