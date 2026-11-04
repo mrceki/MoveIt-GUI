@@ -595,7 +595,8 @@ pages.OPERATE = {
     cmd("switch_mode", { mode: name });
   },
   // Robot power through the UR Dashboard (pendant in Remote Control), as three steps: Power on → Release brakes →
-  // ▶ Play program. Power on and brake release only from a browser on the robot PC: the server checks that too.
+  // ▶ Play program. Power on and brake release from any browser with control and "I can see the robot", unless
+  // the robot PC limits them to its own browser (MOVEIT_GUI_LOCAL_POWER_ONLY): the server checks that too.
   robotCard() {
     const seen = "Check that you can see the robot, nobody is in its reach and the workspace is clear.";
     this.pOn = btn("Power on", "", () => window.confirm(`Power on the robot?\n\n${seen}`) && cmd("power_on", { seen: true }),
@@ -603,7 +604,8 @@ pages.OPERATE = {
     this.pBrake = btn("Release brakes", "", () => window.confirm(`Release the brakes?\n\nThe joints move slightly and click.\n${seen}`) &&
       cmd("brake_release", { seen: true }), "Release the brakes: the robot goes to RUNNING");
     this.pOff = btn("Power off…", "quiet", () => window.confirm("Power off the robot?\n\nGUI motion is stopped first; the brakes engage. " +
-      "Powering on again needs a browser on the robot PC or the pendant.") && cmd("power_off"), "Power off the arm (UR Dashboard)");
+      (INFO.remote_power ? "Power on again here when you can see the robot." :
+      "Powering on again needs a browser on the robot PC or the pendant.")) && cmd("power_off"), "Power off the arm (UR Dashboard)");
     const play = async () => {
       const paused = S.program_state === "PAUSED";
       const r = await cmd("robot_loaded_program");      // play starts whatever is loaded: show it by name first
@@ -622,7 +624,7 @@ pages.OPERATE = {
       "Stop the robot program (power and brakes stay on)");
     const step = (n, b, label) => {
       const el = h("div", { class: "pstep", id: `op-ps${n}` }, h("span", { class: "pnum" }, String(n)),
-        INFO.local || n === 3 ? b : h("span", { class: "muted" }, label + " (robot PC / pendant)"));
+        INFO.local || INFO.remote_power || n === 3 ? b : h("span", { class: "muted" }, label + " (robot PC / pendant)"));
       return el;
     };
     [this.pOn, this.pBrake, this.pPlay, this.pOff, this.pResume, this.pPause, this.pStopProg].forEach((b) => (b.dataset.lease = "1"));

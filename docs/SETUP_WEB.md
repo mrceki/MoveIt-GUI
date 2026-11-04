@@ -53,8 +53,8 @@ by another DNS name (a lab domain name, a CNAME), add `--allow-host robot.lab.ex
 ## 4. Real robot
 
 1. On the pendant: the robot is in Remote control and the External Control URCap program points at this PC.
-   Power on and brake release: on the pendant, or in the GUI (OPERATE) from a browser on this PC only; other
-   devices can operate the robot but never power it on.
+   Power on and brake release: on the pendant, or in the GUI (OPERATE) from any browser that has control, after
+   confirming you can see the robot (`MOVEIT_GUI_LOCAL_POWER_ONLY=1 ur7e_gui.sh` limits them to a browser on this PC).
 2. Start the GUI:
    ```bash
    ~/ur7e_gui.sh                                  # web GUI, robot 10.6.203.101

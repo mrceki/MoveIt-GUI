@@ -16,6 +16,7 @@ import contextlib
 import itertools
 import json
 import math
+import os
 import secrets
 import threading
 import time
@@ -101,6 +102,12 @@ class Lease:
 
     def view(self) -> dict:
         return {"client": self.id, "name": self.name}
+
+
+def remote_power() -> bool:
+    """Power on / brake release from any browser with control (default), or only from the robot PC
+    (MOVEIT_GUI_LOCAL_POWER_ONLY=1)."""
+    return os.environ.get("MOVEIT_GUI_LOCAL_POWER_ONLY", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
 class WebService(WorkcellCommands):
@@ -252,14 +259,18 @@ class WebService(WorkcellCommands):
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
             raise CommandError(f"unknown command '{cmd}'")
-        if getattr(handler, "local_only", False) and not local:
+        local_only = getattr(handler, "local_only", False)
+        if local_only and not local and not remote_power():
             raise CommandError("only from a browser on the robot PC, where you can see the robot "
-                               "(or on the teach pendant)")
+                               "(or on the teach pendant): MOVEIT_GUI_LOCAL_POWER_ONLY is set")
         read_only = getattr(handler, "read_only", False)
         holds = self.heartbeat(client)                    # any request with the valid token is also a heartbeat
         if not read_only and not holds:
             raise CommandError("take control first: another browser or nobody holds the control lease")
         args = dict(args or {})
+        args.pop("local", None)                           # the server says where the browser is, never the page
+        if local_only:
+            args["local"] = bool(local)
         rev = args.pop("rev", None)
         edits = cmd in PROGRAM_EDITS or cmd in ("program_undo", "program_redo")
         with (self._edit_lock if edits else contextlib.nullcontext()):    # snapshot, handler, compare: one at a time
@@ -475,8 +486,9 @@ class WebService(WorkcellCommands):
 
     # ------------------------------------------------------------ robot power (UR Dashboard)
     # Power off may come from any browser that has control: it only makes the robot safer.
-    # Power on and brake release wake the arm (releasing the brakes moves the joints slightly), so they are
-    # accepted only from a browser on the robot PC, with control and an explicit "I can see the robot".
+    # Power on and brake release wake the arm (releasing the brakes moves the joints slightly), so they need
+    # control and an explicit "I can see the robot", from any browser (logged with who and where). With
+    # MOVEIT_GUI_LOCAL_POWER_ONLY=1 only a browser on the robot PC (or the pendant) may.
     # The pendant must be in Remote Control mode; in Local mode the robot refuses and says so.
     def _who(self) -> str:
         return self.lease.name or "a browser"
@@ -496,22 +508,25 @@ class WebService(WorkcellCommands):
         if not self.core.idle():
             raise CommandError(f"{what}: the GUI is commanding the robot: stop it first")
 
-    def cmd_power_on(self, seen=False):
+    def _where(self, local) -> str:
+        return "on the robot PC" if local else "from a remote browser"
+
+    def cmd_power_on(self, seen=False, local=False):
         self._require_seen(seen, "power on")
         if self.core.last_snap.robot_mode in ("POWER_ON", "IDLE", "RUNNING"):
             raise CommandError("the robot is already powered on")
-        self.core.bridge.log(f"web: power on from {self._who()} on the robot PC")
+        self.core.bridge.log(f"web: power on from {self._who()} {self._where(local)}")
         return self._submit("power on", lambda: self.core.bridge.dashboard("power_on"))
     cmd_power_on.local_only = True
 
-    def cmd_brake_release(self, seen=False):
+    def cmd_brake_release(self, seen=False, local=False):
         self._require_seen(seen, "brake release")
         m = self.core.last_snap.robot_mode
         if m == "RUNNING":
             raise CommandError("the brakes are already released (robot mode RUNNING)")
         if m not in ("IDLE", "?"):
             raise CommandError(f"robot mode is {m}: power on first and wait for IDLE")
-        self.core.bridge.log(f"web: brake release from {self._who()} on the robot PC")
+        self.core.bridge.log(f"web: brake release from {self._who()} {self._where(local)}")
         return self._submit("brake release", lambda: self.core.bridge.dashboard("brake_release"))
     cmd_brake_release.local_only = True
 
@@ -2004,7 +2019,7 @@ class WebService(WorkcellCommands):
         return {
             "base": {"name": base, "label": B.BASES[base][0]},
             "robot": p.display_name, "profile": p.name, "ur_type": p.ur_type, "robot_ip": p.robot_ip,
-            "fake": c.fake, "base_link": p.base_link, "joint_names": p.joint_names,
+            "fake": c.fake, "remote_power": remote_power(), "base_link": p.base_link, "joint_names": p.joint_names,
             "modes": [{"name": n, "label": m.label, "interface": m.command_interface, "direct_torque": m.direct_torque,
                        "experimental": m.experimental, "moveit": m.supports_moveit,
                        "allowed": m.allow_activation and not no_mode[n],

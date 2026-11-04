@@ -19,6 +19,8 @@
 #   gripper               Robotiq gripper on tool0          none      the bare arm
 # Kept in ~/ur7e_data/config/moveit_gui/base; SETUP > Setups switches it too (and restarts the stack).
 #
+# Power on / Release brakes work from any browser that has control (after "I can see the robot");
+# MOVEIT_GUI_LOCAL_POWER_ONLY=1 ur7e_gui.sh limits them to a browser on this PC (and the pendant).
 # Saved data (programs, TCPs, fixtures, payload/vial results, logs) goes to ~/ur7e_data.
 set -eo pipefail
 
@@ -39,7 +41,7 @@ while [ $# -gt 0 ]; do
     --port)     PORT="$2"; shift 2 ;;
     --base)     NEW_BASE="$2"; shift 2 ;;
     --)         shift; LAUNCH_ARGS=("$@"); break ;;
-    -h|--help)  sed -n 2,22p "$0"; exit 0 ;;
+    -h|--help)  sed -n 2,24p "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
@@ -139,6 +141,7 @@ start_stack() {
     STACK="exec > >(tee /data/logs/launch_$stamp.log) 2>&1; exec ros2 launch ur7e_robotiq_bringup gui.launch.py robot_ip:=$ROBOT_IP ${LAUNCH_ARGS[*]}"
   fi
   docker run -d --rm --init --stop-signal SIGINT --stop-timeout 30 --name "$NAME" --net=host -e ROS_DOMAIN_ID="$DOMAIN" -e UR7E_EE_CONFIG="$BASE" $(parts_env) \
+    -e MOVEIT_GUI_LOCAL_POWER_ONLY="${MOVEIT_GUI_LOCAL_POWER_ONLY:-}" \
     -e DISPLAY="${DISPLAY:-:0}" -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$DATA:/data" -v "$WS:/ws" \
     "$IMAGE" bash -c "source /opt/ros/jazzy/setup.bash && source /opt/ur7e_ws/install/setup.bash && $STACK" >/dev/null

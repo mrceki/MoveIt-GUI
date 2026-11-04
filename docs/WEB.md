@@ -120,9 +120,11 @@ Screenshots: `docs/ux/web_operate_v24_running.png`, `docs/ux/web_operate_v24_pow
 
 * **Power off…** — any browser that has control. GUI motion is stopped first, then the robot powers off and the
   brakes engage. It asks first.
-* **Power on** and **Release brakes** — only in a browser **on the robot PC**, with control, after confirming that
-  you can see the robot and its workspace is clear. Releasing the brakes moves the joints slightly. Other browsers
-  do not get these buttons, and the server refuses the commands from them.
+* **Power on** and **Release brakes** — any browser that has control, after confirming that you can see the robot
+  and its workspace is clear. Releasing the brakes moves the joints slightly. The log says who and whether it came
+  from the robot PC or a remote browser.
+  * `MOVEIT_GUI_LOCAL_POWER_ONLY=1` (environment of `ur7e_gui.sh`, passed into the container) limits them to a
+    browser **on the robot PC**: other browsers do not get these buttons, and the server refuses the commands.
   * The server decides what counts as "on the robot PC", not the page: the connection must come from this machine
     (loopback or the address the server listens on), carry no proxy header (`tailscale serve`, `X-Forwarded-For`,
     …), and the page's `Origin` must be that same address and port. An SSH port forward to this PC cannot be told

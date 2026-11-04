@@ -1,5 +1,6 @@
-"""Robot power from the web GUI: power off from any browser with control; power on and brake release only from a
-browser on the robot PC, with control and "I can see the robot". The server decides what is local, not the page."""
+"""Robot power from the web GUI: power off from any browser with control; power on and brake release from any
+browser with control and "I can see the robot" (MOVEIT_GUI_LOCAL_POWER_ONLY=1: only from the robot PC). The server
+decides what is local, not the page."""
 import json
 import os
 import time
@@ -58,33 +59,45 @@ def mode(s, m):
     s.tick()
 
 
-def test_power_on_and_brake_release_only_from_the_robot_pc_and_only_when_seen(s):
+def test_power_on_and_brake_release_need_control_and_seen_from_any_browser(s):
     mode(s, "POWER_OFF")
-    with pytest.raises(CommandError, match="robot PC"):
-        s.command("a", "power_on", {"seen": True})                       # remote browser, even with control
-    with pytest.raises(CommandError, match="robot PC"):
-        s.command("a", "brake_release", {"seen": True})
     with pytest.raises(CommandError, match="take control"):
-        s.command("b", "power_on", {"seen": True}, local=True)           # local, but without control
+        s.command("b", "power_on", {"seen": True})                       # without control
     with pytest.raises(CommandError, match="can see the robot"):
-        s.command("a", "power_on", {}, local=True)
+        s.command("a", "power_on", {})
     with pytest.raises(CommandError, match="can see the robot"):
-        s.command("a", "power_on", {"seen": "yes"}, local=True)          # only a real true counts
+        s.command("a", "power_on", {"seen": "yes"})                      # only a real true counts
     with pytest.raises(CommandError, match="power on first"):
-        s.command("a", "brake_release", {"seen": True}, local=True)      # brakes need a powered robot (IDLE)
+        s.command("a", "brake_release", {"seen": True})                  # brakes need a powered robot (IDLE)
     assert dash(s) == []
 
-    assert s.command("a", "power_on", {"seen": True}, local=True)["ok"]
+    assert s.command("a", "power_on", {"seen": True, "local": True})["ok"]   # remote; the page cannot claim local
     assert wait(lambda: dash(s) == ["power_on"])
     mode(s, "IDLE")
     with pytest.raises(CommandError, match="already powered on"):
-        s.command("a", "power_on", {"seen": True}, local=True)
+        s.command("a", "power_on", {"seen": True})
     s.command("a", "brake_release", {"seen": True}, local=True)
     assert wait(lambda: dash(s) == ["power_on", "brake_release"])
     mode(s, "RUNNING")
     with pytest.raises(CommandError, match="already released"):
-        s.command("a", "brake_release", {"seen": True}, local=True)
-    assert any("brake release from Ana on the robot PC" in line for line in logs(s))
+        s.command("a", "brake_release", {"seen": True})
+    lines = logs(s)
+    assert any("power on from Ana from a remote browser" in line for line in lines)
+    assert any("brake release from Ana on the robot PC" in line for line in lines)
+    assert s.info()["remote_power"] is True
+
+
+def test_local_power_only_limits_power_on_to_the_robot_pc(s, monkeypatch):
+    monkeypatch.setenv("MOVEIT_GUI_LOCAL_POWER_ONLY", "1")
+    mode(s, "POWER_OFF")
+    assert s.info()["remote_power"] is False
+    with pytest.raises(CommandError, match="robot PC"):
+        s.command("a", "power_on", {"seen": True})                       # remote browser, even with control
+    with pytest.raises(CommandError, match="robot PC"):
+        s.command("a", "brake_release", {"seen": True, "local": True})   # the page cannot claim local
+    assert dash(s) == []
+    assert s.command("a", "power_on", {"seen": True}, local=True)["ok"]
+    assert wait(lambda: dash(s) == ["power_on"])
 
 
 def test_power_off_from_any_browser_with_control_stops_motion_first(s):
@@ -119,7 +132,8 @@ def post(url, body, headers):
         return e.code, json.loads(e.read())
 
 
-def test_server_counts_only_a_same_pc_page_without_proxy_headers_as_local(http):
+def test_server_counts_only_a_same_pc_page_without_proxy_headers_as_local(http, monkeypatch):
+    monkeypatch.setenv("MOVEIT_GUI_LOCAL_POWER_ONLY", "1")             # the local check matters only then
     base, port, s = http
     mode(s, "POWER_OFF")
     body = {"client": "a", "cmd": "power_on", "args": {"seen": True}}
