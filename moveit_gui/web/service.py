@@ -30,7 +30,7 @@ import yaml
 from .. import bases as B
 from .. import transforms as tf
 from ..bridge_api import wrench_fresh
-from ..calibration import CalibrationError, FixtureDef, TcpDef, config_dir
+from ..calibration import CalibrationError, FixtureDef, TcpDef, config_dir, pivot_quality, solve_pivot
 from ..core import RobotCore
 from ..ft_payload import PayloadCalibration, PayloadCalibrationError
 from ..force import ForceError, WrenchTarget
@@ -126,6 +126,9 @@ class WebService(WorkcellCommands):
         self._hold: Optional[dict] = None                 # hold-to-run motion: {"seen", "label"}
         self.prepared_policy: Optional[str] = None
         self.vial_points: Dict[str, List[float]] = {}
+        self._pivot_parent = ""
+        self._pivot_samples: List[np.ndarray] = []
+        self._pivot_result = None
         self.vials = VialLibrary(config_dir() / "vials" / f"{core.profile.name}.yaml", core.profile.example_fixtures,
                                  core.profile.base_link)
         self._plan_id = 0
@@ -680,6 +683,87 @@ class WebService(WorkcellCommands):
         self.core.store.delete_tcp(str(name))
         self.core.bridge.log(f"TCP {name} deleted")
         return self._ok(f"TCP {name} deleted")
+
+    def cmd_pivot_reset(self, parent):
+        if parent not in self._tcp_parents():
+            raise CommandError(f"unknown parent '{parent}'")
+        self._pivot_parent = parent
+        self._pivot_samples = []
+        self._pivot_result = None
+        return self._ok(pivot=self._pivot_view())
+
+    def cmd_pivot_capture(self, parent):
+        if parent not in self._tcp_parents():
+            raise CommandError(f"unknown parent '{parent}'")
+        if self._pivot_parent != parent:
+            self.cmd_pivot_reset(parent)
+        if len(self._pivot_samples) >= 100:
+            raise CommandError("maximum 100 pivot samples")
+        # Reads TF only. The operator moves the robot in freedrive; never command motion here.
+        T = self.core.geo.current_T_base_tcp(parent)
+        if not np.all(np.isfinite(T)):
+            raise CommandError("invalid parent pose")
+        self._pivot_samples.append(T)
+        self._pivot_result = None
+        return self._ok(pivot=self._pivot_view())
+
+    def cmd_pivot_remove(self, index):
+        i = int(index)
+        if not 0 <= i < len(self._pivot_samples):
+            raise CommandError("no sample at that index")
+        del self._pivot_samples[i]
+        self._pivot_result = None
+        return self._ok(pivot=self._pivot_view())
+
+    def cmd_pivot_solve(self):
+        self._pivot_result = solve_pivot(self._pivot_samples)
+        return self._ok(pivot=self._pivot_view())
+
+    def cmd_pivot_save(self, name, rpy_deg, replace=False):
+        if not self.core.idle():
+            raise CommandError("the robot is busy: save TCPs while idle")
+        res = self._pivot_result
+        if res is None:
+            raise CommandError("solve the current samples first")
+        if self._pivot_parent not in self._tcp_parents():
+            raise CommandError("pivot parent is no longer available")
+        rpy = [float(v) for v in rpy_deg]
+        if len(rpy) != 3 or not all(math.isfinite(v) and abs(v) <= 180 for v in rpy):
+            raise CommandError("orientation must be three finite angles in [-180, 180] degrees")
+        name = str(name).strip()
+        if name == ACTIVE_TCP:
+            raise CommandError(f"'{ACTIVE_TCP}' is reserved")
+        tcp = TcpDef(name, "virtual", parent=self._pivot_parent,
+                     T_parent_tcp=tf.mm_deg_to_T(res.p_parent_tcp * 1000, rpy),
+                     meta={"method": "pivot", "sample_count": res.sample_count,
+                           "residual_rms_m": round(res.rms_m, 7),
+                           "residual_max_m": round(res.max_m, 7),
+                           "orientation": "manual RPY (not calibrated)" if any(rpy)
+                           else "inherited from parent"})
+        self.core.store.put_tcp(tcp, replace=bool(replace))
+        self.core.bridge.log(f"Pivot TCP {name} saved from {res.sample_count} samples, RMS {res.rms_m * 1000:.3f} mm")
+        return self._ok(f"TCP {name} saved")
+
+    def _pivot_view(self):
+        quality, reason, span = pivot_quality(self._pivot_samples)
+        samples = []
+        for T in self._pivot_samples:
+            xyz, rpy = tf.T_to_mm_deg(T)
+            samples.append({"xyz_mm": [round(float(x), 2) for x in xyz],
+                            "rpy_deg": [round(float(x), 2) for x in rpy]})
+        out = {"parent": self._pivot_parent, "samples": samples,
+               "quality": quality, "quality_reason": reason, "span_deg": round(span, 1), "result": None}
+        if self._pivot_result is not None:
+            r = self._pivot_result
+            out["result"] = {"xyz_mm": [round(float(x * 1000), 3) for x in r.p_parent_tcp],
+                             "pivot_base_mm": [round(float(x * 1000), 2) for x in r.p_base_pivot],
+                             "rms_mm": round(r.rms_m * 1000, 3), "max_mm": round(r.max_m * 1000, 3),
+                             "worst_sample": int(np.argmax(r.residuals_m)) + 1}
+        return out
+
+    def cmd_pivot_get(self):
+        return self._ok(pivot=self._pivot_view())
+    cmd_pivot_get.read_only = True
 
     def _tcp_parents(self) -> List[str]:
         p = self.core.profile

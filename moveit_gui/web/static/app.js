@@ -1791,7 +1791,7 @@ pages.SETUP = {
     this.views["TCPs"] = h("div", { class: "card su-main" }, h("div", { class: "section" }, "TCPs"),
       note("A virtual TCP is a fixed offset from a parent TCP or link (e.g. the spatula tip).",
         "Recorded poses store their TCP. A virtual TCP changes poses only, not MoveIt's collision model. " +
-        "Pivot calibration is still in the desktop app."),
+        "Pivot calibration estimates tip position, not orientation."),
       h("div", { class: "list", id: "su-tcps" }),
       h("div", { class: "section" }, "New / edit virtual TCP"),
       h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
@@ -1801,7 +1801,29 @@ pages.SETUP = {
         h("span", { class: "k" }, "R P Y °"), h("div", { class: "row" }, [3, 4, 5].map((i) => h("input", { type: "number", id: `su-to${i}`, value: "0", step: "1", style: "width:80px" })))),
       h("div", { class: "row" },
         (() => { const b = btn("Save TCP", "primary", () => this.saveTcp()); b.dataset.lease = "1"; return b; })(),
-        h("span", { class: "muted small" }, "Saving a name that exists edits it.")));
+        h("span", { class: "muted small" }, "Saving a name that exists edits it.")),
+      h("div", { class: "section" }, "Pivot calibration"),
+      note("Hold the tool tip against one fixed point. In freedrive, tilt about two different axes and capture 6–12 poses. " +
+        "No robot motion is commanded by Capture. Use a parent attached rigidly to the tool."),
+      h("div", { class: "row" }, h("span", { class: "k" }, "Parent"),
+        h("select", { id: "su-pivot-parent", onchange: () => this.pivotReset() }), freedriveButton()),
+      h("select", { id: "su-pivot-samples", size: "5", style: "width:100%;min-height:100px" }),
+      h("div", { class: "row" },
+        ...[["Capture sample", () => this.pivotCmd("pivot_capture", { parent: $("#su-pivot-parent").value })],
+          ["Remove selected", () => this.pivotCmd("pivot_remove", { index: $("#su-pivot-samples").selectedIndex })],
+          ["Reset", () => this.pivotReset()], ["Solve", () => this.pivotCmd("pivot_solve")]].map(([label, fn]) => {
+            const b = btn(label, "", fn); b.dataset.lease = "1"; return b;
+          })),
+      h("div", { class: "muted small", id: "su-pivot-quality" }, "No samples"),
+      h("div", { class: "mono small", id: "su-pivot-result" }, "Solve after capturing diverse orientations."),
+      h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
+        h("span", { class: "k" }, "Save as"), h("input", { id: "su-pivot-name", value: "spatula_tip" }),
+        h("span", { class: "k" }, "Manual R P Y °"),
+        h("div", { class: "row" }, [0, 1, 2].map(i => h("input", {
+          id: `su-pivot-r${i}`, type: "number", value: "0", min: "-180", max: "180", step: "1", style: "width:80px"
+        })))),
+      (() => { const b = btn("Save calibrated TCP", "primary", () => this.pivotSave()); b.id = "su-pivot-save";
+        b.dataset.lease = "1"; return b; })());
     // Vial
     const vrows = INFO.vial_points.map((n, k) => h("div", { class: "row" }, h("span", { class: "dot", id: `su-vd-${k}` }),
       h("span", { style: "width:130px" }, n + (n === "Bottom" ? " (optional)" : "")),
@@ -2039,6 +2061,7 @@ pages.SETUP = {
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
     if (n === "Controller gains") this.gLoad(true);
     if (n === "Parts") this.wc.W.parts.load();
+    if (n === "TCPs") this.pivotCmd("pivot_get");
     if (n === "Camera calibration") this.wc.W.he.load();
     if (n === "Setups") this.wc.W.setups.load();
   },
@@ -2331,6 +2354,32 @@ pages.SETUP = {
     if (exists && !window.confirm(`Change TCP ${name}? Poses taught with it will now mean a different tool point.`)) return;
     cmd("tcp_save", { name, parent: $("#su-tp").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), replace: exists });
   },
+  async pivotCmd(command, args = {}) {
+    const r = await cmd(command, args);
+    if (r.ok && r.pivot) this.pivotUpdate(r.pivot);
+  },
+  pivotReset() { this.pivotCmd("pivot_reset", { parent: $("#su-pivot-parent").value }); },
+  pivotUpdate(p) {
+    this.pivot = p;
+    const sel = $("#su-pivot-samples"), selected = sel.selectedIndex;
+    sel.replaceChildren(...p.samples.map((x, i) => h("option", { value: i },
+      `#${i + 1}  ${x.xyz_mm.join(", ")} mm · ${x.rpy_deg.join(", ")}°`)));
+    sel.selectedIndex = selected < p.samples.length ? selected : p.samples.length - 1;
+    $("#su-pivot-quality").textContent = `${p.samples.length} samples · ${p.quality}: ${p.quality_reason}`;
+    const r = p.result;
+    $("#su-pivot-result").textContent = r
+      ? `Tip in ${p.parent}: [${r.xyz_mm.join(", ")}] mm; pivot in base: [${r.pivot_base_mm.join(", ")}] mm; ` +
+        `RMS ${r.rms_mm} mm, max ${r.max_mm} mm (sample #${r.worst_sample})`
+      : "Solve after capturing diverse orientations.";
+    gate($("#su-pivot-save"), !!r);
+  },
+  pivotSave() {
+    if (!this.pivot?.result) return;
+    const name = $("#su-pivot-name").value.trim();
+    const existing = S.calibration.tcps.some(t => t.name === name);
+    if (existing && !window.confirm(`Replace TCP ${name}? Previously taught poses will use the new offset.`)) return;
+    cmd("pivot_save", { name, replace: existing, rpy_deg: [0, 1, 2].map(i => +$(`#su-pivot-r${i}`).value) });
+  },
   // F/T bias: software offsets on the F/T broadcaster (the ATI box itself is never biased)
   buildBias() {
     const cell = (id) => h("td", { class: "num mono", id });
@@ -2549,6 +2598,11 @@ pages.SETUP = {
         const sel = $("#su-tp"), cur = sel.value;
         sel.replaceChildren(...c.tcp_parents.map((n) => h("option", { value: n }, n)));
         sel.value = c.tcp_parents.includes(cur) ? cur : c.active_tcp;
+        const pivotParent = $("#su-pivot-parent"), prev = pivotParent.value;
+        pivotParent.replaceChildren(...c.tcp_parents.map(n => h("option", { value: n }, n)));
+        pivotParent.value = c.tcp_parents.includes(prev) ? prev : c.active_tcp;
+        if (this.pivot && this.pivot.parent && c.tcp_parents.includes(this.pivot.parent))
+          pivotParent.value = this.pivot.parent;
       }
     }
     if (this.sub === "Vial Geometry") gate(this.vsave, this.vialOk);
