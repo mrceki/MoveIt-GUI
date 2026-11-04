@@ -19,7 +19,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from . import force, jog
-from .bridge_api import Snapshot
+from .bridge_api import Snapshot, wrench_fresh
 from .calibration import CalibrationStore
 from .control_modes import CONTROL_STATE_UNKNOWN, ControlModeManager, detect_mode
 from .geometry import Geometry, PoseSpec
@@ -250,6 +250,9 @@ class RobotCore:
             return f"{m.label if m else self.mode} is {why}. Change to Position or Admittance."
         return None
 
+    STATE_STALE_S = 1.0                  # joint states older than this: the robot / driver is gone
+    CONTROLLERS_STALE_S = 3.0            # controller list older than this: controller_manager is gone
+
     def robot_refusal(self) -> Optional[str]:
         """The robot itself cannot take commands. Unknown values ("?", None) do not refuse, with one exception:
         the UR io_and_status_controller publishes robot_program_running only when it CHANGES from its initial
@@ -257,6 +260,14 @@ class RobotCore:
         program has not run since the driver started. A goal sent then is accepted but held at speed scaling 0:
         the GUI waits, and the arm would start moving later when someone presses Play."""
         s = self.bridge.snapshot()
+        # robot_mode / safety_mode / program_running are published on change only, so their own age says nothing.
+        # The liveness signals are the joint states (500 Hz while the driver and the robot network live) and the
+        # controller list (polled twice a second): when either is stale, every status above may be a dead value.
+        if s.joint_state_age is None or s.joint_state_age > self.STATE_STALE_S:
+            return ("no fresh joint states" if s.joint_state_age is None else
+                    f"joint states are {s.joint_state_age:.1f} s old") + ": the UR driver or the robot network is down"
+        if getattr(s, "controllers_age", None) is not None and s.controllers_age > self.CONTROLLERS_STALE_S:
+            return f"the controller list is {s.controllers_age:.0f} s old: controller_manager does not answer"
         if s.safety_mode not in ("?", "NORMAL", "REDUCED"):
             return f"safety mode is {s.safety_mode}: clear it on the pendant"
         if s.robot_mode not in ("?", "RUNNING"):
@@ -692,6 +703,8 @@ class RobotCore:
     def force_start(self, target: "force.WrenchTarget") -> Result:
         """Apply (or change) the force. The front end must call force_hold() every < force.HOLD_TIMEOUT_S."""
         f = self._force
+        if f is not None and f.alive and getattr(f, "owner", None) == "program":
+            return False, "a running program owns the force: stop the program first"
         if f is not None and f.alive and not f.releasing:
             if f.target.frame == target.frame:
                 f.retarget(target)
@@ -867,15 +880,17 @@ class RobotCore:
             snap = s()
             qd = snap.joint_velocities
             still = qd is None or max((abs(v) for v in qd), default=0.0) <= self.profile.stationary_joint_velocity
-            return (list(snap.wrench) if snap.wrench else None), still
+            return wrench_fresh(snap), still       # a frozen sensor reads as "no F/T data": the zero fails
         return self.ft_bias.zero(sample, stopped=stopped, refusal=lambda: None)
 
     def stop_all(self, reason: str = ""):
-        self.force_stop("STOP: zeroed at once")
-        self.jog_stop("STOP")
-        self.runner.stop()
-        self.policies.cancel()
-        self.bridge.cancel_motion()
+        # each part on its own: one that raises must not keep the others (or the cancel) from running
+        for part in (lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
+                     lambda: self.jog_stop("STOP"), self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
+            try:
+                part()
+            except Exception as e:
+                self.bridge.log(f"STOP: {type(e).__name__}: {e}")
         self.command_source = "idle"
         self.bridge.log(f"STOPPED: {reason}" if reason else "STOP GUI MOTION pressed")
 
@@ -989,8 +1004,7 @@ class _CoreProgramHooks(ProgramHooks):
         return self.core.store.active_tcp
 
     def wrench(self):
-        w = self.core.bridge.snapshot().wrench
-        return list(w) if w else None
+        return wrench_fresh(self.core.bridge.snapshot())     # None = none or stale (older than 0.2 s)
 
     def force_apply(self, wrench, frame):
         return self.core.program_force_apply(wrench, frame)

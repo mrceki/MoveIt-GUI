@@ -17,6 +17,7 @@ Stop concepts, kept visibly apart:
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets, sip
@@ -384,6 +385,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self._timer.stop()
+        try:
+            self.core.stop_all("GUI closed")             # zeroes a force, stops jog / program / policy / motion
+            self.core.recorder.stop_and_wait("GUI closed")
+        except Exception as ex:                          # closing must go on: the bridge zeroes wrenches again
+            print(f"shutdown: {ex}", file=sys.stderr)
         self.runner.stop()
         self.policies.cancel()
         super().closeEvent(e)

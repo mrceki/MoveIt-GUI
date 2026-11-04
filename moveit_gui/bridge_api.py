@@ -86,6 +86,19 @@ class Snapshot:
     gripper_position: Optional[float] = None
     freedrive: bool = False
     gripper_status: Optional[dict] = None                        # gripper_status_dict(), None = not reported
+    wrench_age: Optional[float] = None                           # seconds since the last F/T sample, None = never
+    controllers_age: Optional[float] = None                      # seconds since the controller list was refreshed
+    spin_age: Optional[float] = None                             # seconds since the ROS executor last spun (heartbeat)
+
+
+WRENCH_STALE_S = 0.2        # a force-gated motion (move until contact, F/T zero) needs a reading at most this old
+
+
+def wrench_fresh(snap: "Snapshot") -> Optional[List[float]]:
+    """The snapshot's wrench, or None when there is none or it is older than WRENCH_STALE_S."""
+    if not snap.wrench or snap.wrench_age is None or snap.wrench_age > WRENCH_STALE_S:
+        return None
+    return list(snap.wrench)
 
 
 # Robotiq GripperStatus (robotiq_msgs), decoded for display. gOBJ is the gripper's own grasp answer.

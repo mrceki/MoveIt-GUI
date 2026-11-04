@@ -121,6 +121,8 @@ class FakeBridge:
         self.fail_next_switch = False
         # test hooks for fail-closed behaviour
         self.fake_joint_state_age: Optional[float] = 0.0
+        self.fake_wrench_age: float = 0.0                   # tests set it > WRENCH_STALE_S to freeze the sensor
+        self.shutdown_wrenches: list = []                   # zeros published by shutdown(), for tests
         self.fake_velocities_available = True
         self.stale_frames: set = set()
         self.extra_frames: Dict[str, np.ndarray] = {}   # child of tool0, e.g. a tool frame in TF
@@ -179,6 +181,7 @@ class FakeBridge:
             gripper_joint=[self.gripper_pos, 0.0, 0.0],
             wrench=self._fake_wrench() if self.ft_live else None,
             gripper_position=self.gripper_pos, freedrive=self.freedrive,
+            wrench_age=self.fake_wrench_age if self.ft_live else None, controllers_age=0.0, spin_age=0.0,
             gripper_status=gripper_status_dict(SimpleNamespace(
                 object_detection=self.gripper_object, motor_current=0.0, gripper_fault=self.gripper_fault,
                 gripper_fault_severity=3 if self.gripper_fault else 0)),
@@ -691,7 +694,14 @@ class FakeBridge:
 
     def shutdown(self):
         self._image_stop.set()
+        self.set_freedrive_keepalive(False)
         self.cancel_motion()
+        for m in self.profile.modes.values():            # like RosBridge: zero every wrench target on the way out
+            topic = m.wrench.get("topic")
+            if topic:
+                for _ in range(3):
+                    self.publish_wrench(topic, m.wrench.get("frame", self.profile.base_link), [0.0] * 6)
+                    self.shutdown_wrenches.append(topic)
 
 
 def fake_image(encoding: str, w: int, h: int, k: int):

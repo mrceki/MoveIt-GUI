@@ -108,6 +108,8 @@ def _pose_to_T(pose) -> np.ndarray:
 
 class RosBridge:
     STALE_S = 1.0
+    SPIN_STALE_S = 2.0              # executor heartbeat older than this: the ROS thread is stuck
+    CONTROLLERS_STALE_S = 3.0       # polled every 0.5 s by _health_tick
     stop_epoch = 0                  # see __init__ (per instance once a STOP bumps it)
 
     def __init__(self, profile: RobotProfile, node_name: str = "moveit_gui"):
@@ -121,6 +123,9 @@ class RosBridge:
         self._snap = Snapshot(connected={k: False for k in ("ROS", "UR", "MoveIt", "Gripper", "F/T")})
         self._snap.connected["ROS"] = True
         self._t_joints = self._t_wrench = 0.0
+        self._t_controllers = 0.0                       # last controller list (poll or call); 0 = never
+        self._t_spin = time.monotonic()                 # executor heartbeat
+        self._shutting_down = False
         self.wrench_history = WrenchHistory()           # 100 Hz F/T for the web chart
         self._joints_received = False
         self._velocities_ok = False
@@ -298,9 +303,25 @@ class RosBridge:
 
         self._executor = MultiThreadedExecutor(num_threads=6)
         self._executor.add_node(n)
-        self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True, name="ros-executor")
+        self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True, name="ros-executor")
         self._spin_thread.start()
         self.log(f"ROS bridge up for profile '{profile.name}'")
+
+    def _spin_loop(self):
+        """Spin the executor until shutdown. One failing callback must not end every update silently: log it and
+        keep spinning. self._t_spin is the heartbeat the snapshot reports (connected["ROS"])."""
+        while not self._shutting_down:
+            try:
+                self._executor.spin_once(timeout_sec=0.1)
+                self._t_spin = time.monotonic()
+            except Exception as e:
+                if self._shutting_down or not rclpy.ok():
+                    return
+                try:
+                    self.log(f"ROS executor error (spinning on): {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
     # =============================================================== helpers
     def log(self, msg: str):
@@ -315,15 +336,27 @@ class RosBridge:
 
     def snapshot(self) -> Snapshot:
         age = self.joint_state_age()          # takes the lock itself: must NOT be called while holding it
+        now = time.monotonic()
+        t_wr, t_ct, t_sp = (getattr(self, n, 0.0) for n in ("_t_wrench", "_t_controllers", "_t_spin"))
+        spin_age = now - t_sp if t_sp else None
+        ctrl_age = now - t_ct if t_ct else None
         with self._lock:
             s = self._snap
-            return Snapshot(connected=dict(s.connected), joints=s.joints and list(s.joints),
+            connected = dict(s.connected)
+            connected["ROS"] = spin_age is not None and spin_age < self.SPIN_STALE_S
+            # A controller list nobody refreshed says nothing about the controllers now: report none, so the
+            # mode reads "unknown". robot_mode / safety_mode / program_running are published on change only (the
+            # driver's latched topics) and cannot be aged here; core.robot_refusal uses joint_state_age for them.
+            stale_ctrl = ctrl_age is not None and ctrl_age > self.CONTROLLERS_STALE_S
+            return Snapshot(connected=connected, wrench_age=now - t_wr if t_wr else None,
+                            controllers_age=ctrl_age, spin_age=spin_age, joints=s.joints and list(s.joints),
                             joint_velocities=s.joint_velocities and list(s.joint_velocities),
                             joint_state_age=age, robot_mode=s.robot_mode, safety_mode=s.safety_mode,
                             program_running=s.program_running, speed_scaling=s.speed_scaling,
                             program_state=s.program_state, remote_control=s.remote_control,
-                            controllers=dict(s.controllers),
-                            claimed_interfaces={k: list(v) for k, v in s.claimed_interfaces.items()},
+                            controllers={} if stale_ctrl else dict(s.controllers),
+                            claimed_interfaces={} if stale_ctrl else
+                            {k: list(v) for k, v in s.claimed_interfaces.items()},
                             gripper_controllers=dict(s.gripper_controllers),
                             gripper_joint=s.gripper_joint and list(s.gripper_joint),
                             wrench=s.wrench and list(s.wrench),
@@ -508,6 +541,7 @@ class RosBridge:
             with self._lock:
                 self._snap.controllers = {c.name: c.state for c in res.controller}
                 self._snap.claimed_interfaces = {c.name: list(c.claimed_interfaces) for c in res.controller}
+            self._t_controllers = time.monotonic()
 
     def _on_gripper_controller_list(self, fut):
         try:
@@ -531,6 +565,7 @@ class RosBridge:
         with self._lock:
             self._snap.controllers = dict(states)
             self._snap.claimed_interfaces = {c.name: list(c.claimed_interfaces) for c in res.controller}
+        self._t_controllers = time.monotonic()
         return states
 
     def controller_claims(self) -> Optional[Dict[str, List[str]]]:
@@ -703,7 +738,7 @@ class RosBridge:
             # STOP came in while the goal was being sent: cancel it, then wait below until MoveIt reports it ended.
             self.log("STOP was pressed while the motion was being sent: cancelling it")
             handle.cancel_goal_async()
-        timeout = float(self.profile.moveit.get("planning_timeout_s", 60.0))
+        timeout = self._execution_timeout(trajectory)
         try:
             result = self._wait_future(handle.get_result_async(), timeout)
         finally:
@@ -718,6 +753,22 @@ class RosBridge:
             self.log(f"{controller}: execution failed (MoveIt error {result.result.error_code.val})")
         return ok
 
+    def _plan_timeout(self) -> float:
+        """Give up on a plan when move_group does not answer (it died mid-plan): the GUI must not stay busy."""
+        return max(10.0, 2.0 * float(self.profile.moveit.get("planning_timeout_s", 60.0)))
+
+    def _execution_timeout(self, trajectory) -> float:
+        """Time to wait for a trajectory: its own duration at the robot's current speed scaling, plus a margin.
+        A slow move at low speed is not cancelled; a hung execution still ends."""
+        try:
+            tfs = trajectory.points[-1].time_from_start
+            duration = float(tfs.sec) + float(tfs.nanosec) * 1e-9
+        except Exception:
+            return float(self.profile.moveit.get("planning_timeout_s", 60.0))
+        scaling = self._snap.speed_scaling
+        scaling = 1.0 if not scaling else min(max(float(scaling), 0.05), 1.0)
+        return duration / scaling * 1.5 + 10.0
+
     def plan_joints(self, joints, vel=0.1, acc=0.1):
         """A JointTrajectory to `joints` (profile order), or None. Nothing moves."""
         if self.moveit is None:
@@ -725,7 +776,8 @@ class RosBridge:
             return None
         self.set_scaling(vel, acc)
         try:
-            traj = self.moveit.plan(joint_positions=list(joints), joint_names=self.profile.joint_names)
+            traj = self.moveit.plan(joint_positions=list(joints), joint_names=self.profile.joint_names,
+                                    timeout_sec=self._plan_timeout())
         except Exception as e:
             self.log(f"plan failed: {e}")
             return None
@@ -744,7 +796,8 @@ class RosBridge:
                  f"{[round(v, 4) for v in position]} {[round(v, 4) for v in quat_xyzw]}")
         try:
             traj = self.moveit.plan(position=position, quat_xyzw=quat_xyzw, target_link=target_link,
-                                    cartesian=bool(cartesian), frame_id=self.profile.base_link)
+                                    cartesian=bool(cartesian), frame_id=self.profile.base_link,
+                                    timeout_sec=self._plan_timeout())
         except Exception as e:
             self.log(f"plan failed: {e}")
             return None
@@ -1170,8 +1223,28 @@ class RosBridge:
 
     # ============================================================== shutdown
     def shutdown(self):
-        self.set_freedrive_keepalive(False)
-        self.cancel_motion()
+        """Leave the robot at rest: the admittance / impedance controllers keep their last wrench target for ever,
+        so zero every wrench publisher (a few times, it is best effort) before the node goes."""
+        self._shutting_down = True
+        try:
+            self.set_freedrive_keepalive(False)
+        except Exception as e:
+            self.log(f"shutdown: freedrive keepalive: {e}")
+        try:
+            self.cancel_motion()
+        except Exception as e:
+            self.log(f"shutdown: cancel motion: {e}")
+        for topic, pub in list(self._wrench_pubs.items()):
+            frame = next((m.wrench.get("frame", self.profile.base_link) for m in self.profile.modes.values()
+                          if m.wrench.get("topic") == topic), self.profile.base_link)
+            for _ in range(3):
+                try:
+                    self.publish_wrench(topic, frame, [0.0] * 6)
+                except Exception as e:
+                    self.log(f"shutdown: zero wrench on {topic}: {e}")
+                    break
+                time.sleep(0.02)
+        time.sleep(0.1)                                  # let DDS send the last zeros before the node goes
         self._executor.shutdown(timeout_sec=1.0)
         self.node.destroy_node()
         if rclpy.ok():

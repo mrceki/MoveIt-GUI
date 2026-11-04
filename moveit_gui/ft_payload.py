@@ -20,6 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import transforms as tf
+from .bridge_api import wrench_fresh
 from .calibration import config_dir
 
 DEFAULT_SOURCE = "~/franka_ros2/ft_sensor_calibration"
@@ -125,9 +126,9 @@ class PayloadCalibration:
         while len(data) < self.samples_per_pose:
             if self._stop.is_set():
                 raise PayloadCalibrationError(f"{pose['name']}: cancelled")
-            w = self.bridge.snapshot().wrench
+            w = wrench_fresh(self.bridge.snapshot())
             if w is None:
-                raise PayloadCalibrationError(f"{pose['name']}: the ATI stopped publishing")
+                raise PayloadCalibrationError(f"{pose['name']}: the ATI stopped publishing (no fresh reading)")
             data.append(list(w))
             on_progress(len(data), self.samples_per_pose)
             self._sleep(self.sample_period_s)

@@ -932,7 +932,7 @@ class ProgramRunner:
             for _ in range(10):
                 w = self.hooks.wrench()
                 if w is None:
-                    self.on_log("move until contact refused: no F/T data")
+                    self.on_log("move until contact refused: no fresh F/T data (none, or older than 0.2 s)")
                     return False
                 base.append(w[:3])
                 time.sleep(0.01)
@@ -943,10 +943,18 @@ class ProgramRunner:
         peak = [0.0]
         done = threading.Event()
 
+        stale = threading.Event()
+
         def watch():
+            t_ok = time.monotonic()
             while not done.is_set():
-                w = self.hooks.wrench()
+                w = self.hooks.wrench()          # None when there is no reading or it is older than 0.2 s
+                if w is None and time.monotonic() - t_ok > 0.2:
+                    stale.set()                  # a frozen sensor never shows the contact: stop driving
+                    self.bridge.cancel_motion()
+                    return
                 if w is not None:
+                    t_ok = time.monotonic()
                     df = float(np.linalg.norm(np.asarray(w[:3]) - f0))
                     peak[0] = max(peak[0], df)
                     if df >= thr:
@@ -962,6 +970,9 @@ class ProgramRunner:
             done.set()
             th.join(1.0)
         self.last_contact = {"contact": hit.is_set(), "peak_n": round(peak[0], 2)}
+        if stale.is_set() and not hit.is_set():
+            self.on_log("move until contact aborted: the F/T reading stopped updating")
+            return False
         if self._stop.is_set() or self._state == RunState.PAUSED:
             return False
         if hit.is_set():
