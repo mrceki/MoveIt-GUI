@@ -178,7 +178,7 @@ tbody tr { cursor: pointer; }
               align-items: flex-start; }
 .list .item:hover { background: var(--sunken); }
 .list .item.on { background: var(--selected); }
-.subnav { width: 150px; flex-shrink: 0; }
+.subnav { width: 190px; flex-shrink: 0; }
 .cam { background: var(--chrome); border-radius: var(--r); min-height: 300px; display: flex; align-items: center;
        justify-content: center; color: var(--on-chrome2); }
 .cam img { max-width: 100%; max-height: 70vh; display: block; }
@@ -427,3 +427,15 @@ table.gains .hint { color: var(--muted); font-size: 11px; cursor: help; }
 .chip.err { background: var(--danger-bg); color: var(--danger); }
 .chip .x { cursor: pointer; margin-left: 2px; }
 #pt-list tr.on td { background: rgba(91, 141, 239, 0.12); }
+/* SETUP menu: groups and the small status after each item */
+.subnav .navgrp { font-size: 10px; font-weight: 700; letter-spacing: 1px; color: var(--muted); text-transform: uppercase;
+  padding: 10px var(--s) 2px; }
+.subnav .navgrp:first-child { padding-top: 2px; }
+.subnav .item { align-items: center; }
+.subnav .nb { font-size: 10px; color: var(--muted); white-space: nowrap; max-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+.subnav .nb.ok { color: var(--ok); } .subnav .nb.warn { color: var(--warn); font-weight: 700; }
+#su-modelbar { margin-bottom: var(--s); align-items: center; }
+.st-cur { padding: 8px var(--s); border-radius: var(--r); background: var(--sunken); margin-bottom: var(--s); }
+.list.subnav { width: auto; }
+ol.steps { margin: 4px 0 6px; padding-left: 18px; color: var(--muted); } ol.steps li { margin: 2px 0; }
+

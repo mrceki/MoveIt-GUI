@@ -293,11 +293,34 @@ come back here. Recording never moves the robot. Starting needs control, but any
 
 ## Parts, camera calibration, setups, restart (SETUP)
 
+The SETUP menu is in three groups, in the order a new user needs them: **Robot** (Setups, Parts, TCPs),
+**Calibrate** (Camera calibration, F/T + Payload, Vial Geometry) and **Cell** (Keep-out zones, Cameras, Controller
+gains). Each item shows a short status: the setup in use (or *changed*), how many parts / TCPs / keep-out boxes, ✓
+when a camera, payload or vial is calibrated. One bar at the top of every SETUP page says when saved parts (or
+calibrated cameras, or a base switch) are not in the robot model yet, with **Restart robot stack…**.
+
+**TCPs** (SETUP › TCPs): one list (Edit, Delete, Set active) and one editor: name and parent once, then
+*Type the offset* or *Measure the tip (pivot)*: hold the tip on one fixed point in freedrive, tilt, Capture 6-12
+times, Solve, Save TCP. The pivot gives the position only; the rotation is typed (usually 0 0 0).
+
 **Parts** (SETUP › Parts): things bolted to the robot or the cell, without editing URDF. A part is a box, cylinder,
 sphere, mesh (.stl, .obj or .dae upload) or a bare frame, on a parent (a robot link, or another part) at an offset in
 mm / deg. A shape sits on its frame and grows along +Z, so **+** on a part (or *on far face*) stacks the next piece
 where the previous one ends, like the real tool. Presets: spatula on the gripper, wrist camera bracket, RealSense
 D435, table, frame only.
+
+The editor shows an unsaved part as a translucent **draft** in the SETUP 3D view. Move / Rotate uses the same
+drag gizmo as OPERATE's Goal TCP; Local / Parent chooses the axes and Snap can use 1 mm / 1° or 5 mm / 5° steps.
+Typing XYZ / RPY moves the draft too. **Import mesh…** starts a new mesh draft immediately, places it standing on
+its frame and uses **auto** collision by default; nothing becomes TF / MoveIt geometry until **Save part**.
+Cancel removes the draft and restores the saved part when editing.
+
+For a mesh, **auto (recommended)** builds a few light convex collision meshes automatically: it keeps the CAD mesh
+for the visual (so a .dae keeps its colours), but MoveIt and the generated URDF use the simplified pieces. The
+collision line reports piece / triangle count and volume excess; Advanced can change the piece limit, triangles per
+piece and tolerance, or regenerate. **Collision** in the 3D view shows the same generated pieces, including an
+unsaved draft once its preview is ready. Existing saved mesh parts without a collision setting keep the old
+single-convex-hull behaviour.
 
 * **Live at once:** a static TF frame (parent → part), a MoveIt collision object `gui_part/<name>` (attached to the
   arm link the part rides on, with that link's neighbours as touch links, so plans carry it; a world object for
@@ -315,11 +338,12 @@ D435, table, frame only.
 * **Meshes:** STL and OBJ are in whatever unit the CAD used. The upload guesses it from the size (mm / m / inch can be
   changed; the size shown in mm must match the real part). A .dae carries its unit and keeps its own colours. *Place
   it* puts the mesh's origin where you want it on the part frame: *as exported*, *centred*, or *standing on the
-  frame* (centred in X / Y, bottom on the frame, so it stacks like the other shapes). Up to 20 MB and 200 000
+  frame* (centred in X / Y, bottom on the frame, so it stacks like the other shapes). Up to 20 MB and 400 000
   triangles; textures are not used.
-* **Collision** per part: *as shown*, *convex hull* (default for meshes: light, and MoveIt plans faster with it),
-  *bounding box*, or *none* (shown only: MoveIt ignores it, nothing is attached). The hull is made once per mesh in
-  `parts/generated/hulls/`. The same shape goes live and into the generated URDF.
+* **Collision** per part: new meshes default to *auto (recommended)*, which generates a small deterministic set of
+  conservative convex pieces under `parts/generated/collision/`. *Full visual mesh*, *single convex hull*,
+  *bounding box* and *none* remain available; saved mesh parts that omit `collision` still use the historical
+  single-hull behaviour. The same collision geometry goes live in MoveIt and into the generated URDF.
 * **Visual / Collision** (bottom right of every 3D view): show the robot's visual meshes, its collision shapes
   (translucent green: what MoveIt checks, robot links and parts), or both. Every 3D view follows the choice.
 * A new tool changes the payload: redo SETUP › F/T + Payload.
@@ -330,6 +354,9 @@ Screenshot: `docs/ux/web_setup_parts.png`.
 DICT_5X5_100 by default; **Print board…** opens it at true size; print at 100 %, measure a square, enter it, *Save
 board*). Eye-in-hand (camera on the tool, board still in the cell: gives flange → camera) or eye-to-hand (camera on
 a stand, board on the tool: gives base → camera).
+
+The page is four steps and the next step's button is the blue one (Start, Collect all…, Solve, Save + add to robot).
+The board is one line (*7 × 5 squares of 35 mm …*); *Change the board* opens its fields.
 
 1. Pick the camera and **Start**: intrinsics come from its CameraInfo (RealSense / ZED are factory calibrated).
 2. **Look** shows what the detector sees (corners, reprojection error, distance). Then either **Capture here**
@@ -364,7 +391,12 @@ stack too when the setup's parts or base differ from the running robot model. So
 build it in Parts, save it as a setup, and load setups to switch; the files in use before are kept as an automatic backup (`_before_…`, newest 5). Stored in
 `config_dir()/setups/<name>/`.
 
-**Restart** (SETUP › Setups, and the Parts banner): *Restart GUI* (exit code 76) or *Restart robot stack* (75: the
+The top of the page says which setup is **in use** (the last one saved or loaded) and what changed since
+(*Changed since saved: TCPs + fixtures*), with **Save into "<name>"**. Under the save form, *Saves:* lists what a
+save would hold. **Load…** first shows only what differs from the files in use, a base change, and what restarts.
+The setup in use is kept in `config_dir()/setups/current.yaml`; the comparison leaves out the generated URDF/SRDF.
+
+**Restart** (SETUP › Setups, and the bar on every SETUP page): *Restart GUI* (exit code 76) or *Restart robot stack* (75: the
 container stops and starts again with the parts, about a minute; press Play on the pendant again unless headless).
 `ur7e_gui.sh` does the restart; refused while anything moves, runs or pushes. Every browser takes control again.
 
