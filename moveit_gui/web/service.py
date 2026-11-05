@@ -42,6 +42,7 @@ from ..geometry_calibration import VialGeometryError, estimate_vial
 from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
 from ..policies import RecordingOptions
+from .users import Users, public_id
 from ..program import CONTAINER_STEPS, STEP_TYPES, Program, ProgramError, ProgramWaypoint, RunState, Step, path_label, walk
 from ..program_path import simulate
 from ..robot_model import model_or_error
@@ -93,6 +94,7 @@ class Lease:
         self.id: Optional[str] = None
         self.name = ""
         self.seen = 0.0
+        self.uid: Optional[str] = None               # the holder's public user id (users.py), if its page sent one
 
     @property
     def client(self) -> Optional[str]:               # truthy while somebody holds the lease
@@ -102,7 +104,7 @@ class Lease:
         return bool(token) and bool(self.token) and secrets.compare_digest(str(token), self.token)
 
     def view(self) -> dict:
-        return {"client": self.id, "name": self.name}
+        return {"client": self.id, "name": self.name, "uid": self.uid}
 
 
 def remote_power() -> bool:
@@ -117,6 +119,9 @@ class WebService(WorkcellCommands):
         self.clock = clock
         self.lease = Lease()
         self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
+        self.users = Users(clock)                         # who has the page open (one per browser)
+        self.asking: Optional[dict] = None                # someone asks the holder for control: {uid, name, at, kept}
+        self.offer: Optional[dict] = None                 # the holder gave control to {uid, name, until}
         self._lock = threading.RLock()
         self._edit_lock = threading.RLock()               # program edits + undo/redo: snapshot, handler, compare
         self._last_err: Dict[str, float] = {}
@@ -222,21 +227,87 @@ class WebService(WorkcellCommands):
                 self._log_error(f"lease stop ({what})", e)
 
     # =================================================================== lease
-    def take_lease(self, client: str = "", name: str = "", presented: str = "") -> dict:
-        """Returns {client: public id, name, token: secret}. The token is shown only here; keep it out of logs.
+    def take_lease(self, client: str = "", name: str = "", presented: str = "", bid: str = "") -> dict:
+        """Returns {client: public id, name, uid, token: secret}. The token is shown only here; keep it out of logs.
         client: the token to install (in-process callers and tests); empty = a random one, which is what the HTTP
-        layer always uses. presented: the token the caller already holds, so the holder may take again."""
+        layer always uses. presented: the token the caller already holds, so the holder may take again.
+        bid: the browser's own id (users.py), so the users list can say who has control."""
+        uid = public_id(bid) if Users.valid(bid) else None
         with self._lease_lock:
             cur = self.lease
-            if cur.token and not (cur.holds(client) or cur.holds(presented)):
+            again = cur.holds(client) or cur.holds(presented)
+            off = self.offer if self.offer and self.clock() < self.offer["until"] else None
+            if off and not again and off["uid"] != uid:
+                raise CommandError(f"control is being handed to {off['name']} (for a few seconds)")
+            if cur.token and not again:
                 if not self.core.idle() or self.core.last_snap.freedrive:
                     raise CommandError(f"{cur.name or 'another browser'} is controlling a moving robot")
                 self.core.bridge.log(f"web: {name or 'a browser'} took over control from {cur.name or cur.id}")
             lease = Lease()
             lease.token, lease.id = client or secrets.token_urlsafe(24), secrets.token_urlsafe(6)
-            lease.name, lease.seen = name or "browser", self.clock()
+            lease.name, lease.seen, lease.uid = name or "browser", self.clock(), uid
             self.lease = lease
+            self.offer = None
+            if self.asking and (self.asking["uid"] == uid or not again):
+                self.asking = None                        # answered by taking it (or a new holder: the question is gone)
             return {**lease.view(), "token": lease.token}
+
+    # ------------------------------------------------------- asking for control
+    ASK_S = 60.0      # a question for control is open this long
+    KEPT_S = 8.0      # "kept" is shown to the one who asked this long
+    OFFER_S = 15.0    # control given to someone waits this long for them to take it
+
+    def ask_control(self, bid: str, name: str = "") -> dict:
+        """A browser without control asks the holder for it (the holder's page shows a pop-up: Give / Keep)."""
+        if not Users.valid(bid):
+            raise CommandError("this page has no browser id: reload it")
+        uid = public_id(bid)
+        with self._lease_lock:
+            if not self.lease.token:
+                raise CommandError("nobody has control: take it")
+            if self.lease.uid == uid:
+                raise CommandError("you already have control")
+            a, now = self.asking, self.clock()
+            if a and a["uid"] == uid and not a["kept"] and now - a["at"] < self.ASK_S:
+                return {"ok": True, "msg": "already asked: waiting for an answer"}
+            if a and a["uid"] == uid and a["kept"] and now - a["at"] < 20.0:
+                raise CommandError(f"{self.lease.name.split(' @ ')[0]} keeps control: ask again in {20 - (now - a['at']):.0f} s")
+            if a and a["uid"] != uid and not a["kept"] and now - a["at"] < self.ASK_S:
+                raise CommandError(f"{a['name']} is asking already: wait for the answer")
+            self.asking = {"uid": uid, "name": name or self.users.label(bid), "at": self.clock(), "kept": False}
+        self.core.bridge.log(f"web: {self.asking['name']} asks {self.lease.name} for control")
+        return {"ok": True, "msg": f"asked {self.lease.name.split(' @ ')[0]} for control"}
+
+    def cmd_control_answer(self, give=False):
+        """The holder answers a question for control. Give: control goes to the one who asked (robot idle only)."""
+        with self._lease_lock:
+            a = self.asking
+            if not a or a["kept"] or self.clock() - a["at"] > self.ASK_S:
+                raise CommandError("nobody is asking for control now")
+            if not give:
+                a["kept"], a["at"] = True, self.clock()
+                holder = self.lease.name
+            else:
+                if not self.core.idle() or self.core.last_snap.freedrive:
+                    raise CommandError("the robot is moving: stop it first, then give control")
+                holder, self.lease = self.lease.name, Lease()
+                self.offer = {"uid": a["uid"], "name": a["name"], "until": self.clock() + self.OFFER_S}
+                self.asking = None
+        self.core.bridge.log(f"web: {holder} {'gave control to' if give else 'keeps control; asked by'} {a['name']}")
+        return self._ok(f"control given to {a['name']}" if give else "you keep control")
+
+    def _lease_state(self) -> dict:
+        now = self.clock()
+        a, o = self.asking, self.offer
+        if a and now - a["at"] > (self.KEPT_S if a["kept"] else self.ASK_S):
+            a = self.asking = None
+        if o and now >= o["until"]:
+            o = self.offer = None
+        if a and not a["kept"] and not self.lease.token and not o:
+            a = self.asking = None                        # the holder left: just take control
+        return {**self.lease.view(),
+                "ask": {"id": a["uid"], "name": a["name"], "kept": a["kept"], "age_s": round(now - a["at"], 1)} if a else None,
+                "offer": {"id": o["uid"], "name": o["name"]} if o else None}
 
     def heartbeat(self, token: str) -> bool:
         with self._lease_lock:
@@ -2138,7 +2209,8 @@ class WebService(WorkcellCommands):
             "workcell": self.workcell_state(),
             "record": self.core.recorder.view(),
             "gains_applying": self.core.gains.applying,
-            "lease": self.lease.view(),
+            "lease": self._lease_state(),
+            "users": self.users.view(self.lease.uid),
             "jog": {"active": c.jogging, "hold_refusal": c.jog_hold_refusal(),
                     "servo_warning": c.servo_warning() if c.jogging else ""},
             "force": {**c.force_view(), "note": c.force_note()},

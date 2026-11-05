@@ -29,7 +29,7 @@ def test_token_is_secret_and_not_broadcast(env):
     assert len(tok) >= 20 and r["client"] and r["client"] != tok
     s.tick()
     assert tok not in json.dumps(s.state()) and tok not in json.dumps(s.info())
-    assert s.state()["lease"] == {"client": r["client"], "name": "alice"}
+    assert s.state()["lease"] == {"client": r["client"], "name": "alice", "uid": None, "ask": None, "offer": None}
     # the public id is no credential
     with pytest.raises(CommandError, match="take control"):
         s.command(r["client"], "move_waypoint", {"name": "ready"})

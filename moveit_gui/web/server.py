@@ -5,6 +5,8 @@
   GET  /                      the app (static files, no build step, no internet needed)
   GET  /api/info              robot profile: joints, modes, waypoints, cameras, policies
   GET  /api/events            Server-Sent Events: "state" 10 Hz, "log" lines, "result" of jobs
+  POST /api/ask               ask whoever has control for it (their page asks them: Give / Keep)
+  POST /api/hello             {bid, name}: this browser's name changed (the users list)
   POST /api/lease|heartbeat|release   the control lease (see service.py): /api/lease returns a secret token that
                               every later request must carry as "token"; it is never broadcast
   POST /api/stop              STOP GUI MOTION, from anyone
@@ -269,7 +271,8 @@ def make_handler(hub: Hub, allow_hosts=()):
                     return self._json(200, {**service.info(), "you": self._who(),
                                             "local": self._local(need_origin=False)})
                 if path == "/api/events":
-                    return self._events()
+                    q = parse_qs(url.query)
+                    return self._events(q.get("bid", [""])[0], q.get("name", [""])[0])
                 if path == "/api/camera.mjpeg":
                     return self._camera(parse_qs(url.query).get("topic", [""])[0])
                 if path == "/api/robot_model":
@@ -314,7 +317,15 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.end_headers()
             self.wfile.write(body)
 
-        def _events(self):
+        def _events(self, bid: str = "", name: str = ""):
+            uid = service.users.open(bid, name, self._who())          # one user per browser (users.py)
+            try:
+                self._events_loop(uid)
+            finally:
+                if uid:
+                    service.users.close(bid)
+
+        def _events_loop(self, uid):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
@@ -322,6 +333,9 @@ def make_handler(hub: Hub, allow_hosts=()):
             self.end_headers()
             self.close_connection = True
             seen_version, log_seq = -1, 0
+            if uid:                                           # this page's own public id (to find itself in "users")
+                self.wfile.write(f"event: hello\ndata: {json.dumps({'id': uid})}\n\n".encode())
+                self.wfile.flush()
             res_id = max((r["id"] for r in service.results), default=0)
             if service.logs:                                  # last lines of history on connect
                 log_seq = max(0, service.logs[-1][0] - 200)
@@ -387,8 +401,18 @@ def make_handler(hub: Hub, allow_hosts=()):
                     return self._json(200, service.stop(self._who()))
                 if path == "/api/lease":
                     op = " ".join(str(body.get("name") or "").split())[:24]   # operator name typed in the browser
+                    bid = str(body.get("bid") or "")
+                    if op:
+                        service.users.rename(bid, op)
+                    op = op or (service.users.label(bid) if service.users.valid(bid) else "")
                     return self._json(200, {"ok": True, "lease": service.take_lease(
-                        "", f"{op} @ {self._who()}" if op else self._who(), presented=client)})
+                        "", f"{op} @ {self._who()}" if op else self._who(), presented=client, bid=bid)})
+                if path == "/api/ask":
+                    bid = str(body.get("bid") or "")
+                    return self._json(200, service.ask_control(bid))
+                if path == "/api/hello":                          # this browser's name changed
+                    service.users.rename(str(body.get("bid") or ""), str(body.get("name") or ""))
+                    return self._json(200, {"ok": True})
                 if path == "/api/heartbeat":
                     return self._json(200, {"ok": True, "holds": service.heartbeat(client)})
                 if path == "/api/release":

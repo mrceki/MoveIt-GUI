@@ -845,3 +845,20 @@ body:not(.ledit) .lws .ltile > .lbody > .xview { padding: 2px 0 0; }
 .dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .dlg-btns .btn { min-width: 84px; }
 @keyframes dlg-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* who has the GUI open (top bar) */
+.hchip.users { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; border: 0; background: transparent;
+  color: var(--on-chrome2); font: inherit; font-size: 12px; padding: 3px 6px; border-radius: 6px; }
+.hchip.users:hover { background: rgba(255,255,255,.08); color: #fff; }
+.hchip.users .ic { width: 16px; height: 16px; }
+#lease-ask { color: var(--on-chrome2); }
+.users-pop { position: fixed; z-index: 1500; background: var(--raised); border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.25);
+  min-width: 300px; max-width: 420px; padding: 8px 0 6px; font-size: 13px; }
+.up-head { font-weight: 650; padding: 2px 14px 6px; border-bottom: 1px solid var(--line); }
+.up-row { display: flex; align-items: center; gap: 8px; padding: 6px 14px; }
+.up-row.me { background: var(--surface); }
+.up-name { font-weight: 550; }
+.up-where { margin-left: auto; white-space: nowrap; }
+.up-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); flex: none; }
+.up-dot.on { background: var(--ok, #2e8b57); }
+.up-foot { border-top: 1px solid var(--line); padding: 6px 10px 0; display: flex; justify-content: flex-end; }

@@ -6,7 +6,8 @@
 //   tell(text)                                        just OK
 // The first line is the title, the rest the message. One pop-up at a time: others wait.
 // valid: a function; a queued pop-up whose question no longer applies is skipped (answers Cancel).
-// A pop-up with `timeout` (seconds) answers Cancel by itself when the time runs out (shown on the Cancel button).
+// A pop-up with `timeout` (seconds) closes by itself when the time runs out (shown on the Cancel button) and answers
+// null (not false: nobody pressed Cancel).
 
 let queue = Promise.resolve();
 let openNow = null;
@@ -81,7 +82,7 @@ function show(text, o) {
     document.addEventListener("keydown", key, true);
     if (left) {
       const lbl = no ? no.textContent : "";
-      const tick = () => { if (no) no.textContent = `${lbl} (${left})`; if (left-- <= 0) answer(false); };
+      const tick = () => { if (no) no.textContent = `${lbl} (${left})`; if (left-- <= 0) done(null); };
       tick();
       timer = setInterval(tick, 1000);
     }

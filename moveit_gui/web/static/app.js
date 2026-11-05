@@ -49,6 +49,19 @@ try {
   sessionStorage.removeItem("lease");
 } catch (e) { /* no sessionStorage: no reload-keeps-control */ }
 let INFO = null, S = null, holds = false, connected = false, netBad = false, srvError = "";
+// This browser's own id (kept in localStorage; every tab of it is the same user), so browsers on one PC or behind one
+// IP are told apart. Never shown to others: they see a public id the server derives from it (MYUID, from "hello").
+const BID = (() => {
+  let b = "";
+  try { b = localStorage.getItem("browser-id") || ""; } catch (e) { /* no storage */ }
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(b)) {
+    const r = crypto.getRandomValues(new Uint8Array(18));
+    b = btoa(String.fromCharCode(...r)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    try { localStorage.setItem("browser-id", b); } catch (e) { /* this tab only */ }
+  }
+  return b;
+})();
+let MYUID = null;
 const logs = [];
 
 async function post(path, body = {}, silent = false) {
@@ -108,26 +121,105 @@ function gate(el, cond = true) { el.disabled = !(holds && cond); }
 async function operatorName(force) {
   let n = localStorage.getItem("operator") || "";
   if (!n || force) {
-    const v = (await askText("Your name (shown to others as the person controlling the robot):", n));
-    if (v != null) { n = v.trim().slice(0, 24); localStorage.setItem("operator", n); }
+    const v = await askText("Your name\n\nShown to the others who have this GUI open, and as the person in control.", n,
+      { maxLength: 24, placeholder: "e.g. Cenk" });
+    if (v != null) { n = v.trim().slice(0, 24); localStorage.setItem("operator", n); post("/api/hello", { bid: BID, name: n }, true); }
   }
   return n;
 }
 let leaseAt = 0;
+let gaveAt = 0;               // this browser just gave control away: losing it is no news
 function lostControl(why) {
   TOKEN = MYID = null;
   if (!holds) return;
+  if (Date.now() - gaveAt < 5000) { holds = false; render(); return; }
   holds = false;
   toast(`You lost control of the robot: ${why}. Take control again to operate.`, false, true);
   render();
 }
 async function takeLease() {
-  const r = await post("/api/lease", { name: await operatorName(false) });
+  const r = await post("/api/lease", { name: await operatorName(false), bid: BID });
   holds = !!r.ok;
   if (holds) { TOKEN = r.lease.token; MYID = r.lease.client; hbFailsSince = 0; }
   if (holds) document.querySelectorAll(".toast").forEach((x) => /lost control/.test(x.dataset.msg) && x.remove());
   leaseAt = Date.now();
   render();
+}
+// ---- users: everyone with this GUI open, one per browser (the server's "users" list); asking for control
+let usersPop = null, askKey = "", offerTaken = "", keptSeen = "";
+function usersFill() {
+  const us = (S && S.users) || [];
+  usersPop.replaceChildren(
+    h("div", { class: "up-head" }, `Open in ${us.length} browser${us.length === 1 ? "" : "s"}`),
+    ...us.map((u) => h("div", { class: "up-row" + (u.id === MYUID ? " me" : "") },
+      h("span", { class: "up-dot" + (u.control ? " on" : "") }),
+      h("span", { class: "up-name" }, u.name + (u.id === MYUID ? " (you)" : "")),
+      u.control ? h("span", { class: "chip ok" }, "control") : "",
+      h("span", { class: "up-where muted small", title: "Where it connects from (Tailscale user or IP)" },
+        u.where + (u.tabs > 1 ? ` · ${u.tabs} tabs` : "")))),
+    h("div", { class: "up-foot" },
+      h("button", { class: "btn quiet", type: "button", onclick: async () => {
+        await operatorName(true);
+        if (holds) takeLease();
+      } }, "Change my name")));
+}
+function usersToggle(e) {
+  e.stopPropagation();
+  if (usersPop) { usersPop.remove(); usersPop = null; return; }
+  usersPop = h("div", { class: "users-pop" });
+  const r = $("#h-users").getBoundingClientRect();
+  usersPop.style.top = r.bottom + 6 + "px";
+  usersPop.style.right = Math.max(8, innerWidth - r.right) + "px";
+  document.body.append(usersPop);
+  usersFill();
+  const off = (ev) => {
+    if (usersPop && (ev.type === "keydown" ? ev.key === "Escape" : !usersPop.contains(ev.target))) {
+      usersPop.remove(); usersPop = null;
+      document.removeEventListener("pointerdown", off, true); document.removeEventListener("keydown", off, true);
+    }
+  };
+  document.addEventListener("pointerdown", off, true); document.addEventListener("keydown", off, true);
+}
+async function askControl() {
+  const r = await post("/api/ask", { bid: BID }, true);
+  toast(r.msg || (r.ok ? "asked" : "failed"), !!r.ok);
+}
+function usersRender(s) {
+  const us = s.users || [], L = s.lease, b = $("#h-users");
+  b.innerHTML = icon("users") + `<span>${us.length || "—"}</span>`;
+  b.title = `Open in ${us.length} browser${us.length === 1 ? "" : "s"}: ` + us.map((u) => u.name + (u.control ? " (control)" : "")).join(", ");
+  if (usersPop) usersFill();
+  // someone else has control: ask them for it
+  const mine = L.ask && L.ask.id === MYUID;
+  $("#lease-ask").hidden = holds || !L.client || !MYUID || L.uid === MYUID;
+  $("#lease-ask").disabled = !!(mine && !L.ask.kept);
+  $("#lease-ask").textContent = mine && !L.ask.kept ? "Asked…" : "Ask";
+  if (mine && L.ask.kept && keptSeen !== L.ask.id + L.name) {
+    keptSeen = L.ask.id + L.name;
+    toast(`${L.name.split(" @ ")[0]} keeps control`, false);
+  }
+  // control was given to this browser: take it
+  if (L.offer && L.offer.id === MYUID && !holds && offerTaken !== L.offer.name + L.offer.id) {
+    offerTaken = L.offer.name + L.offer.id;
+    takeLease().then(() => holds && toast("You have control now (it was given to you)", true));
+  }
+  // this browser has control and someone asks for it: Give / Keep
+  const key = holds && L.ask && !L.ask.kept && L.ask.id !== MYUID ? "ask:" + L.ask.id : "";
+  if (key !== askKey) {
+    dismiss("ask");
+    askKey = key;
+    if (key) {
+      const who = L.ask.name, id = L.ask.id;
+      ask(`${who} asks for control\n\nGive: ${who} gets control now (only while the robot is idle). Keep: you keep it.`,
+        { ok: "Give", cancel: "Keep", timeout: 45, key: "ask", valid: () => holds && S.lease.ask && S.lease.ask.id === id })
+        .then(async (give) => {
+          if (give == null || !holds || !(S.lease.ask && S.lease.ask.id === id)) return;    // no answer: it expires
+          if (give) gaveAt = Date.now();
+          const r = await cmd("control_answer", { give });
+          if (r.ok && give) { holds = false; TOKEN = MYID = null; render(); } else gaveAt = 0;
+        });
+    }
+  }
 }
 async function releaseLease() { await post("/api/release"); holds = false; TOKEN = MYID = null; render(); }
 // Heartbeat: every 500 ms, never two at once, with a timeout. Control is lost ONLY when the server answers
@@ -3087,6 +3179,7 @@ function renderHeader(s) {
   $("#lease-view").hidden = holds;
   $("#lease-who").title = "Click to change your name";
   $("#lease-who").onclick = async () => { await operatorName(true); if (holds) takeLease(); };
+  usersRender(s);
   document.body.classList.toggle("viewing", !holds);
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
   $("#lease-btn").className = "btn " + (holds ? "quiet" : "primary");
@@ -3148,6 +3241,8 @@ async function boot() {
   }
   $("#stop").onclick = () => post("/api/stop");
   $("#lease-btn").onclick = () => (holds ? releaseLease() : takeLease());
+  $("#lease-ask").onclick = askControl;
+  $("#h-users").onclick = usersToggle;
   $("#h-tcp").onchange = (e) => cmd("set_tcp", { name: e.target.value });
   $("#h-ovr").oninput = (e) => ($("#h-ovr-val").textContent = e.target.value + "%");
   $("#h-ovr").onchange = (e) => { cmd("speed_override", { percent: +e.target.value }); e.target.blur(); };
@@ -3155,7 +3250,9 @@ async function boot() {
   $("#h-rec").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") post("/api/stop"); });
 
-  const es = new EventSource("/api/events");
+  const es = new EventSource("/api/events?bid=" + encodeURIComponent(BID) + "&name=" +
+    encodeURIComponent(localStorage.getItem("operator") || ""));
+  es.addEventListener("hello", (e) => { MYUID = JSON.parse(e.data).id; });
   let boot = null, logSeq = 0;
   es.addEventListener("state", (e) => {
     connected = true;

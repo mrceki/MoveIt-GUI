@@ -33,6 +33,16 @@ program runner and lease, and they do not know about each other.
 
 - **Viewing is free; controlling needs the lease.** Click **Take control** in the header. Only one browser holds
   control. Others see "Viewing · <name> has control", and all their robot buttons are disabled.
+- **Several users, also from one IP** (`web/users.py`). Each browser is one user, however many tabs it has open.
+  It keeps a random id in its localStorage, so browsers on one PC, or everyone coming in through `tailscale serve`
+  (all 127.0.0.1), are still told apart. The people icon in the header shows how many browsers have the GUI open.
+  Click it for the list: name, where they connect from, who has control. **Change my name** is at the bottom of the
+  list. The name is asked once per browser. Same names get (2), (3). The browser's own id is never shown to the
+  others; they see a short id derived from it.
+- **Ask for control.** When someone else has control, **Ask** sends them a pop-up: **Give** or **Keep** (it closes
+  by itself after 45 s, and the question ends after 60 s). Give hands control straight to the one who asked, only
+  while the robot is idle. For 15 s nobody else can take it. Keep tells the one who asked, who can ask again
+  after 20 s. **Take over** still works without asking, but only while the robot is idle.
 - **■ STOP works from every browser, with or without control** (and Esc). It stops the GUI program, MoveIt motion and the
   running policy. It is not an emergency stop: the pendant e-stop is.
   A STOP pressed while MoveIt is still planning (or while the move waits to start) also counts: that move is never sent.

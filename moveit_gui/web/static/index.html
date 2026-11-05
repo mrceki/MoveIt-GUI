@@ -29,9 +29,11 @@
   </div>
   <div class="sep"></div>
   <div id="lease">
+    <button class="hchip users" id="h-users" type="button" title="Who has this GUI open">—</button>
     <span class="hchip view" id="lease-view" title="View only: buttons that move or change the robot are greyed out. Press Take control to operate. STOP always works."><svg class="ic" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg> View only</span>
     <span class="who" id="lease-who">—</span>
     <button class="btn" id="lease-btn">Take control</button>
+    <button class="btn quiet" id="lease-ask" type="button" hidden title="Ask whoever has control to give it to you (they get a pop-up: Give / Keep)">Ask</button>
   </div>
   <button id="stop" title="STOP GUI MOTION: program, MoveIt motion and policy. Not an emergency stop. (Esc)">■ STOP</button>
 </header>
