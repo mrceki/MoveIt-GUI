@@ -5,6 +5,12 @@
 import { jointMonitor, ftChart } from "/static/monitors.js";
 import { workcell } from "/static/workcell.js";
 import { drivers, driversBadge } from "/static/drivers.js";
+import { workspace } from "/static/views.js";
+import { extraViews } from "/static/panels.js";
+import { icon } from "/static/icons.js";
+// short joint names for compact readouts: "shoulder_pan_joint" -> "Shoulder pan"
+const jshort = (n) => { const x = n.replace(/^.*?(shoulder|elbow|wrist)/, "$1").replace(/_joint$/, "").replace(/_/g, " ");
+  return x.charAt(0).toUpperCase() + x.slice(1); };
 
 const $ = (s, r = document) => r.querySelector(s);
 function h(tag, props = {}, ...kids) {
@@ -139,7 +145,7 @@ async function heartbeat() {
     if (netBad) { netBad = false; render(); }
     if (d.holds) { if (!holds) { holds = true; render(); } }
     else lostControl(S && S.lease && S.lease.client && S.lease.client !== MYID ? `${S.lease.name} took over`
-      : "the robot PC stopped hearing from this browser (see the log there)");
+      : "another browser took it and left, or this browser went quiet for over 2.5 s (sleep, network gap, a tab in the background for long)");
   } catch (e) {
     hbFailsSince = hbFailsSince || Date.now();
     if (!netBad && Date.now() - hbFailsSince > 800) { netBad = true; render(); }
@@ -232,100 +238,117 @@ function frameSelect(id) {
 // ================================================================== OPERATE
 pages.OPERATE = {
   build(el) {
+    // Manual: one card, four tabs, one footer (Speed · Acceleration · Plan · Move) shared by Joints and Pose
     const jrows = INFO.joint_names.map((n, i) =>
-      h("div", { class: "jrow" }, h("span", { class: "muted" }, n.replace("_joint", "")),
+      h("div", { class: "jrow" }, h("span", { class: "jname" }, jshort(n)),
         h("input", { type: "number", step: "0.5", id: `op-j${i}`, value: "0",
           oninput: (e) => e.target.classList.add("edited") }),
         h("span", { class: "cur", id: `op-jc${i}` }, "—")));
-    const wp = h("select", { id: "op-wp", onchange: (e) => {
+    const wp = h("select", { id: "op-wp", title: "Fill in a saved waypoint", onchange: (e) => {
       const w = INFO.waypoints.find((x) => x.name === e.target.value);
       if (w) w.joints_deg.forEach((v, i) => setField(`#op-j${i}`, v, true));
       this.loadedWp = w ? w.name : "";
-      $("#op-wp-name").textContent = w ? "target: " + w.name : "";
+      $("#op-wp-name").textContent = w ? w.name : "";
       e.target.value = "";
-    } }, h("option", { value: "" }, "Waypoint…"), INFO.waypoints.map((w) => h("option", { value: w.name }, w.name)));
-    const cart = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"].map((n, i) =>
-      h("div", { class: "jrow" }, h("span", { class: "muted" }, n + (i < 3 ? " mm" : " °")),
-        h("input", { type: "number", step: i < 3 ? "1" : "1", id: `op-c${i}`, value: "0",
-          oninput: (e) => { e.target.classList.add("edited"); this.fieldsToGoal(); } }), h("span")));
+    } }, h("option", { value: "" }, "Waypoint"), INFO.waypoints.map((w) => h("option", { value: w.name }, w.name)));
+    const cfield = (i, n) => h("label", { class: "cfield" }, h("span", { class: "k" }, n),
+      h("input", { type: "number", step: "1", id: `op-c${i}`, value: "0",
+        oninput: (e) => { e.target.classList.add("edited"); this.fieldsToGoal(); } }));
     const tabs = h("div", { class: "tabs" },
-      h("a", { class: "on", id: "op-tab-j", onclick: () => this.tab("j") }, "Joint"),
-      h("a", { id: "op-tab-c", onclick: () => this.tab("c") }, "Cartesian"),
+      h("a", { class: "on", id: "op-tab-j", onclick: () => this.tab("j") }, "Joints"),
+      h("a", { id: "op-tab-c", onclick: () => this.tab("c") }, "Pose"),
       h("a", { id: "op-tab-g", onclick: () => this.tab("g") }, "Jog"),
       h("a", { id: "op-tab-f", onclick: () => this.tab("f") }, "Force"));
-    const manual = h("div", { class: "card" },
-      h("div", { class: "section" }, "Manual"), tabs,
-      h("div", { id: "op-j" }, h("div", { class: "col", style: "gap:4px" },
-        h("div", { class: "jrow jhead" }, h("span", {}, "Joint"), h("span", {}, "Target °"), h("span", {}, "Now")), jrows),
-        h("div", { class: "row" }, wp, h("span", { class: "muted", id: "op-wp-name" }),
-          btn("Reset to current", "quiet", () => this.resetJoints(),
-            "Discard your edits: every field follows the arm again")),
-        note("Fields follow the arm until you edit them.", "Edited fields are highlighted. Reset to current makes every field follow the arm again.")),
+    const useCur = (f, tip) => h("button", { class: "btn quiet ibtn", type: "button", title: tip, html: icon("reset") + "<span>Use current</span>", onclick: f });
+    const manual = h("div", { class: "card manual" },
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow" }, "Manual")), tabs,
+      h("div", { id: "op-j" },
+        h("div", { class: "jtable" },
+          h("div", { class: "jrow jhead" }, h("span", {}, "Joint"), h("span", {}, "Target (°)"), h("span", {}, "Current")), jrows),
+        h("div", { class: "row" }, wp, h("span", { class: "muted small grow", id: "op-wp-name" }),
+          useCur(() => this.resetJoints(), "Discard your edits: every field follows the arm again. Edited fields are blue."))),
       h("div", { id: "op-c", class: "hidden" },
         h("div", { class: "row" }, h("span", { class: "muted" }, "Frame"),
           (() => { const f = frameSelect("op-frame"); f.onchange = () => this.resetCart(); return f; })(),
-          h("label", { class: "chk" }, h("input", { type: "checkbox", id: "op-linear" }), "Linear")),
-        h("div", { class: "col", style: "gap:4px" },
-          h("div", { class: "jrow jhead" }, h("span", {}, "TCP"), h("span", {}, "Target"), h("span", {}, "")), cart),
-        h("div", { class: "row" }, btn("Reset to current", "quiet", () => this.resetCart(),
-          "Fill in where the TCP is now, in the selected frame"))),
+          h("div", { class: "grow" }),
+          h("label", { class: "tchip", title: "Move the TCP along a straight line (Cartesian path) instead of a free joint move" },
+            h("input", { type: "checkbox", id: "op-linear" }), "Straight line")),
+        h("div", { class: "cgrid" },
+          h("div", { class: "cgroup" }, h("div", { class: "cap" }, "Position (mm)"), ["X", "Y", "Z"].map((n, i) => cfield(i, n))),
+          h("div", { class: "cgroup" }, h("div", { class: "cap" }, "Rotation (°)"), ["Roll", "Pitch", "Yaw"].map((n, i) => cfield(i + 3, n)))),
+        h("div", { class: "row" }, h("div", { class: "grow" }),
+          useCur(() => this.resetCart(), "Fill in where the TCP is now, in the selected frame"))),
       jogPanel(),
       forcePanel(),
-      h("div", { id: "op-motion" }, h("hr", { id: "op-hr" }),
-      h("div", { class: "row" }, h("span", { class: "muted" }, "Velocity %"),
-        h("input", { type: "number", id: "op-vel", value: "10", min: "1", max: "100", style: "width:60px" }),
-        h("span", { class: "muted" }, "Accel %"),
-        h("input", { type: "number", id: "op-acc", value: "10", min: "1", max: "100", style: "width:60px" }),
-        h("label", { class: "chk" }, h("input", { type: "checkbox", id: "op-confirm", checked: !INFO.fake }),
-          "Confirm moves"))),
-      h("div", { class: "banner-warn hidden", id: "op-refusal" }),
-      h("div", { class: "row", id: "op-gorow" },
-        btn("Plan", "", () => this.plan(), "Plan only and preview it in the 3D view; nothing moves until Execute"),
-        btn("MoveJ", "primary grow", () => this.go(), "Plan and execute")),
-      // right under Plan: the plan just made (previewed in the 3D view) and its Execute
-      h("div", { class: "row hidden planrow", id: "op-planrow" },
-        h("span", { class: "badge", id: "op-plan-info" }), h("div", { class: "grow" }),
-        btn("▶ Execute plan", "primary", () => this.execute(), "Run the previewed plan, if the arm is still at its start"),
-        btn("Clear", "quiet", () => cmd("plan_clear"))));
+      h("div", { class: "mfoot" },
+        h("div", { class: "row", id: "op-motion" },
+          h("label", { class: "nfield", title: "Velocity scaling, % of the joint limits" }, h("span", { class: "muted" }, "Speed"),
+            h("input", { type: "number", id: "op-vel", value: "10", min: "1", max: "100" }), h("span", { class: "muted" }, "%")),
+          h("label", { class: "nfield", title: "Acceleration scaling, %" }, h("span", { class: "muted" }, "Accel."),
+            h("input", { type: "number", id: "op-acc", value: "10", min: "1", max: "100" }), h("span", { class: "muted" }, "%")),
+          h("div", { class: "grow" }),
+          h("label", { class: "chk", title: "Ask before every move (large joint moves always ask)" },
+            h("input", { type: "checkbox", id: "op-confirm", checked: !INFO.fake }), "Confirm")),
+        h("div", { class: "banner-warn hidden", id: "op-refusal" }),
+        h("div", { class: "row", id: "op-gorow" },
+          btn("Preview", "", () => this.plan(), "Plan only and show it in the 3D view; nothing moves until Execute"),
+          btn("Move", "primary grow", () => this.go(), "Plan and move")),
+        // right under Preview: the plan just made (shown in the 3D view) and its Execute
+        h("div", { class: "row hidden planrow", id: "op-planrow" },
+          h("span", { class: "badge", id: "op-plan-info" }), h("div", { class: "grow" }),
+          btn("Execute plan", "primary", () => this.execute(), "Run the previewed plan, if the arm is still at its start"),
+          btn("Clear", "quiet", () => cmd("plan_clear")))));
     $("#op-gorow", manual).firstChild.id = "op-plan";
     $("#op-gorow", manual).lastChild.id = "op-go";
     $("#op-planrow", manual).querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
 
-    // 3D view (RViz-like): robot, goal gizmo, plan preview, force arrows. Robot state readouts below it.
-    const view = h("div", { class: "card", style: "flex:1.7;min-width:380px" },
-      h("div", { class: "row" }, h("div", { class: "section", style: "margin:0" }, "3D view"), h("div", { class: "grow" }),
-        h("label", { class: "chk", title: "A goal for the TCP: drag it, then Plan (Cartesian tab)" },
-          h("input", { type: "checkbox", id: "v3-goal", onchange: (e) => this.showGoal(e.target.checked) }), "Goal"),
-        h("select", { id: "v3-gmode", onchange: (e) => this.view && this.view.setGizmoMode(e.target.value) },
-          h("option", { value: "translate" }, "Move"), h("option", { value: "rotate" }, "Rotate")),
-        btn("Goal = TCP", "quiet", () => this.goalToTcp(), "Put the goal on the TCP")),
-      h("div", { class: "muted small hidden", id: "v3-goal-ik" }, ""),
-      this.viewBar(),
+    // 3D view (RViz-like): robot, goal gizmo, plan preview, force arrows. Its controls float on top of it; the TCP
+    // pose is a small box in its corner. It is the first tile of OPERATE > Views (views.js).
+    const v3box = h("div", { class: "v3box" },
       h("div", { class: "view3d", id: "v3" }, h("div", { class: "muted v3msg", id: "v3-msg" }, "Loading the robot model…")),
-      h("div", { class: "secondary", id: "op-tcpname" }), h("div", { class: "grid pose2", id: "op-pose" }));
+      this.viewBar(),
+      h("div", { class: "v3ovl v3ik hidden", id: "v3-goal-ik" }, ""),
+      this.poseCard());
 
     const modeSel = h("select", { id: "op-mode" });
     for (const m of INFO.modes.filter((m) => !m.hidden))
       modeSel.append(h("option", { value: m.name, disabled: !m.allowed },
         m.label + (m.direct_torque ? " (direct torque)" : "") + (m.allowed ? "" : " — disabled")));
     const robot = this.robotCard();
-    const stack = h("div", { class: "card" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Arm control"),
-        h("span", { class: "badge warn hidden", id: "op-exp" }, "EXPERIMENTAL")),
-      h("div", { class: "row", style: "align-items:baseline" }, h("span", { class: "title", id: "op-mode-title" }, "—"),
-        h("span", { class: "muted", id: "op-iface" })),
+    // the modes as one segmented control: the active one is filled; picking another shows "Switch to …" (nothing
+    // changes until that is pressed). The hidden select keeps the pick for switchMode().
+    modeSel.classList.add("hidden");
+    const modeSeg = h("div", { class: "mseg", id: "op-mseg" }, INFO.modes.filter((m) => !m.hidden).map((m) =>
+      h("button", { type: "button", "data-mode": m.name, disabled: !m.allowed,
+        title: m.allowed ? `${m.label}: ${m.interface} command interface` + (m.moveit ? " · MoveIt moves" : " · no MoveIt moves")
+          + (m.direct_torque ? " · direct torque" : "") : m.disabled_reason || "Not available",
+        onclick: () => { modeSel.value = m.name; this.modePick(); } }, m.label)),
+      h("button", { type: "button", id: "op-fdseg", class: "fd", html: icon("hand") + "<span>Freedrive</span>",
+        title: "Hand-guide the arm (UR freedrive). Ending it returns to the mode before.",
+        onclick: () => cmd("freedrive", { on: true }) }));
+    const stack = h("div", { class: "card armcard" },
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow" }, "Arm control"),
+        h("span", { class: "badge warn hidden", id: "op-exp" }, "Experimental"),
+        h("span", { class: "chip hidden", id: "op-iface" })),
+      h("span", { class: "hidden", id: "op-mode-title" }),
+      modeSeg, modeSel,
+      h("div", { class: "fdband hidden", id: "op-fdband" }, h("span", { html: icon("hand") }),
+        h("span", { class: "grow", title: "Move the arm by hand. Ending it returns to the mode before." }, h("b", {}, "Freedrive on")),
+        freedriveButton()),
       h("div", { class: "banner-bad hidden", id: "op-unknown" }),
       h("div", { class: "op-src", id: "op-source" }),
-      h("div", { class: "row" }, modeSel, btn("Switch", "", () => this.switchMode(), "Switch the arm to this control mode")),
-      h("div", { class: "row" }, freedriveButton(),
+      h("div", { class: "swrow hidden", id: "op-switchrow" },
+        h("span", { class: "grow", id: "op-switch-q" }),
+        btn("Cancel", "quiet", () => { modeSel.value = S.mode; this.modePick(); }),
+        btn("Switch", "primary", () => this.switchMode(), "Switch the arm to this control mode")),
+      h("div", { class: "row hidden", id: "op-recoverrow" },
         btn("Re-verify", "", () => cmd("recover"), "After recovering the controllers by hand, check which mode is really active")));
-    modeSel.classList.add("grow");
-    stack.querySelectorAll(".row")[2].lastChild.id = "op-switch";
-    stack.querySelectorAll(".row")[3].lastChild.id = "op-recover";
+    stack.querySelector("#op-switchrow").lastChild.id = "op-switch";
+    stack.querySelector("#op-recoverrow").firstChild.id = "op-recover";
 
     const g = INFO.gripper;
     const grip = h("div", { class: "card" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, g.enabled ? g.model || "Gripper" : "Gripper"),
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: g.model || "" }, "Gripper"),
         g.enabled ? h("span", { class: "chip", id: "op-grip-chip" }, "—") : ""),
       g.enabled ? [
         h("div", { class: "row" }, h("span", { class: "muted", style: "width:40px" }, "Open"), h("div", { class: "bar grow" },
@@ -333,9 +356,9 @@ pages.OPERATE = {
           h("span", { class: "mono", id: "op-grip-pct", style: "width:38px;text-align:right" }, "—")),
         h("div", { class: "muted small", id: "op-grip-status" }),
         h("div", { class: "row" },
-          btn("Open", "", () => cmd("gripper", { percent: 0, effort: gripForce() })),
-          btn("Close", "", () => cmd("gripper", { percent: 100, effort: gripForce() })),
-          h("span", { class: "vsep" }),
+          btn("Open", "grow", () => cmd("gripper", { percent: 0, effort: gripForce() })),
+          btn("Close", "grow", () => cmd("gripper", { percent: 100, effort: gripForce() }))),
+        h("div", { class: "row gcustom" }, h("span", { class: "muted small" }, "To"),
           h("input", { type: "number", id: "op-grip-to", min: "0", max: "100", step: "5", value: "50", style: "width:52px",
             title: "% closed" }),
           h("span", { class: "muted" }, "%"),
@@ -359,23 +382,34 @@ pages.OPERATE = {
       h("span", { class: "v", id: `op-ft${i}` }, "—"), h("div", { class: "cbar" }, h("div", { id: `op-ftb${i}` })));
     this.ftc = ftChart();
     const ft = h("div", { class: "card" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "ATI F/T",
-        h("span", { class: "muted", style: "font-weight:400;letter-spacing:0;text-transform:none" }, `  ·  ${INFO.ft_frame || "sensor frame"}`)),
-        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + Payload)" }, "BIASED")),
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: `Frame: ${INFO.ft_frame || "sensor frame"}` }, "F/T sensor"),
+        h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + Payload)" }, "Biased"),
+        h("button", { class: "btn quiet ibtn", type: "button", id: "op-ft-show", title: "Show the F/T chart under this card",
+          html: icon("chart") + "<span>Chart</span>", onclick: () => this.vg.toggleChart() })),
       h("div", { class: "ft3" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(ftCell),
-        h("span", { class: "u" }, "Nm"), [3, 4, 5].map(ftCell)),
-      this.ftc.el);
+        h("span", { class: "u" }, "Nm"), [3, 4, 5].map(ftCell)));
     this.ftc.el.classList.remove("card");
 
     this.jm = jointMonitor(INFO.joint_names, INFO.joint_limits_deg);
-    const jmCard = h("details", { class: "card", open: true },
-      h("summary", { class: "section" }, "Joints"), this.jm.el);
+    // Joints: bars with limits, a list, or one line of angles (pick in the card's corner; kept per browser)
+    const jv = ["bars", "list", "line"].includes(localStorage.getItem("op-joints")) ? localStorage.getItem("op-joints") : "bars";
+    const jmCard = h("div", { class: "card jmcard", "data-v": jv },
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow" }, "Joints"),
+        h("span", { class: "tseg jvseg" }, [["bars", "Bars with limits"], ["list", "List"], ["line", "One line"]].map(([k, t]) =>
+          h("button", { type: "button", class: k === jv ? "on" : "", title: t, html: icon(k), onclick: (e) => {
+            jmCard.dataset.v = k; localStorage.setItem("op-joints", k);
+            for (const b of e.currentTarget.parentNode.children) b.classList.toggle("on", b === e.currentTarget);
+          } })))),
+      h("div", { class: "jbars" }, this.jm.el), h("div", { class: "jsum", id: "op-jsum" }), h("div", { class: "jline", id: "op-jline" }));
     if (this.jm.unknownCount()) this.retryLimits(6);
-    view.classList.add("op-view");
-    // left: what you command (manual) and what the tool feels (F/T); right: arm mode, gripper, joints
-    el.append(h("div", { class: "cols" },
-      h("div", { class: "col op-left", style: "flex:1.2;min-width:320px" }, manual, ft), view,
-      h("div", { class: "col op-side", style: "flex:1;min-width:270px;max-width:380px" }, robot, stack, grip, jmCard)));
+    // the workspace and its layouts (views.js): left what you command and what the tool feels, middle the 3D view
+    // and cameras, right the robot, arm mode, gripper and joints. The cards themselves stay as they are.
+    // more windows for your own layouts: Motion planner, Joint chart, Program run, Log (panels.js)
+    this.xv = extraViews({ h, btn, cmd, pcmd, INFO, getS: () => S, op: this, navTo, logs });
+    this.vg = workspace({ h, cmd, toast, view3d: v3box, ftEl: this.ftc.el, ftBtn: $("#op-ft-show", ft), extra: this.xv,
+      cards: { manual, fts: ft, robot, arm: stack, grip, joints: jmCard }, header: $("#h-layouts"),
+      onEdit: () => navTo("OPERATE") });
+    el.append(this.vg.el);
     this.mode = "j";
     this.planId = -1;
     import("/static/view3d.js").then((m) => this.initView(m)).catch((e) => {
@@ -389,19 +423,47 @@ pages.OPERATE = {
     this.frameList = [];
     const pop = h("div", { class: "popover hidden", id: "v3-fpop" });
     document.addEventListener("click", (e) => { if (!e.composedPath().some((n) => n.classList && n.classList.contains("popwrap"))) pop.classList.add("hidden"); });
-    return h("div", { class: "row v3bar" },
-      h("span", { class: "popwrap" },
-        btn("Frames ▾", "quiet", () => { pop.classList.toggle("hidden"); this.framesRender(); this.framesPoll(true); }, "Show TF frames in the 3D view"), pop),
-      h("label", { class: "chk", title: "Fading line of the last 10 s of TCP motion" },
-        h("input", { type: "checkbox", id: "v3-trail", checked: true, onchange: (e) => this.view && this.view.setTrail(e.target.checked) }), "Trail"),
-      h("label", { class: "chk", title: "Keep-out zones (MoveIt collision boxes, SETUP › Keep-out zones). Disabled ones dashed grey" },
-        h("input", { type: "checkbox", id: "v3-zones", checked: localStorage.getItem("v3-zones") !== "0",
-          onchange: (e) => { localStorage.setItem("v3-zones", e.target.checked ? "1" : "0"); if (S && this.view) this.view.setZones(S.keepout.boxes, e.target.checked); } }), "Zones"),
-      h("label", { class: "chk", title: "Keep the orbit centre on the TCP" },
-        h("input", { type: "checkbox", id: "v3-follow", onchange: (e) => this.view && this.view.setFollow(e.target.checked) }), "Follow TCP"),
-      h("div", { class: "grow" }),
-      h("span", { class: "seg", title: "Camera" },
-        ["Top", "Front", "Side", "Iso"].map((n) => btn(n, "quiet", v((w) => w.setCameraPreset(n.toLowerCase())), `${n} view`))));
+    const tog = (id, label, tip, checked, onchange) => h("label", { class: "tchip", title: tip },
+      h("input", { type: "checkbox", id, checked, onchange }), label);
+    return [
+      h("div", { class: "v3ovl v3tl" },
+        h("span", { class: "popwrap" },
+          h("button", { class: "tchip", type: "button", title: "Show TF frames in the 3D view",
+            onclick: () => { pop.classList.toggle("hidden"); this.framesRender(); this.framesPoll(true); } }, "Frames ▾"), pop),
+        tog("v3-trail", "Trail", "Fading line of the last 10 s of TCP motion", true, (e) => this.view && this.view.setTrail(e.target.checked)),
+        tog("v3-zones", "Zones", "Keep-out zones (MoveIt collision boxes, SETUP › Keep-out zones). Disabled ones dashed grey",
+          localStorage.getItem("v3-zones") !== "0",
+          (e) => { localStorage.setItem("v3-zones", e.target.checked ? "1" : "0"); if (S && this.view) this.view.setZones(S.keepout.boxes, e.target.checked); }),
+        tog("v3-follow", "Follow TCP", "Keep the orbit centre on the TCP", false, (e) => this.view && this.view.setFollow(e.target.checked))),
+      h("div", { class: "v3ovl v3tr" },
+        h("span", { class: "tseg v3goalopts hidden", id: "v3-goalopts" },
+          h("button", { type: "button", class: "on", id: "v3-gm-translate", title: "Drag the goal to move it",
+            onclick: () => this.gizmoMode("translate") }, "Move"),
+          h("button", { type: "button", id: "v3-gm-rotate", title: "Drag the goal to rotate it",
+            onclick: () => this.gizmoMode("rotate") }, "Rotate"),
+          h("button", { type: "button", title: "Put the goal on the TCP", onclick: () => this.goalToTcp() }, "To TCP")),
+        tog("v3-goal", "Goal", "A goal for the TCP: drag it in the view, then Plan (Cartesian tab)", false,
+          (e) => this.showGoal(e.target.checked)),
+        h("span", { class: "tseg v3cams", title: "Camera" },
+          ["Top", "Front", "Side", "Iso"].map((n) => h("button", { type: "button", title: `${n} view`,
+            onclick: v((w) => w.setCameraPreset(n.toLowerCase())) }, n))))];
+  },
+  gizmoMode(m) {
+    if (this.view) this.view.setGizmoMode(m);
+    for (const k of ["translate", "rotate"]) $("#v3-gm-" + k).classList.toggle("on", k === m);
+  },
+  // the small card in the 3D view's corner: where the TCP is and the joint angles; each part folds away
+  poseCard() {
+    let st = { tcp: true, joints: false };
+    try { st = { ...st, ...JSON.parse(localStorage.getItem("v3-pose") || "{}") }; } catch (e) { /* */ }
+    const part = (k, title, body) => {
+      const d = h("details", { class: "v3pp", open: st[k] }, h("summary", {}, title), body);
+      d.addEventListener("toggle", () => { st[k] = d.open; localStorage.setItem("v3-pose", JSON.stringify(st)); });
+      return d;
+    };
+    return h("div", { class: "v3pose" },
+      part("tcp", h("span", { id: "op-tcpname" }, "TCP"), h("div", { class: "grid pose2", id: "op-pose" })),
+      part("joints", "Joints", h("div", { class: "grid pose2 pj", id: "op-posej" })));
   },
   frameChecked(f) {
     const sel = this.frameSel;
@@ -464,6 +526,7 @@ pages.OPERATE = {
   },
   // ---- goal <-> Cartesian fields (both in the base frame)
   showGoal(on) {
+    $("#v3-goalopts").classList.toggle("hidden", !on);      // Move / Rotate / To TCP only while the goal is shown
     if (!this.view) return;
     if (on && !this.goalSet) this.goalToTcp();
     this.view.showTarget(on);
@@ -532,6 +595,11 @@ pages.OPERATE = {
     if (r.ok && r.plan && this.view && S.plan.id === id && S.plan.what && this.planId === id)
       this.view.playPreview(r.plan, INFO.joint_names, this.extraJoints(S));
   },
+  async replayPreview() {
+    if (!S.plan.what || !this.view) return;
+    const id = S.plan.id, r = await post("/api/cmd", { cmd: "plan_get", args: {} }, true);
+    if (r.ok && r.plan && S.plan.id === id && S.plan.what) this.view.playPreview(r.plan, INFO.joint_names, this.extraJoints(S));
+  },
   extraJoints(s) {
     return s.gripper_joint && s.gripper_position != null ? { [s.gripper_joint]: s.gripper_position } : {};
   },
@@ -558,7 +626,8 @@ pages.OPERATE = {
     if (p) [...p.xyz_mm, ...p.rpy_deg].forEach((v, i) => setField(`#op-c${i}`, v, false));
   },
   // the jog panel is one set of controls shared with PROGRAMS (moved there while PROGRAMS is open)
-  show() { dockJog(null); },
+  show() { dockJog(null); this.vg.enter(); },
+  hide() { this.vg.leave(); },
   tab(t) {
     this.mode = t;
     $("#op-j").classList.toggle("hidden", t !== "j");
@@ -566,9 +635,10 @@ pages.OPERATE = {
     $("#op-g").classList.toggle("hidden", t !== "g");
     $("#op-f").classList.toggle("hidden", t !== "f");
     for (const k of ["j", "c", "g", "f"]) $(`#op-tab-${k}`).classList.toggle("on", t === k);
-    $("#op-go").textContent = t === "j" ? "MoveJ" : "MovePose";
+    $("#op-go").textContent = "Move";
+    $("#op-go").title = t === "j" ? "Plan and move: a joint move (MoveJ)" : "Plan and move the TCP to this pose";
     $("#op-gorow").classList.toggle("hidden", t === "g" || t === "f");
-    $("#op-motion").classList.toggle("hidden", t === "f");      // speed settings do not apply to a force
+    $("#op-motion").classList.toggle("hidden", t === "f" || t === "g");   // Jog has its own speed; a force has none
     if (t !== "g") jogRelease();
   },
   go() {
@@ -588,6 +658,17 @@ pages.OPERATE = {
       if (confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`))
         cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc });
     }
+  },
+  modePick() {
+    const pick = $("#op-mode").value, cur = S && S.mode;
+    for (const b of $("#op-mseg").children) {
+      b.classList.toggle("on", b.dataset.mode === cur);
+      b.classList.toggle("pick", b.dataset.mode === pick && pick !== cur);
+    }
+    const m = INFO.modes.find((x) => x.name === pick);
+    const fd = !!(S && S.freedrive);
+    $("#op-switchrow").classList.toggle("hidden", !m || pick === cur || fd);
+    if (m) $("#op-switch-q").innerHTML = `Switch to <b>${m.label}</b>?` + (m.direct_torque ? ' <span class="badge warn">Direct torque</span>' : "");
   },
   switchMode() {
     const name = $("#op-mode").value, m = INFO.modes.find((x) => x.name === name);
@@ -629,12 +710,18 @@ pages.OPERATE = {
       return el;
     };
     [this.pOn, this.pBrake, this.pPlay, this.pOff, this.pResume, this.pPause, this.pStopProg].forEach((b) => (b.dataset.lease = "1"));
+    // icons + short words; the full explanation is in each button's hover text
+    const ib = (b, ic, t) => { b.innerHTML = icon(ic) + (t ? `<span>${t}</span>` : ""); b.classList.add("ibtn"); return b; };
+    ib(this.pOff, "power", ""); this.pOff.title = "Power off… (UR Dashboard)";
+    ib(this.pPause, "pause", "Pause"); ib(this.pStopProg, "stop", "Stop"); ib(this.pResume, "play", "Resume");
+    ib(this.pPlay, "play", "Play program");
     return h("div", { class: "card", id: "op-robot" },
-      h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "Robot"), this.pOff),
-      h("div", { class: "rstate", id: "op-rstate" }, "—"),
-      h("div", { class: "psteps" }, step(1, this.pOn, "Power on"), step(2, this.pBrake, "Release brakes"), step(3, this.pPlay, "Play program")),
-      h("div", { class: "row", id: "op-progctl" }, this.pResume, this.pPause, this.pStopProg),
-      h("div", { class: "muted small", id: "op-remote" }));
+      h("div", { class: "row chead" }, h("span", { class: "ctitle grow" }, "Robot"),
+        h("span", { class: "chip", id: "op-remote" }, "—"), this.pOff),
+      h("div", { class: "rhead" }, h("span", { class: "dot", id: "op-rdot" }),
+        h("div", { class: "grow" }, h("div", { class: "rstate", id: "op-rstate" }, "—"), h("div", { class: "muted small", id: "op-rsub" })),
+        h("div", { class: "row", id: "op-progctl" }, this.pResume, this.pPause, this.pStopProg)),
+      h("div", { class: "psteps" }, step(1, this.pOn, "Power on"), step(2, this.pBrake, "Release brakes"), step(3, this.pPlay, "Play program")));
   },
 
   robotUpdate(s) {
@@ -644,10 +731,13 @@ pages.OPERATE = {
     const label = { POWER_OFF: "Powered off", IDLE: "Powered on · brakes engaged", RUNNING: "Running",
       BOOTING: "Booting…", POWER_ON: "Powering on…", DISCONNECTED: "Not connected", CONFIRM_SAFETY: "Confirm safety on the pendant",
       BACKDRIVE: "Backdrive", "?": "Robot mode unknown" }[rm] || rm;
-    const safety = s.safety_mode && s.safety_mode !== "NORMAL" ? ` · ${s.safety_mode.replace(/_/g, " ")}` : "";
-    const progTxt = running ? (prog === true ? " · program running ✓" : paused ? " · program PAUSED" : " · program STOPPED") : "";
-    st.textContent = label + safety + progTxt;
-    st.className = "rstate " + (safety ? "bad" : running && prog === true ? "good" : "warn");
+    const safety = s.safety_mode && s.safety_mode !== "NORMAL" ? nice(s.safety_mode) : "";
+    st.textContent = safety || label;
+    $("#op-rsub").textContent = safety ? label : running ? (prog === true ? "Pendant program running" : paused
+      ? "Pendant program paused" : "Pendant program stopped") : "";
+    const cls = safety ? "bad" : running && prog === true ? "ok" : "warn";
+    st.className = "rstate " + cls;
+    $("#op-rdot").className = "dot " + cls;
     // the next step is the primary button; done steps show ✓
     const done = [powered, running, running && prog === true];
     const next = done.indexOf(false);
@@ -673,10 +763,11 @@ pages.OPERATE = {
     gate(this.pPlay, (s.idle || (s.runner && s.runner.state === "PAUSED")) && running && prog !== true);   // a paused GUI run may wait
     // what the robot says about Local / Remote Control (asked every few seconds), not a fixed reminder
     const rc = $("#op-remote");
-    rc.textContent = s.remote_control === true ? "Pendant: Remote Control ✓" :
-      s.remote_control === false ? "Pendant is in LOCAL Control: power, brakes and Play only work in Remote Control" :
+    rc.textContent = s.remote_control === true ? "Remote control" : s.remote_control === false ? "Local control" : "Pendant ?";
+    rc.title = s.remote_control === true ? "The pendant is in Remote Control: this GUI can power on, release brakes and play" :
+      s.remote_control === false ? "The pendant is in Local Control: power, brakes and Play only work in Remote Control" :
       "Pendant control mode unknown (Dashboard not answering)";
-    rc.classList.toggle("warn", s.remote_control === false);
+    rc.className = "chip " + (s.remote_control === false ? "warn" : "");
   },
   retryLimits(n) {   // the URDF can arrive after the page loaded; ask /api/info again a few times
     setTimeout(async () => {
@@ -691,6 +782,7 @@ pages.OPERATE = {
   update(s) {
     if (this.jm) this.jm.update(s);
     if (this.ftc) this.ftc.push(s);
+    if (this.xv) for (const x of Object.values(this.xv)) x.update(s);
     // Untouched fields follow the arm, so a MoveJ never sends a joint back to a stale value.
     if (s.joints_deg) s.joints_deg.forEach((v, i) => setField(`#op-j${i}`, v, false));
     if (this.mode === "c") this.followCart(s);
@@ -719,6 +811,13 @@ pages.OPERATE = {
     }
     (s.joints_deg || []).forEach((v, i) => ($(`#op-jc${i}`).textContent = v.toFixed(1) + "°"));
     $("#op-tcpname").textContent = `TCP ${s.calibration.active_tcp} in ${INFO.base_link}`;
+    const jd = s.joints_deg || [];
+    $("#op-posej").innerHTML = INFO.joint_names.map((n, i) =>
+      `<span class="k">${jshort(n)}</span><span class="v">${jd[i] == null ? "—" : jd[i].toFixed(1)} °</span>`).join("");
+    $("#op-jline").innerHTML = INFO.joint_names.map((n, i) =>
+      `<span title="${jshort(n)}"><span class="k">${["B", "S", "E", "W1", "W2", "W3"][i] || i + 1}</span>${jd[i] == null ? "—" : jd[i].toFixed(1)}</span>`).join("") + "<span class='u'>°</span>";
+    $("#op-jsum").innerHTML = INFO.joint_names.map((n, i) =>
+      `<span><span class="k">${jshort(n)}</span><span class="v">${jd[i] == null ? "—" : jd[i].toFixed(1)}°</span></span>`).join("");
     const p = s.tcp;
     // X Roll / Y Pitch / Z Yaw side by side: one short block instead of six lines
     $("#op-pose").innerHTML = p ? [0, 1, 2].map((i) =>
@@ -728,12 +827,17 @@ pages.OPERATE = {
     $("#op-mode-title").textContent = m ? m.label : (!s.mode_label || /^(none|unknown)$/i.test(s.mode_label) ?
       "No arm controller active" : s.mode_label);
     $("#op-exp").classList.toggle("hidden", !(m && m.experimental));
-    $("#op-iface").textContent = m ? (m.direct_torque ? "DIRECT TORQUE" : m.interface.toUpperCase() + " interface") +
-      (m.moveit ? " · MoveIt motion available" : " · no MoveIt motion") : "";
+    // only what matters: the command interface is in the hover text
+    $("#op-iface").textContent = m && m.direct_torque ? "Direct torque" : "";
+    $("#op-iface").classList.toggle("hidden", !(m && m.direct_torque));
+    $("#op-mseg").classList.toggle("hidden", !!s.freedrive);
+    $("#op-fdband").classList.toggle("hidden", !s.freedrive);
+    gate($("#op-fdseg"), s.idle && !s.unknown);
+    $("#op-mode-title").title = m ? `${m.interface} command interface` + (m.moveit ? " · MoveIt moves available" : "") : "";
     $("#op-unknown").classList.toggle("hidden", !s.unknown);
     $("#op-unknown").textContent = "CONTROL STATE UNKNOWN. " + (s.unknown_reason || "") + " Recover the controllers by hand, then Re-verify.";
     $("#op-source").textContent = s.command_source !== "idle" ? "Commanding: " + s.command_source : "";
-    $("#op-source").classList.toggle("hidden", s.command_source === "idle");
+    $("#op-source").classList.toggle("hidden", s.command_source === "idle" || !!s.freedrive);
     // Follow the robot only when its mode changes: the user's pick must survive until Switch is pressed
     // (clicking Switch takes the focus off the select, so a focus check is not enough).
     if (s.mode !== this.shownMode) {
@@ -741,10 +845,11 @@ pages.OPERATE = {
       if (m && !m.hidden) $("#op-mode").value = s.mode;
     }
     gate($("#op-switch"), s.idle && !s.unknown && !s.freedrive);
-    $("#op-switch").className = "btn " + (INFO.modes.find((x) => x.name === $("#op-mode").value)?.direct_torque ? "experimental" : "");
+    this.modePick();
+    $("#op-switch").className = "btn primary " + (INFO.modes.find((x) => x.name === $("#op-mode").value)?.direct_torque ? "experimental" : "");
     gate($("#op-recover"), true);
     this.robotUpdate(s);
-    $("#op-recover").classList.toggle("hidden", !s.unknown);
+    $("#op-recoverrow").classList.toggle("hidden", !s.unknown);
     if (INFO.gripper.enabled) {
       const g = INFO.gripper, pos = s.gripper_position;
       const pct = pos == null ? null : 100 * (pos - g.open_position) / ((g.closed_position - g.open_position) || 1);
@@ -754,10 +859,10 @@ pages.OPERATE = {
       const ctrlBad = s.gripper_controller && s.gripper_controller !== "active";
       const fault = gs && gs.fault_code && gs.fault_code !== 255;
       const chip = $("#op-grip-chip");
-      const [txt, cls] = !s.connected.Gripper ? ["NOT CONNECTED", "bad"] : ctrlBad ? ["CONTROLLER " + s.gripper_controller.toUpperCase(), "bad"]
-        : fault ? ["FAULT", "bad"] : gs && gs.holding ? ["HOLDING", "good"] : ["READY", "good"];
+      const [txt, cls] = !s.connected.Gripper ? ["Not connected", "bad"] : ctrlBad ? ["Controller " + s.gripper_controller, "bad"]
+        : fault ? ["Fault", "bad"] : gs && gs.holding ? ["Holding object", "good"] : ["Ready", "good"];
       chip.textContent = txt; chip.className = "chip " + cls;
-      $("#op-grip-status").textContent = gs ? `${gs.object} · ${gs.current_a.toFixed(2)} A` : "";
+      $("#op-grip-status").textContent = gs ? `${gs.object.charAt(0).toUpperCase()}${gs.object.slice(1)} · ${gs.current_a.toFixed(2)} A` : "";
       const rc = $("#op-grip-reconn");
       if (rc) {
         const down = !s.connected.Gripper || ctrlBad;
@@ -853,9 +958,10 @@ function jogLabels() {
     const name = joint ? INFO.joint_names[i] : CART[i];
     row.classList.toggle("hidden", !name);
     sliderRow.classList.toggle("hidden", !name);
-    $(`#op-jl${i}`).textContent = !name ? "" : joint ? `J${i + 1} ${name.replace("_joint", "")}` : name;
-    $(`#op-jsl${i}`).textContent = $(`#op-jl${i}`).textContent;
-    $(`#op-js${i}`).setAttribute("aria-label", `${$(`#op-jl${i}`).textContent} velocity (-100 to 100)`);
+    // joints: just J1…J6 (the full name in the tooltip), so the sliders get the width
+    const full = !name ? "" : joint ? `J${i + 1} ${name.replace("_joint", "")}` : name;
+    for (const id of [`#op-jl${i}`, `#op-jsl${i}`]) { $(id).textContent = !name ? "" : joint ? `J${i + 1}` : name; $(id).title = full; }
+    $(`#op-js${i}`).setAttribute("aria-label", `${full} velocity (-100 to 100)`);
   }
 }
 
@@ -981,19 +1087,22 @@ function forcePanel() {
   const cell = (i) => h("label", { class: "fcell" }, h("span", { class: "muted" }, AXES[i]),
     h("input", { type: "number", id: `op-f${i}`, value: "0", step: i < 3 ? "1" : "0.1", style: "width:68px" }));
   const el = h("div", { id: "op-f", class: "hidden" },
-    h("div", { class: "row" }, h("span", { class: "muted" }, "Axes"),
-      h("select", { id: "op-f-frame" }, h("option", { value: "tool" }, "Tool (active TCP)"), h("option", { value: "base" }, "Base")),
-      btn("Zero fields", "quiet", () => [0, 1, 2, 3, 4, 5].forEach((i) => ($(`#op-f${i}`).value = "0")))),
+    h("div", { class: "row" }, h("span", { class: "muted" }, "Frame"),
+      h("select", { id: "op-f-frame", title: "The axes of the wrench" }, h("option", { value: "tool" }, "Tool (active TCP)"), h("option", { value: "base" }, "Base")),
+      h("div", { class: "grow" }),
+      h("button", { class: "btn quiet ibtn", type: "button", title: "Set every field to 0", html: icon("reset") + "<span>Clear</span>",
+        onclick: () => [0, 1, 2, 3, 4, 5].forEach((i) => ($(`#op-f${i}`).value = "0")) })),
     h("div", { class: "fgrid" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(cell), h("span", { class: "u" }, "Nm"), [3, 4, 5].map(cell)),
     h("div", { class: "row" },
       btn("Apply", "primary", () => forceApply(), "Apply (or change) this wrench; it ramps in"),
-      btn("Ramp down", "", () => forceRelease(), "Ramp the force down to zero, then end"),
+      btn("Ramp to zero", "", () => forceRelease(), "Ramp the force down to zero, then end"),
       btn("Zero now", "danger", () => forceStop(), "Zero at once")),
     h("div", { class: "secondary", id: "op-f-status" }),
     h("div", { class: "muted", id: "op-f-note" }),
-    note(`Max ${f.max_force_n} N · ${f.max_torque_nm} Nm · ramps ${f.ramp_force_nps} N/s · zeroed on STOP`,
+    note(`Max ${f.max_force_n} N · ${f.max_torque_nm} Nm`,
       `The tool pushes with this wrench at the active TCP. In free air the arm moves until the controller's ` +
       `stiffness balances it (≈ force / stiffness, see SETUP › Controller gains); on a surface it presses. ` +
+      `Ramps at ${f.ramp_force_nps} N/s. ` +
       `Zeroed at once on STOP, losing control, or if this page stops renewing ` +
       `(keep it in front: hidden tabs are throttled). Ends after ${f.max_duration_s} s.`));
   el.querySelectorAll(".btn").forEach((b) => { if (b.textContent === "Apply") b.dataset.lease = "1"; });
@@ -1028,7 +1137,8 @@ function forceUpdate(s) {
   const fmtW = (w) => `F [${w.slice(0, 3).map((v) => v.toFixed(1)).join(", ")}] N  T [${w.slice(3).map((v) => v.toFixed(2)).join(", ")}] Nm`;
   $("#op-f-status").textContent = f.active ? `${f.releasing ? "Releasing" : "Applying"} (${f.frame} axes): ${fmtW(f.current)}`
     : f.last_end ? "Last: " + f.last_end : "";
-  $("#op-f-note").textContent = f.refusal || f.note || "";
+  const fn = f.refusal || f.note || "";
+  $("#op-f-note").textContent = fn.charAt(0).toUpperCase() + fn.slice(1);
   if (!f.active && FORCE.timer && !s.busy) { clearInterval(FORCE.timer); FORCE.timer = null; }
 }
 
@@ -1785,7 +1895,7 @@ pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
   GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry"]],
-    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]]],
+    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]], ["GUI", ["Layouts"]]],
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
       ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
@@ -1992,15 +2102,15 @@ pages.SETUP = {
     this.svv = true;
     try {
       const m = await import("/static/view3d.js");
-      const v = new m.View3D($("#su-v3"), { baseLink: INFO.base_link });
+      const v = new m.View3D($("#su-v3", this.sv), { baseLink: INFO.base_link });
       this.v3m = m;
       for (let i = 0; i < 20; i++) {
         const r = await fetch("/api/robot_model").then((x) => x.json()).catch(() => ({ ok: false, msg: "no answer" }));
-        if (r.ok) { await v.load(r); $("#su-v3-msg")?.remove(); this.view = v; this.svPaint(true); return; }
-        $("#su-v3-msg").textContent = "Robot model: " + r.msg;
+        if (r.ok) { await v.load(r); $("#su-v3-msg", this.sv)?.remove(); this.view = v; this.svPaint(true); return; }
+        $("#su-v3-msg", this.sv).textContent = "Robot model: " + r.msg;
         await new Promise((res) => setTimeout(res, 3000));
       }
-    } catch (e) { $("#su-v3-msg").textContent = "3D view unavailable: " + e.message; }
+    } catch (e) { $("#su-v3-msg", this.sv).textContent = "3D view unavailable: " + e.message; }
   },
   async svPaint(full) {
     const v = this.view, n = this.sub;
@@ -2068,6 +2178,10 @@ pages.SETUP = {
       } else this.body.replaceChildren(h("div", { class: "cols" }, this.views[n], this.sv));
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
+    } else if (n === "Layouts") {          // made by OPERATE's workspace (views.js)
+      this.lay = this.lay || pages.OPERATE.vg.setupView();
+      this.lay.refresh();
+      this.body.replaceChildren(h("div", { class: "col su-main" }, this.lay.el));
     } else this.body.replaceChildren(this.views[n]);
     if (n === "Drivers & cameras") this.dr.load(); else this.dr.leave();
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
@@ -2873,38 +2987,55 @@ function activity(s) {
   const r = s.runner, pol = s.policy, f = s.force;
   if (r.state !== "IDLE") {
     const where = r.path ? r.path.map((x) => x + 1).join(".") : "";
-    return [`PROGRAM ${r.state === "PAUSED" ? "❚❚ PAUSED" : "▶"} ${r.program || ""}${where ? " · " + where : ""}`,
+    return [`${r.state === "PAUSED" ? "❚❚ Paused" : "▶"} program ${r.program || ""}${where ? " · " + where : ""}`,
       r.state === "PAUSED" ? "warn" : "run", "PROGRAMS", ""];
   }
   if (pol.busy) {
     const fb = pol.feedback;
     return pol.current
-      ? [`POLICY ▶ ${pol.current}${fb && fb.elapsed ? " · " + fb.elapsed.toFixed(1) + " s" : ""}`, "run", "AUTOMATION", ""]
-      : ["PREPARING POLICY…", "warn", "AUTOMATION", ""];
+      ? [`▶ Policy ${pol.current}${fb && fb.elapsed ? " · " + fb.elapsed.toFixed(1) + " s" : ""}`, "run", "AUTOMATION", ""]
+      : ["Preparing policy…", "warn", "AUTOMATION", ""];
   }
   if (s.payload && s.payload.running)
-    return [`PAYLOAD CAL ${s.payload.done}/${s.payload.total}`, "run", "SETUP", ""];
+    return [`Payload calibration ${s.payload.done}/${s.payload.total}`, "run", "SETUP", ""];
   if (f && f.active) {
     const w = f.target || [], n = Math.hypot(w[0] || 0, w[1] || 0, w[2] || 0);
-    return [`FORCE ${n.toFixed(1)} N${f.releasing ? " (releasing)" : ""}`, "warn", "OPERATE",
+    return [`Force ${n.toFixed(1)} N${f.releasing ? " (releasing)" : ""}`, "warn", "OPERATE",
       `A force of ${n.toFixed(1)} N is being applied (${s.mode_label}). Release it on OPERATE → Force, or press STOP.`];
   }
-  if (s.freedrive) return ["FREEDRIVE", "warn", "OPERATE", "Freedrive is on: the arm can be moved by hand. End it on OPERATE."];
-  if (s.jog && s.jog.active) return ["JOGGING (Servo)", "run", "OPERATE", ""];
-  if (s.busy) return [`MOVING · ${s.command_source}`, "run", "OPERATE", ""];
-  return ["IDLE", "", null, ""];
+  if (s.freedrive) return ["Freedrive", "warn", "OPERATE", "Freedrive is on: the arm can be moved by hand. End it on OPERATE."];
+  if (s.jog && s.jog.active) return ["Jogging (Servo)", "run", "OPERATE", ""];
+  if (s.busy) return [`Moving · ${s.command_source}`, "run", "OPERATE", ""];
+  return ["Nothing", "idle", null, ""];
 }
 
+// ROBOT in the header: one plain answer (Ready / what is wrong) and a small line saying what to do
+const nice = (x) => { x = String(x || "").replace(/_/g, " ").toLowerCase(); return x.charAt(0).toUpperCase() + x.slice(1); };
+function robotSummary(s, progOff, healthy) {
+  if (s.robot_mode === "?" || !s.robot_mode) return ["No data", "Waiting for the robot", ""];
+  if (!["NORMAL", "REDUCED"].includes(s.safety_mode))
+    return [nice(s.safety_mode), "See the Robot card", "bad"];
+  if (s.robot_mode !== "RUNNING")
+    return [nice(s.robot_mode), s.robot_mode === "POWER_OFF" ? "Power on from the Robot card" : "Release the brakes on the Robot card", "bad"];
+  if (progOff) return [s.program_state === "PAUSED" ? "Pendant program paused" : "Pendant program stopped",
+    `Press ${s.program_state === "PAUSED" ? "Resume" : "Play"} program on the Robot card`, "bad"];
+  return ["Ready", `Running · ${nice(s.safety_mode)}`, healthy ? "ok" : ""];
+}
 function renderHeader(s) {
   // robot_program_running is only published once it changes: no value while RUNNING = External Control never ran
   const progOff = s.program_running === false || (s.program_running == null && s.robot_mode === "RUNNING");
   const healthy = s.robot_mode === "?" ? null : s.robot_mode === "RUNNING" && ["NORMAL", "REDUCED"].includes(s.safety_mode)
     && !progOff;
-  $("#h-state-dot").className = "dot " + (healthy == null ? "" : healthy ? "ok" : "bad");
-  $("#h-state").textContent = `${s.robot_mode} · ${s.safety_mode}` + (!progOff ? "" : s.program_state === "PAUSED"
-    ? " · PROGRAM PAUSED: ▶ Resume program (OPERATE)" : " · PROGRAM STOPPED: ▶ Play program (OPERATE)");
+  const [stTxt, stSub, stCls] = robotSummary(s, progOff, healthy);
+  $("#h-state-dot").className = "dot " + stCls;
+  $("#h-state").textContent = stTxt;
+  $("#h-state").className = "st-" + stCls;
+  $("#h-state-sub").textContent = stSub;
+  $("#h-stategrp").title = `Robot mode ${s.robot_mode} · safety ${s.safety_mode}` +
+    (s.program_running == null ? "" : ` · pendant program ${progOff ? "not running" : "running"}`);
   const m = INFO.modes.find((x) => x.name === s.mode);
-  $("#h-mode").textContent = s.mode_label;
+  $("#h-mode").textContent = m ? m.label : s.mode_label;
+  $("#h-mode").title = s.mode_label;
   $("#h-mode").className = "val " + (s.unknown || s.mode === "unknown" ? "mode-bad" : m && (m.direct_torque || m.experimental) ? "mode-dt" : "");
   $("#h-speed").textContent = s.speed == null ? "—" : (s.speed * 100).toFixed(0) + "%";
   const ovr = $("#h-ovr");
@@ -2924,9 +3055,9 @@ function renderHeader(s) {
     rp.title = `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`;
   }
   const bad = Object.entries(s.connected || {}).filter(([, v]) => !v).map(([k]) => k);
-  $("#h-conn").textContent = bad.length ? "Not connected: " + bad.join(", ") : "All connected";
-  $("#h-conn").style.color = bad.length ? "#e3ae5b" : "";
-  $("#h-state").title = bad.length ? "Not connected: " + bad.join(", ") : "All connected";
+  $("#h-conn").innerHTML = bad.length ? icon("warn") + " " + bad.join(", ") + " off" : "";
+  $("#h-conn").title = bad.length ? "Not connected: " + bad.join(", ") : "";
+  $("#h-conn").hidden = !bad.length;
   document.body.classList.toggle("disconnected-parts", bad.length > 0);
   // TCP select
   const c = s.calibration, key = JSON.stringify([c.tcps, c.active_tcp]);
@@ -2951,7 +3082,8 @@ function renderHeader(s) {
   const L = s.lease;
   // (states sent just before our own takeover still name the old holder: ignore them for 2 s)
   if (L.client && L.client !== MYID && holds && Date.now() - leaseAt > 2000) lostControl(`${L.name} took over`);
-  $("#lease-who").textContent = holds ? `Control: you (${L.name.split(" @ ")[0]})` : L.client ? `Viewing · ${L.name} has control` : "Viewing";
+  $("#lease-who").textContent = holds ? `You (${L.name.split(" @ ")[0]})` : L.client ? `${L.name.split(" @ ")[0]} has control` : "";
+  $("#lease-view").hidden = holds;
   $("#lease-who").title = "Click to change your name";
   $("#lease-who").onclick = () => { operatorName(true); if (holds) takeLease(); };
   document.body.classList.toggle("viewing", !holds);
@@ -2972,7 +3104,8 @@ function renderHeader(s) {
   const inside = s.keepout && s.keepout.inside && s.keepout.inside.length
     ? `The robot is inside keep-out zone ${s.keepout.inside.join(", ")}: MoveIt will refuse every plan. ` +
       "Jog or freedrive out of it, or untick the box in SETUP." : "";
-  const warn = actBanner || inside;
+  // on OPERATE the Arm control card already shows freedrive (with its End button): no banner on top of the views
+  const warn = (s.freedrive && current === "OPERATE" ? "" : actBanner) || inside;
   banner.className = !connected || s.unknown || srvError || netBad ? "on" : warn ? "on warn" : "";
   banner.textContent = !connected ? "Connection to the robot PC lost. Reconnecting… (the robot stops if this browser had control)"
     : netBad ? "Connection problem: the robot PC answers slowly or not at all. Still trying; if it lasts the robot stops and control is released."
@@ -3003,7 +3136,7 @@ function render() {
 async function boot() {
   INFO = await (await fetch("/api/info")).json();
   $("#h-robot").textContent = INFO.robot + (INFO.fake ? "  [FAKE]" : "");
-  $("#h-profile").textContent = `${INFO.ur_type} · ${INFO.robot_ip} · ${INFO.profile}`;
+  $("#h-robot").title = `${INFO.ur_type} · ${INFO.robot_ip} · profile ${INFO.profile}`;
   document.title = `MoveIt GUI — ${INFO.robot}`;
   const nav = $("#nav"), main = $("#main");
   for (const name of Object.keys(pages)) {

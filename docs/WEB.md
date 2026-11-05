@@ -113,6 +113,40 @@ stop of the robot program are on OPERATE › Robot.
   plan's start (program, jog, pendant), drops it and its preview. **▶ Execute plan** sits right under Plan / MoveJ.
 * PENDANT SPEED in the header is the UR speed slider. The driver publishes it in percent; it was shown ×100
   (100 % read "10000%").
+* **Layouts** (`static/views.js`). Layout **1 Main** is the page above and is fixed: Manual, F/T sensor and its
+  chart on the left, the 3D view in the middle, the robot cards on the right. Nothing in it moves or resizes.
+  In every layout, **−** in a card's title folds it to its title. The chart's own button moves it under the 3D view
+  and back (kept per browser). Make your own layouts in SETUP › Layouts (New, Duplicate, rename, Edit, Delete). Two ready-made ones
+  come with it: **2 Force** (chart, one camera, Gripper minimised) and **3 Cameras** (two cameras under the
+  3D view).
+  * With two or more layouts, their numbers show in the top bar to switch. In your own layouts the column buttons
+    beside the numbers hide or show the side columns.
+  * In your own layouts:
+    * Drag any line between windows to resize, including the line under the 3D view.
+    * Windows always fill their space. There are no gaps and no own window sizes.
+    * **Fit to picture** (the frame button in a camera's bar, on by default): the camera window takes its
+      picture's shape. Under the 3D view the row height follows the cameras' width. Beside it the stack width
+      follows the cameras' height. In a side column the height follows the column width. While it fits, the line
+      it sets is off. It falls back to the line (and the picture letterboxes) if fitting would leave the 3D view too
+      little room, or with fit off.
+    * **−** minimises a window to its title bar, in place. Nothing else moves.
+    * F/T sensor › **Chart** opens the chart right under the card (press again to close it). That chart stays
+      attached to the card: it cannot be minimised or dragged, and it moves with the card.
+  * **Edit** (from SETUP) puts a bar in the top bar: name, **+ View**, Reset, Done.
+    * Drag a window by ⠿ to move it above or below another window. Dropping it on the right or bottom edge of the
+      3D view starts a stack there.
+    * Each view is a camera (with its topic menu), the F/T chart, a **Motion planner**, a **Joint chart**, a
+      **Program run**, a **Log** or empty. **×** closes it. There is one of each, except cameras and empty views.
+      * Motion planner: plans Manual's target (its Joints or Pose tab, Speed, Accel), Preview again, Clear,
+        Execute, plus the plans of this session (`static/panels.js`).
+      * Joint chart: the joint angles or speeds over the last 20 s. Click J1–J6 to show or hide one.
+      * Program run: the running program, its step and loop, why it paused, Pause / Resume / Stop.
+      * Log: the last lines of the GUI log, with a filter and "problems only".
+    * The 3D view is pinned: it never moves, minimises or closes.
+    * Window bars show only while editing. Outside edit mode a view looks like any other card.
+  * A small browser window narrows the side columns first, down to 280 px. After that they fold to a strip by
+    themselves and come back when there is room.
+  * Layouts are kept per browser (localStorage `op-layouts1`).
 
 Screenshots: `docs/ux/web_operate_v24_running.png`, `docs/ux/web_operate_v24_power_off.png`.
 
