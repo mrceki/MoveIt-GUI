@@ -8,6 +8,7 @@ import { drivers, driversBadge } from "/static/drivers.js";
 import { workspace } from "/static/views.js";
 import { extraViews } from "/static/panels.js";
 import { icon } from "/static/icons.js";
+import { ask, askText, tell, dismiss } from "/static/dialog.js";
 // short joint names for compact readouts: "shoulder_pan_joint" -> "Shoulder pan"
 const jshort = (n) => { const x = n.replace(/^.*?(shoulder|elbow|wrist)/, "$1").replace(/_joint$/, "").replace(/_/g, " ");
   return x.charAt(0).toUpperCase() + x.slice(1); };
@@ -104,10 +105,10 @@ function gate(el, cond = true) { el.disabled = !(holds && cond); }
 
 // ------------------------------------------------------------------- lease
 // operator name, asked once per browser, so the header says who has control (not just an IP)
-function operatorName(ask) {
+async function operatorName(force) {
   let n = localStorage.getItem("operator") || "";
-  if (!n || ask) {
-    const v = window.prompt("Your name (shown to others as the person controlling the robot):", n);
+  if (!n || force) {
+    const v = (await askText("Your name (shown to others as the person controlling the robot):", n));
     if (v != null) { n = v.trim().slice(0, 24); localStorage.setItem("operator", n); }
   }
   return n;
@@ -121,7 +122,7 @@ function lostControl(why) {
   render();
 }
 async function takeLease() {
-  const r = await post("/api/lease", { name: operatorName(false) });
+  const r = await post("/api/lease", { name: await operatorName(false) });
   holds = !!r.ok;
   if (holds) { TOKEN = r.lease.token; MYID = r.lease.client; hbFailsSince = 0; }
   if (holds) document.querySelectorAll(".toast").forEach((x) => /lost control/.test(x.dataset.msg) && x.remove());
@@ -161,8 +162,8 @@ window.addEventListener("pageshow", (e) => { if (e.persisted) try { sessionStora
 const pages = {};
 let current = "OPERATE";
 
-function confirmMove(text) {
-  return !$("#op-confirm") || !$("#op-confirm").checked || window.confirm(text + "\n\nExecute?");
+async function confirmMove(text) {
+  return !$("#op-confirm") || !$("#op-confirm").checked || (await ask(text + "\n\nExecute?"));
 }
 function scaling() {
   return { vel: Math.min(1, Math.max(0.01, (+$("#op-vel").value || 10) / 100)),
@@ -582,8 +583,8 @@ pages.OPERATE = {
                          linear: $("#op-linear").checked, vel, acc });
     }
   },
-  execute() {
-    if (confirmMove("Execute the previewed plan (" + (S.plan.what || "") + ")")) cmd("plan_execute");
+  async execute() {
+    if (await confirmMove("Execute the previewed plan (" + (S.plan.what || "") + ")")) cmd("plan_execute");
   },
   async refreshPlan(s) {
     if (!s.plan.what && this.planId !== -2) { this.planId = -2; this.view && this.view.clearPreview(); }   // used / gone
@@ -641,7 +642,7 @@ pages.OPERATE = {
     $("#op-motion").classList.toggle("hidden", t === "f" || t === "g");   // Jog has its own speed; a force has none
     if (t !== "g") jogRelease();
   },
-  go() {
+  async go() {
     const { vel, acc } = scaling();
     if (this.mode === "j") {
       const q = INFO.joint_names.map((_, i) => +$(`#op-j${i}`).value);
@@ -650,12 +651,12 @@ pages.OPERATE = {
       const text = "MoveJ" + (this.loadedWp ? ` to ${this.loadedWp}` : "") + " — joints that move:\n" + d.moved.join("\n")
         + (d.big ? `\n\nWARNING: ${d.big} moves more than 30°.` : "") + `\n\nVelocity ${Math.round(vel * 100)} %`;
       // a large move always asks, even with "Confirm moves" off
-      if (d.big ? window.confirm(text + "\n\nExecute?") : confirmMove(text))
+      if (d.big ? (await ask(text + "\n\nExecute?")) : await confirmMove(text))
         cmd("move_joints", { q_deg: q, vel, acc });
     } else {
       const v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-c${i}`).value);
       const frame = $("#op-frame").value, linear = $("#op-linear").checked;
-      if (confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`))
+      if (await confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`))
         cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc });
     }
   },
@@ -670,10 +671,10 @@ pages.OPERATE = {
     $("#op-switchrow").classList.toggle("hidden", !m || pick === cur || fd);
     if (m) $("#op-switch-q").innerHTML = `Switch to <b>${m.label}</b>?` + (m.direct_torque ? ' <span class="badge warn">Direct torque</span>' : "");
   },
-  switchMode() {
+  async switchMode() {
     const name = $("#op-mode").value, m = INFO.modes.find((x) => x.name === name);
     if (!m) return;
-    if (m.direct_torque && !window.confirm(`Enter ${m.label}? This commands DIRECT TORQUE on the robot.`)) return;
+    if (m.direct_torque && !(await ask(`Enter ${m.label}?\n\nThis commands DIRECT TORQUE on the robot.`, { ok: "Enter", danger: true }))) return;
     cmd("switch_mode", { mode: name });
   },
   // Robot power through the UR Dashboard (pendant in Remote Control), as three steps: Power on → Release brakes →
@@ -681,28 +682,28 @@ pages.OPERATE = {
   // the robot PC limits them to its own browser (MOVEIT_GUI_LOCAL_POWER_ONLY): the server checks that too.
   robotCard() {
     const seen = "Check that you can see the robot, nobody is in its reach and the workspace is clear.";
-    this.pOn = btn("Power on", "", () => window.confirm(`Power on the robot?\n\n${seen}`) && cmd("power_on", { seen: true }),
+    this.pOn = btn("Power on", "", async () => (await ask(`Power on the robot?\n\n${seen}`)) && cmd("power_on", { seen: true }),
       "Power on the arm (UR Dashboard). The brakes stay engaged.");
-    this.pBrake = btn("Release brakes", "", () => window.confirm(`Release the brakes?\n\nThe joints move slightly and click.\n${seen}`) &&
+    this.pBrake = btn("Release brakes", "", async () => (await ask(`Release the brakes?\n\nThe joints move slightly and click.\n${seen}`)) &&
       cmd("brake_release", { seen: true }), "Release the brakes: the robot goes to RUNNING");
-    this.pOff = btn("Power off…", "quiet", () => window.confirm("Power off the robot?\n\nGUI motion is stopped first; the brakes engage. " +
+    this.pOff = btn("Power off…", "quiet", async () => (await ask("Power off the robot?\n\nGUI motion is stopped first; the brakes engage. " +
       (INFO.remote_power ? "Power on again here when you can see the robot." :
-      "Powering on again needs a browser on the robot PC or the pendant.")) && cmd("power_off"), "Power off the arm (UR Dashboard)");
+      "Powering on again needs a browser on the robot PC or the pendant."))) && cmd("power_off"), "Power off the arm (UR Dashboard)");
     const play = async () => {
       const paused = S.program_state === "PAUSED";
       const r = await cmd("robot_loaded_program");      // play starts whatever is loaded: show it by name first
       const gui = S.runner && S.runner.state === "PAUSED" && S.runner.pause_reason ? "\nThe paused GUI program carries on with its step." : "";
-      if (r && r.ok && window.confirm(paused ? `Resume ${r.program} on the robot?${gui}` :
+      if (r && r.ok && (await ask(paused ? `Resume ${r.program} on the robot?${gui}` :
         `Start ${r.program} on the robot?\n\nIt must be your External Control program. ` +
-        "Pending GUI motions are cancelled first; the GUI can command the arm once it runs." + gui)) cmd("robot_play", { program: r.program });
+        "Pending GUI motions are cancelled first; the GUI can command the arm once it runs." + gui))) cmd("robot_play", { program: r.program });
     };
     this.pPlay = btn("▶ Play program", "", play,
       "Start the program loaded on the pendant (External Control). In Remote Control the pendant's Play button is disabled.");
     this.pResume = btn("▶ Resume program", "primary", play, "Continue the paused robot program");
     this.pPause = btn("⏸ Pause program", "", () => cmd("robot_pause"),
       "Pause the robot program: the arm halts, power and brakes stay on. A GUI program run pauses with it.");
-    this.pStopProg = btn("■ Stop program", "quiet", () => window.confirm("Stop the robot program?\n\nThe arm halts; power and brakes stay on. " +
-      "▶ Play starts it again from the beginning. A GUI program run pauses and can resume after Play.") && cmd("robot_stop_program"),
+    this.pStopProg = btn("■ Stop program", "quiet", async () => (await ask("Stop the robot program?\n\nThe arm halts; power and brakes stay on. " +
+      "▶ Play starts it again from the beginning. A GUI program run pauses and can resume after Play.")) && cmd("robot_stop_program"),
       "Stop the robot program (power and brakes stay on)");
     const step = (n, b, label) => {
       const el = h("div", { class: "pstep", id: `op-ps${n}` }, h("span", { class: "pnum" }, String(n)),
@@ -1114,8 +1115,8 @@ async function forceApply() {
   const wrench = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-f${i}`).value || 0);
   const frame = $("#op-f-frame").value;
   const verb = S.force.active ? "Change the force to" : "Apply";
-  if (!S.force.active && !window.confirm(`${verb} F = [${wrench.slice(0, 3).join(", ")}] N, ` +
-      `T = [${wrench.slice(3).join(", ")}] Nm (${frame} axes) in ${S.mode_label}?`)) return;
+  if (!S.force.active && !(await ask(`${verb} F = [${wrench.slice(0, 3).join(", ")}] N, ` +
+      `T = [${wrench.slice(3).join(", ")}] Nm (${frame} axes) in ${S.mode_label}?`))) return;
   const r = await cmd("force_apply", { wrench, frame });
   if (!r.ok) return;
   if (!FORCE.timer) FORCE.timer = setInterval(async () => {
@@ -1163,8 +1164,8 @@ pages.PROGRAMS = {
     const top = h("div", { class: "row" },
       h("span", { class: "title", id: "pg-title" }, "untitled"), h("span", { class: "muted", id: "pg-file" }),
       h("div", { class: "grow" }), files,
-      btn("Open", "", () => this.guard("open " + files.value) && this.apply(pcmd("program_open", { name: files.value }))),
-      btn("New", "quiet", () => this.guard("start a new program") && this.apply(pcmd("program_new"))),
+      btn("Open", "", async () => (await this.guard("open " + files.value)) && this.apply(pcmd("program_open", { name: files.value }))),
+      btn("New", "quiet", async () => (await this.guard("start a new program")) && this.apply(pcmd("program_new"))),
       h("input", { type: "text", id: "pg-name", placeholder: "file name", style: "width:140px" }),
       btn("Save", "", async () => { await this.apply(pcmd("program_save", { name: $("#pg-name").value || null })); this.files(); }),
       btn("Check", "quiet", async () => {
@@ -1290,8 +1291,8 @@ pages.PROGRAMS = {
       h("div", { class: "muted small hidden", id: "pg-sc-base-note" }, "Per angle: approach, search the wall, press with the " +
         "force, stroke down and up along the vial axis, release, lift. F/T is zeroed in free air first. Every number stays " +
         "editable as program steps."),
-      btn("Create from current pose", "", () => {
-        if (!this.guard("create a new scraping program")) return;
+      btn("Create from current pose", "", async () => {
+        if (!(await this.guard("create a new scraping program"))) return;
         const v = [...scrape.querySelector(".grid").querySelectorAll("input[type=number]")].map((i) => +i.value);
         const common = { frame: $("#pg-sc-frame").value, step_deg: v[1], count: v[2], approach_mm: v[3],
           back_and_forth: $("#pg-sc-back").checked };
@@ -1344,9 +1345,9 @@ pages.PROGRAMS = {
     if (r.ok) $("#pg-files").replaceChildren(...r.files.map((f) => h("option", { value: f }, f)));
   },
   // unsaved changes: ask before replacing the program
-  guard(what) {
+  async guard(what) {
     return !(this.prog && this.prog.dirty) ||
-      window.confirm(`"${this.prog.name}" has unsaved changes. Discard them and ${what}?`);
+      (await ask(`"${this.prog.name}" has unsaved changes. Discard them and ${what}?`));
   },
   undo(redo) {
     if (holds && S && S.runner.state === "IDLE") this.apply(cmd(redo ? "program_redo" : "program_undo"));
@@ -1699,7 +1700,7 @@ pages.PROGRAMS = {
     if (lines.length) kids.push(h("div", { class: "muted small" }, "Changes apply when you leave a field."));
     if (wp) {
       const set = btn("Set waypoint here", "", async () => {
-        if (!window.confirm(`Re-teach waypoint ${wp.name} from the current robot position? Other steps using it follow.`)) return;
+        if (!(await ask(`Re-teach waypoint ${wp.name} from the current robot position? Other steps using it follow.`))) return;
         this.apply(pcmd("program_set_waypoint", { path: row.path }));
       }, "Re-teach this waypoint from the robot's current position");
       const here = holdButton("Hold: Move here", () => {
@@ -1715,17 +1716,17 @@ pages.PROGRAMS = {
   move(d) { if (this.path) this.apply(pcmd("program_move_step", { path: this.path, delta: d })).then((r) => r.ok && r.selected === undefined && this.moved(d)); },
   moved(d) { const p = [...this.path]; p[p.length - 1] += d; this.path = p; this.display(this.prog); },
   dup() { if (this.path) this.apply(pcmd("program_duplicate", { path: this.path })); },
-  del() {
+  async del() {
     const r = this.row();
     if (!r) return;
     const kids = this.prog.rows.filter((x) => x.path.length > r.path.length && pathEq(x.path.slice(0, r.path.length), r.path)).length;
-    if (kids && !window.confirm(`Delete ${r.label} ${r.title} and the ${kids} command(s) inside it? (Undo brings it back.)`)) return;
+    if (kids && !(await ask(`Delete ${r.label} ${r.title} and the ${kids} command(s) inside it? (Undo brings it back.)`))) return;
     this.apply(pcmd("program_delete_step", { path: this.path }));
   },
-  run(step) {
+  async run(step) {
     const start = $("#pg-from").checked && this.path ? this.path : null;
     if (S.runner.state === "PAUSED") return pcmd("program_resume", { step_mode: step });
-    if (!INFO.fake && !step && !window.confirm(`Run ${this.prog?.name || "program"} on the robot${start ? " from step " + this.row()?.label : ""}?`)) return;
+    if (!INFO.fake && !step && !(await ask(`Run ${this.prog?.name || "program"} on the robot${start ? " from step " + this.row()?.label : ""}?`))) return;
     pcmd("program_run", { start, step_mode: step, loop: $("#pg-loop").checked });
   },
   update(s) {
@@ -1819,9 +1820,9 @@ pages.AUTOMATION = {
       (p.tcp ? ` · TCP ${p.tcp}` : "");
     this.reqT = 0;
   },
-  run() {
+  async run() {
     const p = INFO.policies.find((x) => x.name === this.sel), m = INFO.modes.find((x) => x.name === p.mode);
-    if (!INFO.fake && !window.confirm(`Run ${p.name} on the robot?` + (m && m.direct_torque ? "\n\nThis commands DIRECT TORQUE." : ""))) return;
+    if (!INFO.fake && !(await ask(`Run ${p.name} on the robot?` + (m && m.direct_torque ? "\n\nThis commands DIRECT TORQUE." : "")))) return;
     cmd("policy_run", { name: this.sel, recording: this.rec() });
   },
   async requirements() {
@@ -1838,7 +1839,7 @@ pages.AUTOMATION = {
       if (q.fix) {
         fix = btn(q.fix.label, "fix", async () => {
           if (q.fix.page) { if (q.fix.hint) toast(q.fix.hint, true); return navTo(q.fix.page); }
-          if (q.fix.confirm && !window.confirm(q.fix.confirm)) return;
+          if (q.fix.confirm && !(await ask(q.fix.confirm))) return;
           await cmd(q.fix.cmd, q.fix.args);
           this.reqT = 0;
         });
@@ -1965,10 +1966,10 @@ pages.SETUP = {
         note("XY circle in the base frame.", "XY circle in the base frame, assuming a level rim and a vertical vial. Without a bottom touch, Z is the lowest rim point."),
         h("div", { class: "row" }, h("input", { type: "text", id: "su-vname", value: "vial", style: "flex:1" }),
           btn("Save as fixture", "primary", () => cmd("vial_save", { name: $("#su-vname").value }))),
-        h("div", { class: "row" }, btn("Save as vial profile…", "", () => {
-          const n = window.prompt("Name of this vial (e.g. 'vial A', 'rack 2'). It is kept in the vial profiles list:", "");
+        h("div", { class: "row" }, btn("Save as vial profile…", "", async () => {
+          const n = (await askText("Name of this vial (e.g. 'vial A', 'rack 2'). It is kept in the vial profiles list:", ""));
           if (n) cmd("vial_profile_save", { name: n, source: "touch", fixture: $("#su-vname").value || "vial",
-            use: window.confirm(`Also use it as "${$("#su-vname").value || "vial"}" now (the frame programs use)?`) })
+            use: (await ask(`Also use it as "${$("#su-vname").value || "vial"}" now (the frame programs use)?`)) })
             .then((r) => r.ok && this.vialProfiles(r.vials));
         }, "Keep the fitted vial as a named profile, to switch back to it later"))),
       // several vials: named profiles (built-in baseline = scraping.py's), one of them is the fixture programs use
@@ -1989,9 +1990,9 @@ pages.SETUP = {
             xyz_mm: ["x", "y", "z"].map((a) => +$(`#su-vp-${a}`).value), radius_mm: $("#su-vp-r").value || null,
             height_mm: $("#su-vp-h").value || null }).then((r) => r.ok && this.vialProfiles(r.vials)),
             "A vial whose position you know: centre of its bottom in the robot base frame"),
-          btn("Save current fixture…", "quiet", () => {
+          btn("Save current fixture…", "quiet", async () => {
             const f = $("#su-vp-as").value || "vial";
-            const n = window.prompt(`Save the fixture "${f}" as a vial profile named:`, "");
+            const n = (await askText(`Save the fixture "${f}" as a vial profile named:`, ""));
             if (n) cmd("vial_profile_save", { name: n, source: "fixture", fixture: f }).then((r) => r.ok && this.vialProfiles(r.vials));
           }, "Keep the vial that is taught now (e.g. before teaching another one)")),
         note("Use makes a profile the fixture (\"vial\") that programs, keep-out boxes and the preview use.",
@@ -2043,16 +2044,16 @@ pages.SETUP = {
             "Move to the selected pose (the blue ghost) and sample the F/T there. Only this pose"); b.id = "su-pcollect"; return b; })(),
           h("span", { class: "muted", id: "su-pstat" })),
         h("div", { class: "row" },
-          (() => { const b = btn("Collect all poses", "", () => {
+          (() => { const b = btn("Collect all poses", "", async () => {
             const p = S && S.payload, n = p ? p.poses.length : 0;
-            if (INFO.fake || window.confirm(`Move through all ${n} calibration poses in order and evaluate?\n\n` +
+            if (INFO.fake || (await ask(`Move through all ${n} calibration poses in order and evaluate?\n\n` +
                 "This starts over (collected poses are cleared). Check the poses with ◀ ▶ first and that the " +
-                "workspace is clear. Keep a hand near STOP."))
+                "workspace is clear. Keep a hand near STOP.")))
               cmd("payload_collect");
           }, "Start over and collect every pose in order, then evaluate"); b.id = "su-pall"; return b; })(),
           (() => { const b = btn("Evaluate", "", () => cmd("payload_evaluate"),
             "Fit mass and CoG from the poses collected so far (3 or more; more and more different is better)"); b.id = "su-peval"; return b; })(),
-          (() => { const b = btn("Start over", "quiet", () => window.confirm("Clear the collected poses?") && cmd("payload_reset"),
+          (() => { const b = btn("Start over", "quiet", async () => (await ask("Clear the collected poses?")) && cmd("payload_reset"),
             "Clear every collected pose"); b.id = "su-preset"; return b; })()),
         note("One pose at a time (select, check the ghost, Move & collect), or Collect all poses.", "Click a pose or use ◀ ▶: the blue " +
           "ghost shows it and nothing moves. Move & collect goes there with MoveIt at 10% (GUI SPEED applies), " +
@@ -2078,7 +2079,7 @@ pages.SETUP = {
     this.views["F/T + Payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
     this.views["Controller gains"] = this.buildGains();
     // Drivers & cameras: drivers.js
-    this.dr = drivers({ h, btn, note, cmd, toast, lease: (b) => { b.dataset.lease = "1"; return b; } });
+    this.dr = drivers({ h, btn, note, cmd, toast, ask, lease: (b) => { b.dataset.lease = "1"; return b; } });
     this.views["Drivers & cameras"] = this.dr.view;
     // one 3D view for the pages that place things in space: the live robot and what the page edits
     this.sv = h("div", { class: "card su-v3card" },
@@ -2087,7 +2088,7 @@ pages.SETUP = {
       h("div", { class: "view3d su-v3", id: "su-v3" }, h("div", { class: "muted v3msg", id: "su-v3-msg" }, "Loading the robot model…")));
     // Parts, Camera calibration, Setups: workcell.js
     const lease = (b) => { b.dataset.lease = "1"; return b; };
-    this.wc = workcell({ h, btn, note, cmd, post, $, toast, lease, freedriveButton, fake: () => INFO.fake });
+    this.wc = workcell({ h, btn, note, cmd, post, $, toast, ask, askText, lease, freedriveButton, fake: () => INFO.fake });
     const pt = this.wc.buildParts(() => this.svPaint(true)), hc = this.wc.buildCalib(), st = this.wc.buildSetups();
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
     this.views["Camera calibration"] = h("div", { class: "cols" }, hc.left, hc.right);
@@ -2159,12 +2160,12 @@ pages.SETUP = {
     this.pGhost(); this.update(S);
   },
   pStop() {},
-  pCollect() {
+  async pCollect() {
     const p = S && S.payload;
     if (!p || this.pPick == null) return;
     const name = p.poses[this.pPick];
-    if (INFO.fake || window.confirm(`Move to "${name}" (the blue ghost) and collect it?\n\nCheck that the path ` +
-        "from where the arm is now is clear. Keep a hand near STOP."))
+    if (INFO.fake || (await ask(`Move to "${name}" (the blue ghost) and collect it?\n\nCheck that the path ` +
+        "from where the arm is now is clear. Keep a hand near STOP.")))
       cmd("payload_collect", { index: this.pPick });
   },
   show(n) {
@@ -2221,7 +2222,7 @@ pages.SETUP = {
       h("div", { class: "row" },
         this.gRestore = btn("Restore saved", "", () => cmd("gains_restore", { mode: this.gMode }).then((r) => r.ok && setTimeout(() => this.gLoad(true), 700)),
           "Put the saved values on the controller now (ramped if it is active)"),
-        this.gForget = btn("Forget saved", "quiet", () => window.confirm("Forget the saved values? The controller keeps its current values until it restarts, then its YAML values come back.") &&
+        this.gForget = btn("Forget saved", "quiet", async () => (await ask("Forget the saved values? The controller keeps its current values until it restarts, then its YAML values come back.")) &&
           cmd("gains_forget", { mode: this.gMode }).then(() => this.gLoad(true)))),
       h("details", {}, h("summary", { class: "muted small" }, "Show as controller YAML"), this.gYaml));
     return h("div", { class: "cols" }, left, right);
@@ -2336,7 +2337,7 @@ pages.SETUP = {
       return `${row.label}: ${r.old[k].map(String).join(", ")}  →  ${r.new[k].map(String).join(", ")}`;
     });
     if (!lines.length) return toast("nothing changed", true);
-    if (!window.confirm(`Set on ${this.gData.modes[this.gMode].node}:\n\n${lines.join("\n")}\n\n${r.warnings.join("\n")}`)) return;
+    if (!(await ask(`Set on ${this.gData.modes[this.gMode].node}:\n\n${lines.join("\n")}\n\n${r.warnings.join("\n")}`))) return;
     const a = await cmd("gains_apply", { mode: this.gMode, values });
     if (a.ok) { this.gPending = true; setTimeout(() => this.gLoad(true), 700); }
   },
@@ -2345,14 +2346,14 @@ pages.SETUP = {
     if (p) { this.gFill(p.values); toast(`preset ${this.gPreset.value} loaded into the table: Apply to use it`, true); }
   },
   async gSavePreset() {
-    const name = window.prompt("Preset name (saves the table as shown):", this.gPreset.value || "");
+    const name = (await askText("Preset name (saves the table as shown):", this.gPreset.value || ""));
     if (!name) return;
     const r = await cmd("gains_preset_save", { name, mode: this.gMode, values: this.gValues(false) });
     if (r.ok) { this.gData.presets = r.presets; this.gRender(); }
   },
   async gDelPreset() {
     const n = this.gPreset.value;
-    if (!n || !window.confirm(`Delete preset ${n}?`)) return;
+    if (!n || !(await ask(`Delete preset ${n}?`))) return;
     const r = await cmd("gains_preset_delete", { name: n });
     if (r.ok) { this.gData.presets = r.presets; this.gRender(); }
   },
@@ -2385,12 +2386,12 @@ pages.SETUP = {
       h("td", { class: "num" }, e.height_mm != null ? (+e.height_mm).toFixed(1) : "—"),
       h("td", { class: "muted small" }, (e.builtin ? "built in · " : "") + (e.source || "") + (e.saved ? " · " + e.saved : "")),
       h("td", { class: e.in_use_as.length ? "good" : "muted" }, e.in_use_as.join(", ") || "—"),
-      h("td", {}, (() => { const b = btn("Use", "primary", () => {
-          if (window.confirm(`Use vial profile "${e.name}" as "${as()}"?\n\nCentre ${e.xyz_mm.join(", ")} mm in ${INFO.base_link}` +
-              (e.builtin ? `\n(${e.source}: only right if your vial is really there)` : "") + "\n\nPrograms move relative to it.")) 
+      h("td", {}, (() => { const b = btn("Use", "primary", async () => {
+          if ((await ask(`Use vial profile "${e.name}" as "${as()}"?\n\nCentre ${e.xyz_mm.join(", ")} mm in ${INFO.base_link}` +
+              (e.builtin ? `\n(${e.source}: only right if your vial is really there)` : "") + "\n\nPrograms move relative to it."))) 
             cmd("vial_profile_use", { name: e.name, fixture: as() }).then((r) => { if (r.ok) { this.vialProfiles(r.vials); this.svPaint(true); } });
         }, `Make "${e.name}" the fixture programs use`); b.dataset.lease = "1"; return b; })(),
-        e.builtin ? "" : (() => { const b = btn("Delete", "quiet", () => window.confirm(`Delete vial profile "${e.name}"? Fixtures made from it stay.`) &&
+        e.builtin ? "" : (() => { const b = btn("Delete", "quiet", async () => (await ask(`Delete vial profile "${e.name}"? Fixtures made from it stay.`)) &&
           cmd("vial_profile_delete", { name: e.name }).then((r) => r.ok && this.vialProfiles(r.vials))); b.dataset.lease = "1"; return b; })()))));
   },
   // ---- keep-out zones
@@ -2459,8 +2460,8 @@ pages.SETUP = {
       const en = h("input", { type: "checkbox", checked: b.enabled, title: "Enabled: MoveIt plans around it",
         onchange: (e) => cmd("keepout_enable", { name: b.name, enabled: e.target.checked }).then((r) => { if (!r.ok) e.target.checked = !e.target.checked; }) });
       gate(en, s.idle);
-      const ed = btn("Edit", "quiet", () => this.koForm(b)), del = btn("Delete", "quiet", () =>
-        window.confirm(`Delete keep-out box ${b.name}? MoveIt will plan through that space again.`) && cmd("keepout_delete", { name: b.name }));
+      const ed = btn("Edit", "quiet", () => this.koForm(b)), del = btn("Delete", "quiet", async () =>
+        (await ask(`Delete keep-out box ${b.name}? MoveIt will plan through that space again.`)) && cmd("keepout_delete", { name: b.name }));
       gate(del, s.idle);
       const where = b.error ? h("span", { class: "error" }, b.error)
         : `${b.size_mm.join(" × ")} mm · centre ${b.xyz_mm.join(", ")} mm` + (b.rpy_deg.some((v) => v) ? ` · ${b.rpy_deg.join(", ")} °` : "") + ` in ${b.frame}`;
@@ -2494,10 +2495,10 @@ pages.SETUP = {
       : "Rotation of the TCP from its parent (0 0 0 = the same axes).";
     if (k === "pivot") this.pivotCmd("pivot_get"); else gate($("#su-t-save"), true);
   },
-  saveTcp() {
+  async saveTcp() {
     const name = $("#su-tn").value.trim(), v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#su-to${i}`).value);
     const exists = S.calibration.tcps.some((t) => t.name === name && !t.builtin);
-    if (exists && !window.confirm(`Change TCP ${name}? Poses taught with it will now mean a different tool point.`)) return;
+    if (exists && !(await ask(`Change TCP ${name}? Poses taught with it will now mean a different tool point.`))) return;
     cmd("tcp_save", { name, parent: $("#su-tp").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), replace: exists });
   },
   async pivotCmd(command, args = {}) {
@@ -2516,11 +2517,11 @@ pages.SETUP = {
       : "";
     if (this.tcpHow === "pivot") gate($("#su-t-save"), !!r);
   },
-  pivotSave() {
+  async pivotSave() {
     if (!this.pivot?.result) return;
     const name = $("#su-tn").value.trim();
     const existing = S.calibration.tcps.some(t => t.name === name);
-    if (existing && !window.confirm(`Replace TCP ${name}? Previously taught poses will use the new offset.`)) return;
+    if (existing && !(await ask(`Replace TCP ${name}? Previously taught poses will use the new offset.`))) return;
     cmd("pivot_save", { name, replace: existing, rpy_deg: [3, 4, 5].map(i => +$(`#su-to${i}`).value) });
   },
   // F/T bias: software offsets on the F/T broadcaster (the ATI box itself is never biased)
@@ -2545,10 +2546,10 @@ pages.SETUP = {
     B.use = lb(btn("Use", "", () => this.biasUse(), "Apply the selected set"));
     B.load = btn("Edit", "quiet", () => { const p = this.S_fb.presets[B.presetSel.value]; if (p) this.biasFill(p.bias); },
       "Copy the selected set into the fields (not applied)");
-    B.del = btn("Delete", "quiet", () => B.presetSel.value && window.confirm(`Delete the F/T bias set '${B.presetSel.value}'?`) &&
+    B.del = btn("Delete", "quiet", async () => B.presetSel.value && (await ask(`Delete the F/T bias set '${B.presetSel.value}'?`)) &&
       cmd("ft_bias_preset_delete", { name: B.presetSel.value }));
-    B.save = btn("Save fields as set…", "quiet", () => {
-      const name = window.prompt("Name of this F/T bias set (e.g. 'gripper, no part'):", "");
+    B.save = btn("Save fields as set…", "quiet", async () => {
+      const name = (await askText("Name of this F/T bias set (e.g. 'gripper, no part'):", ""));
       if (name) cmd("ft_bias_preset_save", { name, bias: this.biasFields() });
     });
     B.del.dataset.lease = B.save.dataset.lease = "1";
@@ -2589,29 +2590,29 @@ pages.SETUP = {
     return p && p.applied ? "\n\nThe admittance gravity compensation was set from a payload calibration with the " +
       "current bias: after this change it no longer matches. Re-run the calibration, or switch back." : "";
   },
-  biasZero(all) {
+  async biasZero(all) {
     const what = all ? "Zero ALL of the F/T reading at the current load, tool weight included?" + this.biasWarn()
       : "Zero the F/T drift?\n\nIf a payload is loaded on the admittance controller, the reading keeps that tool " +
         "weight and only the drift is removed; the gravity compensation stays valid.";
-    if (window.confirm(what + "\n\nDo not touch the tool; the arm must be still for 1 s. The bias is software only " +
-        "(the ATI box is not biased) and Clear (raw) undoes it."))
+    if ((await ask(what + "\n\nDo not touch the tool; the arm must be still for 1 s. The bias is software only " +
+        "(the ATI box is not biased) and Clear (raw) undoes it.")))
       cmd("ft_bias_zero", all ? { plain: true } : {});
   },
-  biasClear() {
-    if (window.confirm("Clear the F/T bias? The reading becomes the raw sensor values." + this.biasWarn()))
+  async biasClear() {
+    if ((await ask("Clear the F/T bias? The reading becomes the raw sensor values." + this.biasWarn())))
       cmd("ft_bias_clear");
   },
-  biasSet(b, what) {
+  async biasSet(b, what) {
     const v = b || this.biasFields();
     const txt = `F [${v.slice(0, 3).join(", ")}] N, T [${v.slice(3).join(", ")}] Nm`;
-    if (window.confirm(`Set the F/T bias to ${what ? what + ": " : ""}${txt}?\n\nThe reading becomes raw − bias.` + this.biasWarn()))
+    if ((await ask(`Set the F/T bias to ${what ? what + ": " : ""}${txt}?\n\nThe reading becomes raw − bias.` + this.biasWarn())))
       cmd("ft_bias_set", { bias: v });
   },
-  biasUse() {
+  async biasUse() {
     const n = this.fb.presetSel.value, p = n && this.S_fb.presets[n];
     if (!p) return;
     const v = p.bias, txt = `F [${v.slice(0, 3).join(", ")}] N, T [${v.slice(3).join(", ")}] Nm`;
-    if (window.confirm(`Use the F/T bias set '${n}': ${txt}?` + this.biasWarn())) cmd("ft_bias_use", { name: n });
+    if ((await ask(`Use the F/T bias set '${n}': ${txt}?` + this.biasWarn()))) cmd("ft_bias_use", { name: n });
   },
   biasUpdate(s) {
     const f = s.ft_bias, B = this.fb;
@@ -2686,11 +2687,11 @@ pages.SETUP = {
     $("#su-psaved-note").textContent = f && f.path ? `Calibration files: ${f.count} in ${f.path.replace(/\/[^/]*$/, "")}. ` +
       "The payload is restored on the controller before every switch to Admittance; the bias after a stack restart." : "";
   },
-  applyPayload() {
+  async applyPayload() {
     const r = S.payload && S.payload.result;
     if (!r) return;
     const off = r.offset_n != null ? `\n\nThe fit found a sensor offset of ${r.offset_n.toFixed(2)} N, which the controller cannot remove. Keep ATI hardware biasing off, and keep the F/T bias (above) as it is now.` : "";
-    if (window.confirm(`Set the admittance gravity compensation to ${r.mass.toFixed(3)} kg at ${r.cog.map((c) => (c * 1000).toFixed(1)).join(", ")} mm?` + off))
+    if ((await ask(`Set the admittance gravity compensation to ${r.mass.toFixed(3)} kg at ${r.cog.map((c) => (c * 1000).toFixed(1)).join(", ")} mm?` + off)))
       cmd("payload_apply");
   },
   // the small status after each menu item, and the robot-model bar
@@ -2743,8 +2744,8 @@ pages.SETUP = {
           h("div", { class: "grow" }, h("div", {}, t.name + (t.builtin ? "" : " · virtual")),
             t.parent ? h("div", { class: "muted small" }, `${t.xyz_mm.join(", ")} mm · ${t.rpy_deg.join(", ")} ° from ${t.parent}`) : null),
           t.builtin ? null : (() => { const b = btn("Edit", "quiet", () => this.editTcp(t)); gate(b); return b; })(),
-          t.builtin ? null : (() => { const b = btn("Delete", "quiet", () =>
-            window.confirm(`Delete TCP ${t.name}? Program poses that use it will not run.`) && cmd("tcp_delete", { name: t.name })); gate(b, s.idle); return b; })(),
+          t.builtin ? null : (() => { const b = btn("Delete", "quiet", async () =>
+            (await ask(`Delete TCP ${t.name}? Program poses that use it will not run.`)) && cmd("tcp_delete", { name: t.name })); gate(b, s.idle); return b; })(),
           t.name === c.active_tcp ? h("span", { class: "badge" }, "ACTIVE")
             : (() => { const b = btn("Set active", "quiet", () => cmd("set_tcp", { name: t.name })); gate(b); return b; })())));
         const sel = $("#su-tp"), cur = sel.value;
@@ -3085,7 +3086,7 @@ function renderHeader(s) {
   $("#lease-who").textContent = holds ? `You (${L.name.split(" @ ")[0]})` : L.client ? `${L.name.split(" @ ")[0]} has control` : "";
   $("#lease-view").hidden = holds;
   $("#lease-who").title = "Click to change your name";
-  $("#lease-who").onclick = () => { operatorName(true); if (holds) takeLease(); };
+  $("#lease-who").onclick = async () => { await operatorName(true); if (holds) takeLease(); };
   document.body.classList.toggle("viewing", !holds);
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
   $("#lease-btn").className = "btn " + (holds ? "quiet" : "primary");

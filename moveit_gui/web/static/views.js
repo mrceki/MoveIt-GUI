@@ -11,6 +11,7 @@
 // or onto the right or bottom edge of the 3D view. The switcher (numbers) is in the top bar when there are two or
 // more layouts. Kept per browser (localStorage "op-layouts1").
 import { icon } from "/static/icons.js";
+import { ask } from "/static/dialog.js";
 
 const KEY = "op-layouts1";
 const MAIN_H = 560;
@@ -706,8 +707,10 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
           h("button", { class: "btn", type: "button", title: "Open it in OPERATE to move, add or close windows",
             onclick: () => { if (W.cur !== i) { tiles.forEach(stopCam); tiles = new Map(); W.cur = i; } W.edit = true; save(); onEdit && onEdit(); } }, "Edit"),
           h("button", { class: "btn quiet", type: "button", title: "Delete this layout",
-            onclick: () => {
-              if (!window.confirm(`Delete layout ${i + 1} "${x.name}"?`)) return;
+            onclick: async () => {
+              if (!(await ask(`Delete layout ${i + 1} "${x.name}"?`, { ok: "Delete", danger: true }))) return;
+              i = W.list.indexOf(x);
+              if (i < 0) return;
               W.list.splice(i, 1);
               if (W.cur === i) { tiles.forEach(stopCam); tiles = new Map(); W.cur = 0; } else if (W.cur > i) W.cur--;
               save(); draw(); renderHeader();

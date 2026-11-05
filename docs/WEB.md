@@ -99,6 +99,10 @@ Still desktop-only: pivot calibration of TCPs, the fixture wizard, the detailed 
 transition view, and the other UR dashboard commands (unlock protective stop, restart safety, popups). Play / pause /
 stop of the robot program are on OPERATE › Robot.
 
+Questions ("Delete …?", "Power on the robot?", names) are the GUI's own pop-ups (`static/dialog.js`), not the
+browser's. Enter answers OK, Esc or a click outside answers Cancel. A question that deletes, forgets or clears has a
+red button named after it.
+
 ## OPERATE layout
 
 * Left: **Manual** (Joint / Cartesian / Jog / Force; target fields with the current value next to them; why a move

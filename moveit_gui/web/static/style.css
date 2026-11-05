@@ -832,3 +832,16 @@ body:not(.ledit) .lws .ltile > .lbody > .xview { padding: 2px 0 0; }
 .lstack.right { overflow-y: auto; }
 .xj-chips .ftc-chip { padding: 0 6px; font-size: 11px; min-height: 20px; }
 .xj-top .tseg button { padding: 1px 8px; font-size: 11.5px; }
+
+/* the GUI's own pop-ups (dialog.js) */
+.dlg-back { position: fixed; inset: 0; z-index: 2000; background: rgba(20, 24, 30, .38); display: flex; align-items: flex-start;
+  justify-content: center; padding-top: 14vh; animation: dlg-in .12s ease-out; }
+.dlg { background: var(--raised); border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.28); width: min(460px, calc(100vw - 32px));
+  padding: 18px 20px 14px; display: flex; flex-direction: column; gap: 10px; border-top: 4px solid var(--accent); }
+.dlg.danger { border-top-color: var(--danger); }
+.dlg-title { font-weight: 650; font-size: 15px; line-height: 1.35; white-space: pre-line; }
+.dlg-text { color: var(--text2); font-size: 13px; line-height: 1.5; white-space: pre-line; max-height: 50vh; overflow: auto; }
+.dlg-input { width: 100%; font-size: 14px; padding: 6px 8px; }
+.dlg-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.dlg-btns .btn { min-width: 84px; }
+@keyframes dlg-in { from { opacity: 0; } to { opacity: 1; } }
