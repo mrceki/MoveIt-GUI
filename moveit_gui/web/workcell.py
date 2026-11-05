@@ -6,6 +6,7 @@ payload calibration: claimed with core.begin_motion, refused unless idle in a Mo
 from __future__ import annotations
 
 import base64
+import os
 import re
 import threading
 import time
@@ -17,6 +18,7 @@ import numpy as np
 from .. import bases as B
 from .. import handeye as he
 from .. import parts as P
+from .. import services as SV
 from .. import transforms as tf
 from ..calibration import TcpDef, config_dir
 from ..setups import Setups, members as S_members
@@ -43,6 +45,7 @@ class WorkcellCommands:
         self._tcp_checked = None
         self._collision_jobs: Dict[str, dict] = {}
         self._restore_auto_collisions()
+        self._drivers_init()
         self.he: dict = {"topic": "", "info_topic": "", "mount": "eye_in_hand", "K": None, "D": None,
                          "frame": "", "samples": [], "result": None, "poses": [], "last": None,
                          "progress": {"running": False, "done": 0, "total": 0, "error": ""}}
@@ -172,6 +175,7 @@ class WorkcellCommands:
                        "solved": self.he["result"] is not None},
                 "restarting": self.restart_code, "model_rev": self.model_rev,
                 "cams_n": len(self.cams.cameras),
+                "drivers": self.drivers_state(),
                 "setup": self._setup_summary(), "base_next": self._base_next()}
 
     def _base_next(self) -> str:
@@ -181,6 +185,66 @@ class WorkcellCommands:
             return v["next"] if v.get("next") and v["next"] != v.get("running") else ""
         except Exception:
             return ""
+
+    # ------------------------------------------------------------------ drivers & pipelines (services.py)
+    def _drivers_init(self):
+        c, prof = self.core, self.core.profile.name
+        here = config_dir() / "services"
+        run = here / "run" if c.fake else Path("/tmp/moveit_gui_services") / prof   # /tmp: gone with the container
+        logs = Path(os.environ["MOVEIT_GUI_LOG_DIR"]) / "services" if os.environ.get("MOVEIT_GUI_LOG_DIR") \
+            else here / "logs"
+        b = c.bridge
+        self.drivers = SV.Services(here / f"{prof}.yaml", run, logs,
+                                   spawn=SV.spawn_fake if c.fake else SV.spawn_process,
+                                   have=(lambda pkg: True) if c.fake else SV.have_package,
+                                   publishers=b.topic_publishers, on_change=self._driver_changed if c.fake else None,
+                                   log=b.log)
+
+    def _driver_changed(self, s, up: bool):
+        """Fake mode: a started fake driver 'publishes' its outputs, so the page and the preview work."""
+        b = self.core.bridge
+        for o in s.outputs():
+            if o["image"]:
+                (b.fake_cameras.__setitem__(o["topic"], ("rgb8", 640, 480, 15.0)) if up
+                 else b.fake_cameras.pop(o["topic"], None))
+            else:
+                (b.fake_published.add if up else b.fake_published.discard)(o["topic"])
+
+    def drivers_state(self) -> list:
+        """Small, in every state: [{name, kind, state, msg}] (the full view is drivers_get)."""
+        return [{k: r[k] for k in ("name", "kind", "state", "msg")} for r in self.drivers.view()["services"]]
+
+    def drivers_stop_all(self, wait: float = 6.0):
+        """The GUI closes: stop the drivers, except on a GUI-only restart (the next GUI adopts them)."""
+        if self.restart_code == RESTART_GUI:
+            return
+        self.drivers.stop_all(wait=wait)
+
+    def cmd_drivers_get(self):
+        return self._ok(**self.drivers.view(), types=SV.Services.types_view(self.drivers.have), kinds=SV.KINDS)
+    cmd_drivers_get.read_only = True
+
+    def cmd_drivers_save(self, service, replace=None):
+        s = self.drivers.save(dict(service or {}), replace or None)
+        return self._ok(f"{s.name} saved", **self.drivers.view())
+
+    def cmd_drivers_delete(self, name):
+        self.drivers.delete(str(name))
+        return self._ok(f"{name} deleted", **self.drivers.view())
+
+    def cmd_drivers_start(self, name):
+        return self._ok(self.drivers.start(str(name)), **self.drivers.view())
+
+    def cmd_drivers_stop(self, name):
+        return self._ok(self.drivers.stop(str(name)), **self.drivers.view())
+
+    def cmd_drivers_autostart(self, name, on=True):
+        self.drivers.set_autostart(str(name), bool(on))
+        return self._ok(f"{name}: {'starts' if on else 'does not start'} with the GUI", **self.drivers.view())
+
+    def cmd_drivers_log(self, name, lines=60):
+        return self._ok(**self.drivers.log_tail(str(name), max(5, min(400, int(lines)))))
+    cmd_drivers_log.read_only = True
 
     # ------------------------------------------------------------------ parts
     def _robot_links(self) -> set:
@@ -579,6 +643,12 @@ class WorkcellCommands:
         r = h["result"]
         cams = [{"name": c.get("name", c["topic"]), "topic": c["topic"], "info": c.get("info", "")}
                 for c in self.core.profile.cameras if not str(c.get("topic", "")).endswith(("depth", "depth_registered"))]
+        mine = []                                          # colour pictures of SETUP > Drivers & cameras first
+        for d in self.drivers.view()["services"]:
+            info = next((o["topic"] for o in d["outputs"] if o["topic"].endswith("camera_info")), "")
+            mine += [{"name": f"{d['name']} ({o['label']})", "topic": o["topic"], "info": info} for o in d["outputs"]
+                     if o["image"] and info and "depth" not in o["topic"]]
+        cams = mine + [c for c in cams if all(m["topic"] != c["topic"] for m in mine)]
         res = None
         if r:
             xyz, rpy = tf.T_to_mm_deg(r["X"])

@@ -4,6 +4,7 @@
 
 import { jointMonitor, ftChart } from "/static/monitors.js";
 import { workcell } from "/static/workcell.js";
+import { drivers, driversBadge } from "/static/drivers.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 function h(tag, props = {}, ...kids) {
@@ -1784,7 +1785,7 @@ pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
   GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry"]],
-    ["Cell", ["Keep-out zones", "Cameras", "Controller gains"]]],
+    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]]],
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
       ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
@@ -1966,18 +1967,9 @@ pages.SETUP = {
     this.pcols = this.views["F/T + Payload"];
     this.views["F/T + Payload"] = h("div", { class: "col" }, this.buildBias(), this.pcols);
     this.views["Controller gains"] = this.buildGains();
-    // Cameras
-    this.views["Cameras"] = h("div", { class: "cols" },
-      h("div", { class: "card", style: "width:300px" }, h("div", { class: "section" }, "Cameras"),
-        h("div", { class: "list", id: "su-cams" }),
-        h("div", { class: "section" }, "Any image topic"),
-        h("input", { type: "text", id: "su-topic", list: "su-topics", placeholder: "/camera/…/image_raw",
-                     onchange: (e) => this.watch(e.target.value.trim()) }),
-        h("datalist", { id: "su-topics" }),
-        h("div", {}, btn("Rescan topics", "quiet", () => this.camStatus(true)))),
-      h("div", { class: "card grow" }, h("div", { class: "row" }, h("span", { class: "title grow", id: "su-camtitle" }, "No topic selected")),
-        h("div", { class: "secondary", id: "su-caminfo" }),
-        h("div", { class: "cam", id: "su-cam" }, "Select a camera")));
+    // Drivers & cameras: drivers.js
+    this.dr = drivers({ h, btn, note, cmd, toast, lease: (b) => { b.dataset.lease = "1"; return b; } });
+    this.views["Drivers & cameras"] = this.dr.view;
     // one 3D view for the pages that place things in space: the live robot and what the page edits
     this.sv = h("div", { class: "card su-v3card" },
       h("div", { class: "row" }, h("span", { class: "section grow", style: "margin:0" }, "3D view"),
@@ -2077,7 +2069,7 @@ pages.SETUP = {
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
     } else this.body.replaceChildren(this.views[n]);
-    if (n === "Cameras") this.camStatus(true); else this.watch(null, true);
+    if (n === "Drivers & cameras") this.dr.load(); else this.dr.leave();
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
     if (n === "Controller gains") this.gLoad(true);
     if (n === "Parts") this.wc.W.parts.load();
@@ -2251,7 +2243,7 @@ pages.SETUP = {
     if (r.ok) { this.gData.presets = r.presets; this.gRender(); }
   },
   hide() {
-    this.watch(null, true);
+    this.dr.leave();
     if (this.view) this.view.clearPartDraft();
   },
   vial(v) {
@@ -2587,31 +2579,6 @@ pages.SETUP = {
     if (window.confirm(`Set the admittance gravity compensation to ${r.mass.toFixed(3)} kg at ${r.cog.map((c) => (c * 1000).toFixed(1)).join(", ")} mm?` + off))
       cmd("payload_apply");
   },
-  async camStatus(force) {
-    if (!force && Date.now() - (this.camT || 0) < 2000) return;
-    this.camT = Date.now();
-    const r = await cmd("camera_status");
-    if (!r.ok) return;
-    $("#su-cams").replaceChildren(...r.cameras.map((c) => h("div", { class: "item" + (c.topic === this.topic ? " on" : ""),
-      onclick: () => this.watch(c.topic) },
-      h("span", { class: "dot" + (c.publishers > 0 ? " ok" : ""), style: "margin-top:5px" }),
-      h("div", { class: "grow" }, h("div", {}, c.name), h("div", { class: "muted" }, c.topic)),
-      h("span", { class: "muted", style: "white-space:nowrap" }, c.publishers > 0 ? "publishing" : "no publisher"))));
-    $("#su-topics").replaceChildren(...r.topics.map((t) => h("option", { value: t })));
-    if (!this.topic && r.cameras.length) this.watch(r.cameras[0].topic);
-  },
-  watch(topic, quiet) {
-    const box = $("#su-cam");
-    if (!topic) { if (box) box.replaceChildren(quiet ? "" : "Select a camera"); if (!quiet) this.topic = null; return; }
-    this.topic = topic;
-    const cam = INFO.cameras.find((c) => c.topic === topic);
-    $("#su-camtitle").textContent = cam ? cam.name : topic;
-    $("#su-topic").value = topic;
-    const img = h("img", { src: "/api/camera.mjpeg?topic=" + encodeURIComponent(topic) + "&t=" + Date.now(), alt: "",
-      onerror: () => box.replaceChildren(`${topic}: no image publisher. Is the camera driver running?`) });
-    box.replaceChildren(img);
-    [...$("#su-cams").children].forEach((it) => it.classList.toggle("on", it.querySelector(".muted")?.textContent === topic));
-  },
   // the small status after each menu item, and the robot-model bar
   navStatus(s) {
     const w = s.workcell || {}, st = w.setup || {}, c = s.calibration || {};
@@ -2628,6 +2595,7 @@ pages.SETUP = {
       "F/T + Payload": s.payload?.saved?.file ? ["✓", "ok", "a payload calibration is saved"] : ["—", "", "No payload calibration saved"],
       "Vial Geometry": vial ? ["✓", "ok", "the vial is taught"] : null,
       "Keep-out zones": ko ? [String(ko), "", "enabled keep-out boxes"] : null,
+      "Drivers & cameras": driversBadge(w.drivers),
     };
     this.nav.querySelectorAll(".item").forEach((it) => {
       const v = nb[it.dataset.name], b = it.querySelector(".nb");
@@ -2724,14 +2692,7 @@ pages.SETUP = {
       gate(this.papply, !!(r && r.can_apply) && s.mode !== "admittance");
       this.papply.textContent = s.mode === "admittance" ? "Apply (leave Admittance first)" : "Apply to admittance";
     }
-    if (this.sub === "Cameras") {
-      this.camStatus(false);
-      const c = s.camera;
-      $("#su-caminfo").textContent = c && c.topic === this.topic
-        ? (c.width ? `${c.width}×${c.height} · ` : "") + `${c.encoding || "—"} · ${fmt(c.rate)} Hz · ${c.frame_id || "no frame_id"}` +
-          (c.age != null && c.age > 2 ? ` · last image ${c.age.toFixed(0)} s ago` : "") + (c.error ? " · " + c.error : "")
-        : "";
-    }
+    if (this.sub === "Drivers & cameras") this.dr.update(s);
   },
 };
 
