@@ -27,6 +27,9 @@ Schema v2 (written by this version):
       - {type: move_until_contact, direction: [0, 0, 1], frame: tool, distance_mm: 20, force_n: 3, velocity: 0.02}
       - {type: force, wrench: [0, 0, 5, 0, 0, 0], frame: tool}     # N / Nm the tool exerts, ramped in
       - {type: move_relative, offset_mm: [0, 0, -15], frame: vial, cartesian: true, velocity: 0.02}
+      # speed_mm_s (optional, linear moves: move_pose with cartesian, move_relative, move_until_contact): the TCP
+      # goes at most this fast (mm/s, up to the profile's moveit.max_cartesian_speed_mm_s); velocity still applies
+      - {type: move_relative, offset_mm: [0, 0, 5], frame: tool, speed_mm_s: 10}
       - {type: force_off}                                    # ramped out; also at the end, STOP or a failed step
       # recording and photos (nothing moves): a recording a program starts also ends with it
       - {type: record_start, preset: all, note: "trial 3"}   # preset and note are optional; no preset = saved selection
@@ -54,6 +57,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import yaml
 
+from .cart_speed import DEFAULT_MAX_MM_S, SPEED_STEPS, check_mm_s
 from .geometry import Geometry, GeometryError, PoseSpec
 from .profile import RobotProfile
 
@@ -133,6 +137,22 @@ class Step:
         return self.type in CONTAINER_STEPS
 
     @property
+    def linear(self) -> bool:
+        """A straight-line (MoveL) motion step: the ones speed_mm_s applies to."""
+        if self.type == "move_pose":
+            return bool(self.params.get("cartesian", False))
+        if self.type == "move_relative":
+            return bool(self.params.get("cartesian", True))
+        return self.type == "move_until_contact"
+
+    def speed_text(self) -> str:
+        """'  20 mm/s' for a linear step with speed_mm_s, else ''."""
+        v = self.params.get("speed_mm_s")
+        if not self.linear or isinstance(v, bool) or not isinstance(v, (int, float)):
+            return ""
+        return f"  {float(v):g} mm/s"
+
+    @property
     def title(self) -> str:
         if self.type == "move_pose":
             return "MoveL" if self.params.get("cartesian") else "MoveJ to pose"
@@ -147,8 +167,8 @@ class Step:
             lin = " (linear)" if p.get("cartesian") else ""
             if "pose" in p and isinstance(p["pose"], dict):
                 pose = p["pose"]
-                return f"{pose.get('tcp')} @ {pose.get('frame')}{lin}{v}"
-            return f"{p.get('target', '?')}{lin}{v}"
+                return f"{pose.get('tcp')} @ {pose.get('frame')}{lin}{v}{self.speed_text()}"
+            return f"{p.get('target', '?')}{lin}{v}{self.speed_text()}"
         if self.type == "gripper":
             what = p.get("command") or f"pos {p.get('position')}"
             eff = f"  {p['effort']} N" if "effort" in p else ""
@@ -176,11 +196,12 @@ class Step:
             r = f" rot [{', '.join(f'{float(x):g}' for x in rot)}]°" if rot and any(float(x) for x in rot) else ""
             if r and p.get("pivot") == "frame" and p.get("frame", "tool") != "tool":
                 r += " about its origin"
-            return f"[{off}] mm{r} in {p.get('frame', 'tool')}{' (linear)' if p.get('cartesian', True) else ''}{v}"
+            return (f"[{off}] mm{r} in {p.get('frame', 'tool')}{' (linear)' if p.get('cartesian', True) else ''}{v}"
+                    f"{self.speed_text()}")
         if self.type == "move_until_contact":
             d = p.get("direction", [0, 0, 1])
             return (f"along [{', '.join(f'{float(x):g}' for x in d)}] {p.get('frame', 'tool')}, "
-                    f"≤ {p.get('distance_mm', 0)} mm until {p.get('force_n', 0)} N{v}")
+                    f"≤ {p.get('distance_mm', 0)} mm until {p.get('force_n', 0)} N{v}{self.speed_text()}")
         if self.type == "force":
             w = p.get("wrench", [0] * 6)
             tq = f" T [{', '.join(f'{float(x):g}' for x in w[3:])}] Nm" if any(float(x) for x in w[3:]) else ""
@@ -493,6 +514,14 @@ class Program:
                 for k in ("velocity", "acceleration"):
                     if k in p and not 0.0 < float(p[k]) <= 1.0:
                         problems.append(f"step {i}: {k} scaling must be in (0, 1]")
+                if "speed_mm_s" in p:
+                    if s.type not in SPEED_STEPS:
+                        problems.append(f"step {i}: speed_mm_s is for linear moves (MoveL, move relative, until contact)")
+                    else:
+                        try:
+                            check_mm_s(p["speed_mm_s"], getattr(profile, "max_cart_speed_mm_s", DEFAULT_MAX_MM_S))
+                        except ValueError as e:
+                            problems.append(f"step {i}: {e}")
             except ProgramError as e:
                 problems.append(f"step {i}: {e}")
             except (TypeError, ValueError) as e:
@@ -838,7 +867,8 @@ class ProgramRunner:
                 self.on_log(f"move_pose refused: {e}")
                 return False
             return self.bridge.move_pose(target.link, target.T_base_link, bool(p.get("cartesian", False)),
-                                         vel, acc)
+                                         vel, acc, cart_speed=self._cart_speed(step),
+                                         speed_point=target.T_link_tcp[:3, 3])
 
         if t == "gripper":
             g = self.profile.gripper
@@ -879,12 +909,12 @@ class ProgramRunner:
         if t == "move_relative":
             if not self._require_moveit_mode():
                 return False
-            return self._move_relative(p, vel, acc)
+            return self._move_relative(p, vel, acc, self._cart_speed(step))
 
         if t == "move_until_contact":
             if not self._require_moveit_mode():
                 return False
-            return self._move_until_contact(p, vel, acc)
+            return self._move_until_contact(p, vel, acc, self._cart_speed(step))
 
         if t == "force":
             ok, msg = self.hooks.force_apply([float(x) for x in p["wrench"]], p.get("frame", "tool"))
@@ -966,15 +996,25 @@ class ProgramRunner:
             out[:3, :3] = R_off @ T[:3, :3]
         return PoseSpec.from_T(ref, tcp, out)
 
-    def _move_to(self, pose: PoseSpec, cartesian: bool, vel: float, acc: float) -> bool:
+    def _cart_speed(self, step: Step) -> float:
+        """The step's speed_mm_s as the bridge's cart_speed: m/s after the GUI speed override, 0.0 = none.
+        Validated before the run; clamped here too, so a bad value never moves faster than the profile allows."""
+        v = step.params.get("speed_mm_s")
+        if not step.linear or isinstance(v, bool) or not isinstance(v, (int, float)) or not float(v) > 0:
+            return 0.0
+        return min(float(v), self.profile.max_cart_speed_mm_s) / 1000.0 * float(self.speed_override())
+
+    def _move_to(self, pose: PoseSpec, cartesian: bool, vel: float, acc: float, cart_speed: float = 0.0) -> bool:
         try:
             target = self.geometry.planning_target(pose)
         except GeometryError as e:
             self.on_log(f"move refused: {e}")
             return False
-        return self.bridge.move_pose(target.link, target.T_base_link, cartesian, vel, acc)
+        return self.bridge.move_pose(target.link, target.T_base_link, cartesian, vel, acc,
+                                     cart_speed=cart_speed if cartesian else 0.0,
+                                     speed_point=target.T_link_tcp[:3, 3])
 
-    def _move_relative(self, p: dict, vel: float, acc: float) -> bool:
+    def _move_relative(self, p: dict, vel: float, acc: float, cart_speed: float = 0.0) -> bool:
         import numpy as np
         off = [float(x) / 1000.0 for x in p.get("offset_mm", [0, 0, 0])]
         if "pose" not in self._step_memo:      # from where the step STARTED: a resume after a pause finishes it
@@ -988,9 +1028,9 @@ class ProgramRunner:
                 return False
             self._step_memo["pose"] = pose
         pose = self._step_memo["pose"]
-        return self._move_to(pose, bool(p.get("cartesian", True)), vel, acc)
+        return self._move_to(pose, bool(p.get("cartesian", True)), vel, acc, cart_speed)
 
-    def _move_until_contact(self, p: dict, vel: float, acc: float) -> bool:
+    def _move_until_contact(self, p: dict, vel: float, acc: float, cart_speed: float = 0.0) -> bool:
         """Linear move along `direction` for at most distance_mm; stops as soon as the measured force changes by
         force_n from its value at the start (|ΔF|). No contact within the distance fails the step unless
         on_no_contact: continue."""
@@ -1038,7 +1078,7 @@ class ProgramRunner:
         th = threading.Thread(target=watch, daemon=True, name="contact-watch")
         th.start()
         try:
-            reached = self._move_to(pose, True, vel, acc)
+            reached = self._move_to(pose, True, vel, acc, cart_speed)
         finally:
             done.set()
             th.join(1.0)

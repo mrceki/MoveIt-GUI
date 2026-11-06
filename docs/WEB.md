@@ -82,6 +82,13 @@ program runner and lease, and they do not know about each other.
   (step and Servo), Move here and program moves. Policies and the payload calibration poses are not scaled.
   It is shared by all browsers and resets to 100 % when the GUI restarts. The UR pendant slider (PENDANT SPEED)
   applies on top.
+- **Linear speed (mm/s).** OPERATE › Manual › Pose with **Straight line** on shows a **mm/s** field next to Speed %:
+  the TCP goes at most this fast. Empty or 0 = Speed % only, as before. The limit is the profile's
+  `moveit.max_cartesian_speed_mm_s` (250 mm/s). Linear program steps take the same limit as **Max mm/s** in the
+  step editor (`speed_mm_s` in the file: MoveL, Move relative when linear, Move until contact); the step line shows
+  it. MoveIt ignores its own Cartesian speed fields for straight-line paths, so the GUI slows the planned trajectory
+  down evenly until the TCP point (a virtual TCP too, from the URDF) is at or under the limit; the path stays the
+  same. Speed % and GUI SPEED still apply on top, so the move can be slower, never faster.
 - **Move here** (PROGRAMS) is hold-to-run: the arm moves only while the button is held. The page renews the hold
   every 150 ms and the robot PC stops the move 0.4 s after the last renewal, so a quick tap, a dropped connection
   or a closed tab cannot run the whole move; letting go also sends STOP at once.
