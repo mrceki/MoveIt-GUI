@@ -28,7 +28,7 @@ Schema v2 (written by this version):
       - {type: force, wrench: [0, 0, 5, 0, 0, 0], frame: tool}     # N / Nm the tool exerts, ramped in
       - {type: move_relative, offset_mm: [0, 0, -15], frame: vial, cartesian: true, velocity: 0.02}
       # speed_mm_s (optional, linear moves: move_pose with cartesian, move_relative, move_until_contact): the TCP
-      # goes at most this fast (mm/s, up to the profile's moveit.max_cartesian_speed_mm_s); velocity still applies
+      # moves at this constant speed (mm/s, up to the profile's moveit.max_cartesian_speed_mm_s); velocity still applies
       - {type: move_relative, offset_mm: [0, 0, 5], frame: tool, speed_mm_s: 10}
       - {type: force_off}                                    # ramped out; also at the end, STOP or a failed step
       # recording and photos (nothing moves): a recording a program starts also ends with it

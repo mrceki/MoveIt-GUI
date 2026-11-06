@@ -383,7 +383,7 @@ pages.OPERATE = {
         h("div", { class: "row", id: "op-motion" },
           h("label", { class: "nfield", title: "Velocity scaling, % of the joint limits" }, h("span", { class: "muted" }, "Speed"),
             h("input", { type: "number", id: "op-vel", value: "10", min: "1", max: "100" }), h("span", { class: "muted" }, "%")),
-          h("label", { class: "nfield hidden", id: "op-mms-f", title: "Straight line only: the TCP goes at most this fast " +
+          h("label", { class: "nfield hidden", id: "op-mms-f", title: "Straight line only: the TCP moves at this constant speed " +
               `(mm/s, up to ${INFO.max_cart_speed_mm_s ?? 250}). Empty or 0: Speed % only` },
             h("input", { type: "number", id: "op-mms", min: "0", max: String(INFO.max_cart_speed_mm_s ?? 250), step: "1",
                          placeholder: "–" }), h("span", { class: "muted" }, "mm/s")),
@@ -1671,7 +1671,7 @@ pages.PROGRAMS = {
     const opt = (el) => (el.value === "" ? null : +el.value);
     // optional TCP speed limit of a linear step (empty = Velocity % only)
     const mmsIn = (v) => h("input", { type: "number", step: "1", min: "0", max: String(INFO.max_cart_speed_mm_s ?? 250),
-      value: v ?? "", placeholder: "off", title: `Linear moves: the TCP goes at most this fast (mm/s, up to ${INFO.max_cart_speed_mm_s ?? 250}). Empty: Velocity % only` });
+      value: v ?? "", placeholder: "off", title: `Linear moves: the TCP moves at this constant speed (mm/s, up to ${INFO.max_cart_speed_mm_s ?? 250}). Empty: Velocity % only` });
     const T = row.type;
     if (T === "movej" || T === "move_pose") {
       f.v = pctIn(p.velocity); f.a = pctIn(p.acceleration);

@@ -925,8 +925,9 @@ class RosBridge:
     def plan_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
                   cart_speed=0.0, speed_point=None):
         """A JointTrajectory that brings `target_link` to T_base_link (in profile.base_link), or None.
-        cart_speed (m/s, <= 0 = none; linear moves only): the trajectory is slowed so the point `speed_point`
-        (xyz in target_link, the TCP) never goes faster (cart_speed.py: move_group ignores max_cartesian_speed)."""
+        cart_speed (m/s, <= 0 = none; linear moves only): the trajectory is retimed so the point `speed_point`
+        (xyz in target_link, the TCP) goes at that constant speed, never faster (cart_speed.py: move_group ignores
+        max_cartesian_speed)."""
         if self.moveit is None:
             self.log("plan: MoveIt not available")
             return None
@@ -953,12 +954,14 @@ class RosBridge:
             self.log("plan: planning failed")
         elif limit:
             try:
-                k = cart_speed_mod.limit_speed(traj, point_at, float(cart_speed))
-            except Exception as e:      # pragma: no cover - a malformed trajectory: do not run it unlimited
+                # constant TCP speed within the joint limits (URDF velocity x Speed %, profile acceleration x
+                # Accel %); the uniform slow-down stays as the fallback and the final peak check
+                vlim, alim = cart_speed_mod.joint_limits(self._fk_model, self.profile, traj.joint_names, vel, acc)
+                cart_speed_mod.retime_linear(traj, point_at, float(cart_speed),
+                                             cart_speed_mod.cart_accel_m_s2(self.profile, acc), vlim, alim, self.log)
+            except Exception as e:      # a malformed trajectory: do not run it unlimited
                 self.log(f"plan: speed limit failed: {e}")
                 return None
-            if k > 1.0:
-                self.log(f"linear move slowed x{k:.2f} to keep the TCP at {cart_speed * 1000.0:.0f} mm/s")
         return traj
 
     def _speed_point(self, link: str, point):

@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from . import transforms as tf
+from .cart_speed import cart_accel_m_s2, trapezoid_duration
 from .bridge_api import Snapshot, gripper_status_dict, reconnect_gripper
 from .control_modes import detect_mode, moveit_controller_for
 from .profile import RobotProfile
@@ -516,8 +517,9 @@ class FakeBridge:
     def move_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
                   cart_speed=0.0, speed_point=None) -> bool:
         """Fake: moves the tool0 pose directly (no IK); joints stay where they are. A linear move with cart_speed
-        (m/s) takes at least the straight distance of speed_point (the TCP, xyz in target_link) / cart_speed:
-        last_move_s is that simulated robot time (before move_time_scale)."""
+        (m/s) takes what RosBridge's constant-speed retime takes: the straight distance of speed_point (the TCP, xyz
+        in target_link) / cart_speed + the ramp time (cart_speed.trapezoid_duration). last_move_s is that simulated
+        robot time (before move_time_scale)."""
         self.calls.append(("move_pose", target_link, tuple(np.round(T_base_link[:3, 3], 5)), bool(cartesian)))
         self.last_cart_speed = float(cart_speed or 0.0) if cartesian else 0.0
         if not self._route():
@@ -543,7 +545,9 @@ class FakeBridge:
             T_tool0_link = tf.inv(T_goal) @ T_base_link       # target_link in tool0, fixed
             pt = T_tool0_link @ np.r_[np.asarray(speed_point if speed_point is not None else [0, 0, 0], float), 1.0]
             dist = float(np.linalg.norm((T_goal @ pt)[:3] - (T0 @ pt)[:3]))
-            duration = max(duration, dist / self.last_cart_speed)
+            if dist > 1e-5:                                   # as RosBridge: constant speed, ramps at the
+                duration = trapezoid_duration(dist, self.last_cart_speed,   # Cartesian acceleration (cart_speed.py)
+                                              cart_accel_m_s2(self.profile, acc))
         self.last_move_s = duration
         steps = max(2, int(duration / 0.02 / self.time_scale))
         for i in range(1, steps + 1):
