@@ -28,6 +28,10 @@ Schema v2 (written by this version):
       - {type: force, wrench: [0, 0, 5, 0, 0, 0], frame: tool}     # N / Nm the tool exerts, ramped in
       - {type: move_relative, offset_mm: [0, 0, -15], frame: vial, cartesian: true, velocity: 0.02}
       - {type: force_off}                                    # ramped out; also at the end, STOP or a failed step
+      # recording and photos (nothing moves): a recording a program starts also ends with it
+      - {type: record_start, preset: all, note: "trial 3"}   # preset and note are optional; no preset = saved selection
+      - {type: photo, topic: /camera/camera/color/image_rect_raw, label: before}   # one JPEG, timestamp + label
+      - {type: record_stop}
 
 Every Cartesian pose carries its reference frame and TCP (T_frame_tcp).
 Lengths are metres, joint values radians, quaternions xyzw.
@@ -55,14 +59,16 @@ from .profile import RobotProfile
 
 PROGRAM_VERSION = 2
 STEP_TYPES = ("movej", "move_pose", "move_relative", "move_until_contact", "force", "force_off", "zero_ft",
-              "gripper", "wait", "controller", "policy", "set_io", "speed", "loop", "folder", "comment")
+              "gripper", "wait", "controller", "policy", "set_io", "speed", "loop", "folder", "comment",
+              "photo", "record_start", "record_stop")
 CONTAINER_STEPS = ("loop", "folder")
 MOTION_STEPS = ("movej", "move_pose", "move_relative", "move_until_contact")
 MAX_LOOP_TIMES = 10000
 TITLES = {"movej": "MoveJ", "gripper": "Gripper", "wait": "Wait", "controller": "Control mode", "policy": "Policy",
           "set_io": "Set output", "speed": "Speed", "loop": "Loop", "folder": "Folder", "comment": "Comment",
           "move_relative": "Move relative", "move_until_contact": "Move until contact", "force": "Force",
-          "force_off": "Force off", "zero_ft": "Zero F/T"}
+          "force_off": "Force off", "zero_ft": "Zero F/T", "photo": "Photo",
+          "record_start": "Record start", "record_stop": "Record stop"}
 AXIS_NAMES = ("X", "Y", "Z")
 MAX_RELATIVE_MM = 300.0
 MAX_CONTACT_MM = 200.0
@@ -184,6 +190,13 @@ class Step:
             return "ramp to zero"
         if self.type == "zero_ft":
             return "software bias at the current load"
+        if self.type == "photo":
+            lab = f" · {p['label']}" if p.get("label") else ""
+            return f"{p.get('topic') or '?'}{lab}"
+        if self.type == "record_start":
+            return " · ".join(x for x in (p.get("preset") or "selected topics", p.get("note")) if x)
+        if self.type == "record_stop":
+            return "finish the recording"
         return ""
 
 
@@ -455,6 +468,22 @@ class Program:
                         if tn > float(lim.get("max_torque_nm", 2.0)) + 1e-9:
                             problems.append(f"step {i}: torque {tn:.2f} Nm over the profile limit "
                                             f"{float(lim.get('max_torque_nm', 2.0)):g} Nm")
+                elif s.type == "photo":
+                    topic = p.get("topic")
+                    if not isinstance(topic, str) or not topic.startswith("/"):
+                        problems.append(f"step {i}: photo needs a camera topic (starting with /)")
+                    elif live and bridge is not None and hasattr(bridge, "image_topics"):
+                        try:
+                            if topic not in {t for t, _ in bridge.image_topics()}:
+                                problems.append(f"step {i}: no image is published on {topic}")
+                        except Exception:  # noqa: BLE001 - a graph query that failed: the step reports it
+                            pass
+                elif s.type == "record_start":
+                    from .recorder import PRESETS
+                    if p.get("preset") and p["preset"] not in PRESETS:
+                        problems.append(f"step {i}: unknown recording preset '{p['preset']}'")
+                    if len(str(p.get("note", ""))) > 200:
+                        problems.append(f"step {i}: the note is limited to 200 characters")
                 elif s.type == "loop":
                     t = p.get("times", 1)
                     if isinstance(t, bool) or int(t) != float(t) or not 1 <= int(t) <= MAX_LOOP_TIMES:
@@ -530,6 +559,20 @@ class ProgramHooks:
     def zero_ft(self, stopped: Callable[[], bool]) -> Tuple[bool, str]:
         return False, "zero_ft needs the GUI core"
 
+    def record_start(self, presets, name: str, note: str) -> Tuple[bool, str]:
+        return False, "recording needs the GUI core"
+
+    def record_stop(self, reason: str, wait: bool = False) -> Tuple[bool, str]:
+        """Finish the recording; wait=True returns when the bag is closed."""
+        return True, "not recording"
+
+    def recording(self) -> Optional[str]:
+        """The folder of the recording running now, else None."""
+        return None
+
+    def photo(self, topic: str, label: str) -> Tuple[bool, str]:
+        return False, "photo steps need the GUI core"
+
 
 # =================================================================== runner
 class RunState(enum.Enum):
@@ -572,6 +615,7 @@ class ProgramRunner:
         self._force_on = False                                  # a force step applied a force; force_off ends it
         self._step_memo: dict = {}                              # targets of the step now: kept over a pause
         self._force_params = None                               # (wrench, frame) of the force applied now
+        self._rec_owned = False                                 # a record_start step of THIS run began the recording
         self._was_paused = False                                # paused since the last resume check
         self._fail_msg = ""
         self.skipped: List[str] = []
@@ -675,6 +719,7 @@ class ProgramRunner:
 
     def _run(self, program: Program, start, loop: bool):
         self._force_on = False
+        self._rec_owned = False
         self._step_memo, self.pause_reason, self._force_params = {}, "", None
         self._was_paused, self._fail_msg = False, ""
         self.skipped: List[str] = []           # steps that failed with on_fail: continue
@@ -751,6 +796,10 @@ class ProgramRunner:
                     self.on_log(f"program ended with a force applied: {rel_msg}")
                 else:
                     self.hooks.force_stop(f"program {msg}: zeroed at once")
+            if self._rec_owned:                       # a recording this run started never outlives it
+                self._rec_owned = False
+                _ok, rec_msg = self.hooks.record_stop(f"the program ended ({'finished' if ok else (msg.splitlines() or [''])[0]})")
+                self.on_log(f"program ended while recording: {rec_msg}")
             if ok and self.skipped:
                 msg = (f"finished, {len(self.skipped)} step(s) failed and were skipped (on failure: continue): "
                        + ", ".join(self.skipped[:10]) + (" …" if len(self.skipped) > 10 else ""))
@@ -858,6 +907,30 @@ class ProgramRunner:
             if not ok:                      # a success is logged by the F/T bias itself
                 self.on_log(msg)
             return ok
+
+        if t == "photo":
+            label = str(p.get("label") or "") or "step" + path_label(self.current_path or (0,))
+            ok, msg = self.hooks.photo(p["topic"], label)
+            self.on_log(msg)
+            return ok
+
+        if t == "record_start":
+            if self.hooks.recording():
+                self.on_log("record_start: already recording, carrying on with that recording")
+                return True
+            ok, msg = self.hooks.record_start([p["preset"]] if p.get("preset") else None,
+                                              str(program.name or ""), str(p.get("note") or ""))
+            self.on_log(msg)
+            self._rec_owned = self._rec_owned or ok
+            return ok
+
+        if t == "record_stop":
+            if not self.hooks.recording():
+                return True
+            _ok, msg = self.hooks.record_stop("stopped by the program", wait=True)
+            self._rec_owned = False
+            self.on_log(msg)
+            return True
 
         if t == "set_io":
             return self.bridge.set_digital_out(int(p["pin"]), bool(p["state"]))

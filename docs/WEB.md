@@ -236,6 +236,17 @@ controller_gains:
 AUTOMATION then shows a **Controller gains** readiness check (2 % tolerance). It fails on a mismatch, with
 **Apply trained gains** as its fix.
 
+## Record and photo steps (PROGRAMS › Insert › Record & photo)
+
+Three steps that never move the robot. **Record start** begins a recording (preset "Everything for a run", or the
+topics ticked in DIAGNOSTICS) with an optional note; the folder is named after the program and `meta.json` carries
+the program name and the operator. If a recording already runs (yours, or auto-record) the step carries on with it.
+**Record stop** finishes the recording that runs. A recording that a program started always ends with that program,
+whether it finishes, fails or is stopped; one you started yourself is left alone. **Photo** saves one full-size JPEG
+from the chosen camera as `<date>_<time>_<label>.jpg` (label empty: `stepN`) into the `photos/` folder of the recording
+that runs now, else into `photos/` next to the recordings. It fails the step if the camera gives no frame, and
+the check before a run refuses a camera topic that publishes nothing. In fake mode the photo is a generated image. Older programs load as before.
+
 ## Force work in programs (PROGRAMS › Insert › Force & contact)
 
 | Step | What it does |
@@ -340,6 +351,12 @@ come back here. Recording never moves the robot. Starting needs control, but any
   `~/ur7e_data/recordings/` on the host. Open the `.mcap` in PlotJuggler 4 or Lichtblick/Foxglove, or replay it
   with `ros2 bag play`.
 - Closing the GUI finishes the bag cleanly (SIGINT to `ros2 bag record`).
+- **● Record in the header** is the one-button way: it records everything useful for a run into one folder (joints, TCP
+  pose via TF, F/T, gripper, controller states and the camera topics that are published, compressed only, the preset
+  "Everything for a run"). It asks for an optional note; while recording the button reads **■ Stop** and the red pill shows
+  the elapsed time and size. The folder also gets a short `meta.json`: start and stop time, who started it (the operator
+  name), the program that was running, the control mode, the note, the topics. The ● Record button on DIAGNOSTICS still
+  records only the topics ticked there.
 
 ## Parts, camera calibration, setups, restart (SETUP)
 

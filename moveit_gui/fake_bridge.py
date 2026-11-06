@@ -758,6 +758,17 @@ class FakeBridge:
         self._grab_n = getattr(self, "_grab_n", 0) + 1
         return he.render_board(b, FAKE_CAM_K, T_cam_board, (1280, 720), seed=self._grab_n), FAKE_CAM_OPTICAL
 
+    def grab_photo(self, topic: str, timeout_s: float = 3.0):
+        """A generated JPEG of a simulated camera (a program's photo step)."""
+        from .camera import decode_image, encode_jpeg
+        base = topic[:-len("/compressed")] if topic.endswith("/compressed") else topic
+        if base not in self.fake_cameras:
+            return None, f"{topic}: no image within {timeout_s:.0f} s"
+        enc, w, h, _hz = self.fake_cameras[base]
+        self._grab_n = getattr(self, "_grab_n", 0) + 1
+        data, step = fake_image(enc, w, h, self._grab_n)
+        return encode_jpeg(decode_image(enc, w, h, step, data, max_width=w)), ""
+
     def shutdown(self):
         self._image_stop.set()
         self.set_freedrive_keepalive(False)

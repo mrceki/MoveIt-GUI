@@ -1240,7 +1240,8 @@ function forceUpdate(s) {
 // A step is addressed by its path (list of ints); the selected path is compared as JSON.
 const PG_ICON = { movej: "MoveJ", move_pose: "Move", gripper: "Grip", wait: "Wait", set_io: "I/O", speed: "Spd",
   controller: "Mode", policy: "Pol", loop: "Loop", folder: "Dir", comment: "//", move_relative: "Rel",
-  move_until_contact: "Touch", force: "Force", force_off: "F off", zero_ft: "Zero" };
+  move_until_contact: "Touch", force: "Force", force_off: "F off", zero_ft: "Zero",
+  photo: "Photo", record_start: "Rec", record_stop: "Rec off" };
 // direction pickers for force work: the six axis directions, plus whatever the step already has
 const AXIS_DIRS = [["+x", [1, 0, 0]], ["-x", [-1, 0, 0]], ["+y", [0, 1, 0]], ["-y", [0, -1, 0]], ["+z", [0, 0, 1]], ["-z", [0, 0, -1]]];
 const dirKey = (v) => (AXIS_DIRS.find(([, d]) => d.every((x, i) => Math.abs(x - (v || [])[i]) < 1e-9)) || [null])[0];
@@ -1344,6 +1345,11 @@ pages.PROGRAMS = {
         ins("Force", "force", {}, "Apply a force; it stays on across the next steps until Force off"),
         ins("Force off", "force_off", {}, "Ramp the force out"),
         ins("Move relative", "move_relative", {}, "Move the TCP by an offset in tool, base or fixture axes")),
+      h("div", { class: "section" }, "Record & photo (nothing moves)"),
+      h("div", { class: "row" },
+        ins("Record start", "record_start", {}, "Start a recording (stops by itself when the program ends)"),
+        ins("Record stop", "record_stop", {}, "Finish the recording"),
+        ins("Photo", "photo", {}, "Save one still from a camera into the run folder")),
       h("div", { class: "section" }, "Advanced"),
       h("div", { class: "row" }, ins("Control mode", "controller"), ins("Policy", "policy")));
     insertTab.querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
@@ -1720,6 +1726,24 @@ pages.PROGRAMS = {
     } else if (T === "force_off") {
       f.t = num(p.timeout_s ?? 10, "1"); field("Ramp-out timeout s", f.t);
       this.get = () => ({ timeout_s: +f.t.value });
+    } else if (T === "photo") {
+      const cams = [...new Map([...(INFO.cameras || []).map((c) => [c.topic, c.name || c.topic]),
+        ...(p.topic ? [[p.topic, p.topic]] : [])]).entries()];
+      f.t = sel(cams, p.topic); f.l = h("input", { type: "text", value: p.label ?? "", placeholder: "step number", maxlength: "60" });
+      field("Camera", f.t); field("Label", f.l);
+      lines.push(h("span"), h("span", { class: "muted small" }, "One JPEG named date_time_label.jpg, in the photos folder of the " +
+        "recording running now, else in the photos folder next to the recordings."));
+      this.get = () => ({ topic: f.t.value, label: f.l.value.trim() || null });
+    } else if (T === "record_start") {
+      f.p = sel([["all", "Everything for a run"], ["", "Topics ticked in DIAGNOSTICS"]], p.preset || "");
+      f.n = h("input", { type: "text", value: p.note ?? "", maxlength: "200", placeholder: "note (optional)" });
+      field("Record", f.p); field("Note", f.n);
+      lines.push(h("span"), h("span", { class: "muted small" }, "A recording this program starts also ends when it ends or is stopped. " +
+        "Already recording: carries on with that one."));
+      this.get = () => ({ preset: f.p.value || null, note: f.n.value.trim() || null });
+    } else if (T === "record_stop") {
+      lines.push(h("span"), h("span", { class: "muted small" }, "Finishes the recording that is running."));
+      this.get = () => ({});
     } else if (T === "zero_ft") {
       lines.push(h("span"), h("span", { class: "muted small" }, "Averages the F/T reading for 1 s with the arm still and makes it " +
         "read zero (software bias, SETUP › F/T + Payload). Refused in Admittance or with a force applied: put it before them."));
@@ -3143,8 +3167,12 @@ function renderHeader(s) {
   pill.onclick = actPage ? () => navTo(actPage) : null;
   const rec = s.record && s.record.recording, rp = $("#h-rec");
   rp.hidden = !rec;
+  const rb = $("#h-recbtn");
+  rb.textContent = rec ? "■ Stop" : "● Record";
+  rb.classList.toggle("danger", !!rec);
+  rb.disabled = rec ? !!rec.stopping : !holds;
   if (rec) {
-    rp.textContent = `● REC ${mmss(rec.elapsed_s)}`;
+    rp.textContent = `● REC ${mmss(rec.elapsed_s)} · ${rec.size_mb.toFixed(1)} MB`;
     rp.title = `Recording ${rec.name}: ${rec.size_mb.toFixed(1)} MB, ${rec.topics} topics (${rec.source}). Click for details.`;
   }
   const bad = Object.entries(s.connected || {}).filter(([, v]) => !v).map(([k]) => k);
@@ -3247,6 +3275,11 @@ async function boot() {
   $("#h-ovr").oninput = (e) => ($("#h-ovr-val").textContent = e.target.value + "%");
   $("#h-ovr").onchange = (e) => { cmd("speed_override", { percent: +e.target.value }); e.target.blur(); };
   $("#logs-link").onclick = () => navTo("DIAGNOSTICS");
+  $("#h-recbtn").onclick = async () => {
+    if (S && S.record && S.record.recording) { cmd("record_stop"); return; }
+    const note = await askText("Record everything\n\nNote for this run (optional):", "", { ok: "Record", maxLength: 200, placeholder: "note" });
+    if (note != null) cmd("record_start", { preset: "all", note: note.trim() });
+  };
   $("#h-rec").onclick = () => { navTo("DIAGNOSTICS"); $("#dg-rec").scrollIntoView({ block: "start" }); };
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") post("/api/stop"); });
 

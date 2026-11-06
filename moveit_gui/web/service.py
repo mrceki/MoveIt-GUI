@@ -118,6 +118,7 @@ class WebService(WorkcellCommands):
         self.core = core
         self.clock = clock
         self.lease = Lease()
+        core.operator = lambda: self.lease.name or ""
         self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
         self.users = Users(clock)                         # who has the page open (one per browser)
         self.asking: Optional[dict] = None                # someone asks the holder for control: {uid, name, at, kept}
@@ -526,11 +527,14 @@ class WebService(WorkcellCommands):
             raise CommandError(msg)
         return self._ok(msg, settings=self.core.recorder.settings)
 
-    def cmd_record_start(self, name=""):
-        name = str(name or "")
+    def cmd_record_start(self, name="", note="", preset=""):
+        """preset "" = the topics ticked in DIAGNOSTICS; "all" = the header's Record button (everything for a run)."""
+        name, note = str(name or ""), str(note or "")
         if len(name) > 60:
             raise CommandError("the recording name is limited to 60 characters")
-        ok, msg = self.core.recorder.start(name=name, source=f"manual ({self.lease.name or 'operator'})")
+        if len(note) > 200:
+            raise CommandError("the note is limited to 200 characters")
+        ok, msg = self.core.record_start(name=name, note=note, presets=[str(preset)] if preset else None)
         if not ok:
             raise CommandError(msg)
         return self._ok(msg)
@@ -1066,6 +1070,9 @@ class WebService(WorkcellCommands):
             "force": {"wrench": [0.0, 0.0, 5.0, 0.0, 0.0, 0.0], "frame": "tool"},
             "force_off": {},
             "zero_ft": {},
+            "photo": {"topic": self._default_camera(), "label": ""},
+            "record_start": {"preset": "all"},
+            "record_stop": {},
         }
         if type_ not in defaults:
             raise CommandError(f"cannot insert a '{type_}' step")
@@ -1097,7 +1104,14 @@ class WebService(WorkcellCommands):
         "force": {"wrench": _floats(6), "frame": _choice("tool", "base"), "wait": bool},
         "force_off": {"timeout_s": float},
         "zero_ft": {},
+        "photo": {"topic": str, "label": str},
+        "record_start": {"preset": str, "note": str},
+        "record_stop": {},
     }
+
+    def _default_camera(self) -> str:
+        cams = [c["topic"] for c in self.core.profile.cameras]
+        return next((t for t in cams if "color" in t), cams[0] if cams else "/camera/camera/color/image_rect_raw")
 
     def _apply_params(self, st: Step, params: dict):
         allowed = self._PARAMS.get(st.type, {})
