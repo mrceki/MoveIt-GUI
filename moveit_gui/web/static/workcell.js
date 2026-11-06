@@ -568,7 +568,7 @@ export function workcell(ctx) {
   function buildSetups() {
     // the internal names of what a setup holds, in plain words (several files can be one thing to the user)
     const LABEL = { "TCPs, fixtures, vision": "TCPs + fixtures", "controller gains + payload": "gains + payload",
-      "vial profiles": "vials", "part meshes": "parts", "parts URDF/SRDF": "", "last payload calibration": "payload calibration" };
+      "vial profiles": "vials", "flask profiles": "flasks", "part meshes": "parts", "parts URDF/SRDF": "", "last payload calibration": "payload calibration" };
     const words = (keys) => [...new Set((keys || []).map((k) => LABEL[k] ?? k).filter(Boolean))];
     const list = h("div", { class: "list", id: "st-list" }), autos = h("div", { class: "list", id: "st-auto" });
     const cur = h("div", { class: "st-cur", id: "st-current" }, "—");
