@@ -257,6 +257,11 @@ let current = "OPERATE";
 async function confirmMove(text) {
   return !$("#op-confirm") || !$("#op-confirm").checked || (await ask(text + "\n\nExecute?"));
 }
+// OPERATE's optional mm/s of a linear move: null = none (empty or 0); the server checks the range
+function mmS() {
+  const v = +$("#op-mms").value;
+  return v > 0 ? v : null;
+}
 function scaling() {
   return { vel: Math.min(1, Math.max(0.01, (+$("#op-vel").value || 10) / 100)),
            acc: Math.min(1, Math.max(0.01, (+$("#op-acc").value || 10) / 100)) };
@@ -365,7 +370,7 @@ pages.OPERATE = {
           (() => { const f = frameSelect("op-frame"); f.onchange = () => this.resetCart(); return f; })(),
           h("div", { class: "grow" }),
           h("label", { class: "tchip", title: "Move the TCP along a straight line (Cartesian path) instead of a free joint move" },
-            h("input", { type: "checkbox", id: "op-linear" }), "Straight line")),
+            h("input", { type: "checkbox", id: "op-linear", onchange: () => this.mmsShow() }), "Straight line")),
         h("div", { class: "cgrid" },
           h("div", { class: "cgroup" }, h("div", { class: "cap" }, "Position (mm)"), ["X", "Y", "Z"].map((n, i) => cfield(i, n))),
           h("div", { class: "cgroup" }, h("div", { class: "cap" }, "Rotation (°)"), ["Roll", "Pitch", "Yaw"].map((n, i) => cfield(i + 3, n)))),
@@ -377,6 +382,10 @@ pages.OPERATE = {
         h("div", { class: "row", id: "op-motion" },
           h("label", { class: "nfield", title: "Velocity scaling, % of the joint limits" }, h("span", { class: "muted" }, "Speed"),
             h("input", { type: "number", id: "op-vel", value: "10", min: "1", max: "100" }), h("span", { class: "muted" }, "%")),
+          h("label", { class: "nfield hidden", id: "op-mms-f", title: "Straight line only: the TCP goes at most this fast " +
+              `(mm/s, up to ${INFO.max_cart_speed_mm_s ?? 250}). Empty or 0: Speed % only` },
+            h("input", { type: "number", id: "op-mms", min: "0", max: String(INFO.max_cart_speed_mm_s ?? 250), step: "1",
+                         placeholder: "–" }), h("span", { class: "muted" }, "mm/s")),
           h("label", { class: "nfield", title: "Acceleration scaling, %" }, h("span", { class: "muted" }, "Accel."),
             h("input", { type: "number", id: "op-acc", value: "10", min: "1", max: "100" }), h("span", { class: "muted" }, "%")),
           h("div", { class: "grow" }),
@@ -671,8 +680,9 @@ pages.OPERATE = {
       cmd("plan_joints", { q_deg: INFO.joint_names.map((_, i) => +$(`#op-j${i}`).value), vel, acc });
     else {
       const v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-c${i}`).value);
+      const linear = $("#op-linear").checked;
       cmd("plan_pose", { frame: $("#op-frame").value, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3),
-                         linear: $("#op-linear").checked, vel, acc });
+                         linear, vel, acc, speed_mm_s: linear ? mmS() : null });
     }
   },
   async execute() {
@@ -732,7 +742,11 @@ pages.OPERATE = {
     $("#op-go").title = t === "j" ? "Plan and move: a joint move (MoveJ)" : "Plan and move the TCP to this pose";
     $("#op-gorow").classList.toggle("hidden", t === "g" || t === "f");
     $("#op-motion").classList.toggle("hidden", t === "f" || t === "g");   // Jog has its own speed; a force has none
+    this.mmsShow();
     if (t !== "g") jogRelease();
+  },
+  mmsShow() {             // the mm/s field: Pose tab, straight line only
+    $("#op-mms-f").classList.toggle("hidden", this.mode !== "c" || !$("#op-linear").checked);
   },
   async go() {
     const { vel, acc } = scaling();
@@ -747,9 +761,10 @@ pages.OPERATE = {
         cmd("move_joints", { q_deg: q, vel, acc });
     } else {
       const v = [0, 1, 2, 3, 4, 5].map((i) => +$(`#op-c${i}`).value);
-      const frame = $("#op-frame").value, linear = $("#op-linear").checked;
-      if (await confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`))
-        cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc });
+      const frame = $("#op-frame").value, linear = $("#op-linear").checked, mms = linear ? mmS() : null;
+      if (await confirmMove(`${linear ? "Linear move" : "Move"}: TCP ${S.calibration.active_tcp} to ${v.slice(0, 3)} mm in ${frame}`
+                            + (mms ? ` at ≤ ${mms} mm/s` : "")))
+        cmd("move_pose", { frame, xyz_mm: v.slice(0, 3), rpy_deg: v.slice(3), linear, vel, acc, speed_mm_s: mms });
     }
   },
   modePick() {
@@ -1647,11 +1662,17 @@ pages.PROGRAMS = {
     const pctIn = (v) => h("input", { type: "number", step: "5", min: "1", max: "100", value: pct(v) });
     const sel = (opts, v) => h("select", {}, opts.map(([val, lab]) => h("option", { value: val, selected: val === v }, lab)));
     const opt = (el) => (el.value === "" ? null : +el.value);
+    // optional TCP speed limit of a linear step (empty = Velocity % only)
+    const mmsIn = (v) => h("input", { type: "number", step: "1", min: "0", max: String(INFO.max_cart_speed_mm_s ?? 250),
+      value: v ?? "", placeholder: "off", title: `Linear moves: the TCP goes at most this fast (mm/s, up to ${INFO.max_cart_speed_mm_s ?? 250}). Empty: Velocity % only` });
     const T = row.type;
     if (T === "movej" || T === "move_pose") {
       f.v = pctIn(p.velocity); f.a = pctIn(p.acceleration);
       field("Velocity %", f.v); field("Acceleration %", f.a);
-      this.get = () => ({ velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)), acceleration: Math.min(1, Math.max(0.01, +f.a.value / 100)) });
+      const lin = T === "move_pose" && p.cartesian;
+      if (lin) { f.mm = mmsIn(p.speed_mm_s); field("Max mm/s", f.mm); }
+      this.get = () => ({ velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)), acceleration: Math.min(1, Math.max(0.01, +f.a.value / 100)),
+        ...(lin ? { speed_mm_s: opt(f.mm) } : {}) });
     } else if (T === "gripper") {
       f.c = sel([["open", "Open"], ["close", "Close"], ["", "Position"]], p.command || "");
       f.p = num(p.position ?? 0, "0.05"); f.e = num(p.effort ?? "", "1"); f.e.placeholder = INFO.gripper?.effort_n ? String(INFO.gripper.effort_n) : "default";
@@ -1691,8 +1712,10 @@ pages.PROGRAMS = {
       f.pv = sel([["tcp", "the TCP (turn the tool in place)"], ["frame", "the frame's origin (orbit, e.g. around the vial axis)"]], p.pivot || "tcp");
       field("Axes of", f.fr); field("Rotate about", f.pv);
       field("Linear", h("label", { class: "chk" }, f.l, "straight line (MoveL)")); field("Velocity %", f.v);
+      f.mm = mmsIn(p.speed_mm_s); field("Max mm/s", f.mm);
       this.get = () => ({ offset_mm: f.o.map((x) => +x.value), rotate_deg: f.r.map((x) => +x.value), frame: f.fr.value,
-        pivot: f.pv.value === "tcp" ? null : "frame", cartesian: f.l.checked, velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)) });
+        pivot: f.pv.value === "tcp" ? null : "frame", cartesian: f.l.checked, velocity: Math.min(1, Math.max(0.01, +f.v.value / 100)),
+        speed_mm_s: opt(f.mm) });
     } else if (T === "move_until_contact") {
       const k = dirKey(p.direction);
       f.d = sel([...AXIS_DIRS.map(([n]) => [n, n.toUpperCase()]), ...(k ? [] : [["custom", `[${(p.direction || []).join(", ")}]`]])], k || "custom");
@@ -1700,10 +1723,11 @@ pages.PROGRAMS = {
       f.v = pctIn(p.velocity ?? 0.02); f.v.max = "10";
       f.c = sel([["fail", "fail the program"], ["continue", "continue"]], p.on_no_contact || "fail");
       field("Direction", f.d); field("Axes of", f.fr); field("At most mm", f.m); field("Contact at |ΔF| N", f.n);
-      field("Velocity %", f.v); field("No contact", f.c);
+      f.mm = mmsIn(p.speed_mm_s);
+      field("Velocity %", f.v); field("Max mm/s", f.mm); field("No contact", f.c);
       this.get = () => ({ direction: f.d.value === "custom" ? p.direction : AXIS_DIRS.find(([n]) => n === f.d.value)[1],
         frame: f.fr.value, distance_mm: +f.m.value, force_n: +f.n.value,
-        velocity: Math.min(0.1, Math.max(0.005, +f.v.value / 100)), on_no_contact: f.c.value });
+        velocity: Math.min(0.1, Math.max(0.005, +f.v.value / 100)), speed_mm_s: opt(f.mm), on_no_contact: f.c.value });
     } else if (T === "force") {
       const w = p.wrench || [0, 0, 0, 0, 0, 0];
       f.w = w.map((x, i) => num(x, i < 3 ? "0.5" : "0.05"));

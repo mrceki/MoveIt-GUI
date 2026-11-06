@@ -18,7 +18,7 @@ from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
-from . import force, jog
+from . import cart_speed, force, jog
 from .bridge_api import Snapshot, wrench_fresh
 from .calibration import CalibrationStore
 from .control_modes import CONTROL_STATE_UNKNOWN, ControlModeManager, detect_mode
@@ -346,11 +346,23 @@ class RobotCore:
         vel, acc = self.scaled(vel, acc)
         return self.run_motion(lambda: self.bridge.move_joints(list(q), vel, acc))
 
-    def move_pose(self, pose, linear: bool, vel: float, acc: float) -> Result:
-        """pose: geometry.PoseSpec (frame + TCP). Resolved to the MoveIt link goal here."""
+    def linear_speed(self, speed_mm_s, linear: bool) -> float:
+        """A linear move's TCP speed limit for the bridge: m/s after the GUI speed override, 0.0 = none (no value,
+        0, or not a linear move). Raises ValueError outside (0, profile max]."""
+        v = cart_speed.optional_mm_s(speed_mm_s, self.profile.max_cart_speed_mm_s)
+        return v / 1000.0 * self.speed_override if (v > 0 and linear) else 0.0
+
+    def move_pose(self, pose, linear: bool, vel: float, acc: float, speed_mm_s=None) -> Result:
+        """pose: geometry.PoseSpec (frame + TCP). Resolved to the MoveIt link goal here. speed_mm_s: TCP speed
+        limit of a linear move (None / 0 = only the velocity scaling)."""
         target = self.geo.planning_target(pose)          # GeometryError propagates to the caller
+        try:
+            cs = self.linear_speed(speed_mm_s, linear)
+        except ValueError as e:
+            return False, str(e)
         vel, acc = self.scaled(vel, acc)
-        return self.run_motion(lambda: self.bridge.move_pose(target.link, target.T_base_link, linear, vel, acc))
+        return self.run_motion(lambda: self.bridge.move_pose(target.link, target.T_base_link, linear, vel, acc,
+                                                             cart_speed=cs, speed_point=target.T_link_tcp[:3, 3]))
 
     # ------------------------------------------------------------------- jog
     def jog_step(self, cmd: JogCommand, step: float, vel: float, acc: float) -> Result:
@@ -603,13 +615,19 @@ class RobotCore:
         vel, acc = self.scaled(vel, acc)
         return self._keep_plan(self.bridge.plan_joints(list(q), vel, acc), "joint target")
 
-    def plan_pose(self, pose, linear: bool, vel: float, acc: float) -> Result:
+    def plan_pose(self, pose, linear: bool, vel: float, acc: float, speed_mm_s=None) -> Result:
         if self.busy:
             return False, "robot is busy"
         target = self.geo.planning_target(pose)          # GeometryError propagates to the caller
+        try:
+            cs = self.linear_speed(speed_mm_s, linear)
+        except ValueError as e:
+            return False, str(e)
         vel, acc = self.scaled(vel, acc)
-        return self._keep_plan(self.bridge.plan_pose(target.link, target.T_base_link, linear, vel, acc),
-                               f"{'linear ' if linear else ''}{pose.tcp} in {pose.frame}")
+        return self._keep_plan(self.bridge.plan_pose(target.link, target.T_base_link, linear, vel, acc,
+                                                     cart_speed=cs, speed_point=target.T_link_tcp[:3, 3]),
+                               f"{'linear ' if linear else ''}{pose.tcp} in {pose.frame}"
+                               + (f" ≤ {cs * 1000:.0f} mm/s" if cs else ""))
 
     def _keep_plan(self, traj, what: str) -> Result:
         if traj is None or not getattr(traj, "points", None):

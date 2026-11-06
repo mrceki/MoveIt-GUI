@@ -40,6 +40,7 @@ from std_srvs.srv import Trigger
 import numpy as np
 import yaml
 
+from . import cart_speed as cart_speed_mod
 from . import transforms as tf
 from .bridge_api import (DASHBOARD_COMMANDS, DASHBOARD_TIMEOUT_S, Snapshot, WrenchHistory, dashboard_lost,
                          dashboard_with_reconnect, gripper_status_dict, reconnect_gripper)
@@ -921,15 +922,26 @@ class RosBridge:
             self.log("plan: planning failed")
         return traj
 
-    def plan_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1):
-        """A JointTrajectory that brings `target_link` to T_base_link (in profile.base_link), or None."""
+    def plan_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
+                  cart_speed=0.0, speed_point=None):
+        """A JointTrajectory that brings `target_link` to T_base_link (in profile.base_link), or None.
+        cart_speed (m/s, <= 0 = none; linear moves only): the trajectory is slowed so the point `speed_point`
+        (xyz in target_link, the TCP) never goes faster (cart_speed.py: move_group ignores max_cartesian_speed)."""
         if self.moveit is None:
             self.log("plan: MoveIt not available")
             return None
+        limit = bool(cartesian) and float(cart_speed or 0.0) > 0.0
+        point_at = None
+        if limit:
+            point_at = self._speed_point(target_link, speed_point)
+            if point_at is None:         # never move faster than asked: no plan rather than an unlimited one
+                self.log(f"plan: cannot limit the speed of {target_link} (no robot model with that link)")
+                return None
         position, quat_xyzw = tf.to_pos_quat(T_base_link)
         self.set_scaling(vel, acc)
         self.log(f"plan {'linear ' if cartesian else ''}{target_link} -> "
-                 f"{[round(v, 4) for v in position]} {[round(v, 4) for v in quat_xyzw]}")
+                 f"{[round(v, 4) for v in position]} {[round(v, 4) for v in quat_xyzw]}"
+                 + (f" at <= {cart_speed * 1000.0:.0f} mm/s" if limit else ""))
         try:
             traj = self.moveit.plan(position=position, quat_xyzw=quat_xyzw, target_link=target_link,
                                     cartesian=bool(cartesian), frame_id=self.profile.base_link,
@@ -939,7 +951,30 @@ class RosBridge:
             return None
         if traj is None:
             self.log("plan: planning failed")
+        elif limit:
+            try:
+                k = cart_speed_mod.limit_speed(traj, point_at, float(cart_speed))
+            except Exception as e:      # pragma: no cover - a malformed trajectory: do not run it unlimited
+                self.log(f"plan: speed limit failed: {e}")
+                return None
+            if k > 1.0:
+                self.log(f"linear move slowed x{k:.2f} to keep the TCP at {cart_speed * 1000.0:.0f} mm/s")
         return traj
+
+    def _speed_point(self, link: str, point):
+        """cart_speed point_at for a point in `link`, from robot_description (parsed once per description)."""
+        xml = self.robot_description()
+        if not xml:
+            return None
+        if getattr(self, "_fk_xml", None) is not xml:
+            try:
+                from .robot_model import parse_urdf
+                self._fk_model = parse_urdf(xml)
+            except Exception as e:
+                self.log(f"robot_description not usable for the speed limit: {e}")
+                return None
+            self._fk_xml = xml
+        return cart_speed_mod.point_fk(self._fk_model, self.profile.base_link, link, point)
 
     def execute_trajectory(self, trajectory) -> bool:
         return self._execute_on_active_controller(trajectory)
@@ -950,11 +985,12 @@ class RosBridge:
         traj = self.plan_joints(joints, vel, acc)
         return traj is not None and self._execute_on_active_controller(traj, epoch)
 
-    def move_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1) -> bool:
+    def move_pose(self, target_link: str, T_base_link: np.ndarray, cartesian=False, vel=0.1, acc=0.1,
+                  cart_speed=0.0, speed_point=None) -> bool:
         """Move `target_link` to T_base_link (pose in profile.base_link). TCP/frame conversion
-        already happened in geometry.Geometry.planning_target."""
+        already happened in geometry.Geometry.planning_target. cart_speed / speed_point: see plan_pose."""
         epoch = self.stop_epoch
-        traj = self.plan_pose(target_link, T_base_link, cartesian, vel, acc)
+        traj = self.plan_pose(target_link, T_base_link, cartesian, vel, acc, cart_speed, speed_point)
         return traj is not None and self._execute_on_active_controller(traj, epoch)
 
     # ========================================================= planning scene

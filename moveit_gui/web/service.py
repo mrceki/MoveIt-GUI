@@ -29,6 +29,7 @@ import numpy as np
 import yaml
 
 from .. import bases as B
+from .. import cart_speed
 from .. import transforms as tf
 from ..bridge_api import wrench_fresh
 from ..calibration import CalibrationError, FixtureDef, TcpDef, config_dir, pivot_quality, solve_pivot
@@ -412,14 +413,22 @@ class WebService(WorkcellCommands):
             raise CommandError(f"unknown joint waypoint '{name}'")
         return self.cmd_move_joints([math.degrees(v) for v in w.joints], vel, acc)
 
-    def cmd_move_pose(self, frame, xyz_mm, rpy_deg, linear=False, vel=0.1, acc=0.1):
+    def _mm_s(self, speed_mm_s):
+        """OPERATE's optional mm/s of a linear move: empty / 0 = none, else in (0, profile max]."""
+        try:
+            return cart_speed.optional_mm_s(speed_mm_s, self.core.profile.max_cart_speed_mm_s)
+        except ValueError as e:
+            raise CommandError(str(e)) from None
+
+    def cmd_move_pose(self, frame, xyz_mm, rpy_deg, linear=False, vel=0.1, acc=0.1, speed_mm_s=None):
         pose = PoseSpec.from_T(frame, self.core.store.active_tcp, tf.mm_deg_to_T(xyz_mm, rpy_deg))
         v, a = _frac(vel), _frac(acc)
+        mm_s = self._mm_s(speed_mm_s)
         why = self.core.motion_refusal()
         if why:
             raise CommandError(why)
         self.core.geo.planning_target(pose)          # fail now, not in the job, if the frame/TCP is unknown
-        return self._submit("MovePose", lambda: self.core.move_pose(pose, bool(linear), v, a))
+        return self._submit("MovePose", lambda: self.core.move_pose(pose, bool(linear), v, a, mm_s))
 
     # ------------------------------------------------------- plan / preview / execute
     # Like RViz MotionPlanning: Plan computes a trajectory and nothing moves; the page previews it; Execute runs
@@ -437,11 +446,12 @@ class WebService(WorkcellCommands):
         v, a = _frac(vel), _frac(acc)
         return self._submit("plan", lambda: self._planned(self.core.plan_joints(q, v, a)))
 
-    def cmd_plan_pose(self, frame, xyz_mm, rpy_deg, linear=False, vel=0.1, acc=0.1):
+    def cmd_plan_pose(self, frame, xyz_mm, rpy_deg, linear=False, vel=0.1, acc=0.1, speed_mm_s=None):
         pose = PoseSpec.from_T(frame, self.core.store.active_tcp, tf.mm_deg_to_T(xyz_mm, rpy_deg))
         v, a = _frac(vel), _frac(acc)
+        mm_s = self._mm_s(speed_mm_s)
         self.core.geo.planning_target(pose)          # fail now, not in the job, if the frame/TCP is unknown
-        return self._submit("plan", lambda: self._planned(self.core.plan_pose(pose, bool(linear), v, a)))
+        return self._submit("plan", lambda: self._planned(self.core.plan_pose(pose, bool(linear), v, a, mm_s)))
 
     def cmd_plan_get(self):
         return self._ok(plan=self.core.plan_view(), id=self._plan_id)
@@ -1078,7 +1088,7 @@ class WebService(WorkcellCommands):
     _PARAMS = {
         "movej": {"target": str, "velocity": float, "acceleration": float, "on_fail": _choice("stop", "continue")},
         "move_pose": {"target": str, "cartesian": bool, "velocity": float, "acceleration": float,
-                      "on_fail": _choice("stop", "continue")},
+                      "speed_mm_s": float, "on_fail": _choice("stop", "continue")},
         "gripper": {"command": str, "position": float, "effort": float},
         "wait": {"seconds": float},
         "set_io": {"pin": int, "state": bool},
@@ -1090,10 +1100,10 @@ class WebService(WorkcellCommands):
         "comment": {"text": str},
         "move_relative": {"offset_mm": _floats(3), "rotate_deg": _floats(3), "frame": str, "cartesian": bool,
                           "velocity": float, "acceleration": float, "pivot": _choice("tcp", "frame"),
-                          "on_fail": _choice("stop", "continue")},
+                          "speed_mm_s": float, "on_fail": _choice("stop", "continue")},
         "move_until_contact": {"direction": _floats(3), "frame": str, "distance_mm": float, "force_n": float,
                                "velocity": float, "on_no_contact": _choice("fail", "continue"),
-                               "on_fail": _choice("stop", "continue")},
+                               "speed_mm_s": float, "on_fail": _choice("stop", "continue")},
         "force": {"wrench": _floats(6), "frame": _choice("tool", "base"), "wait": bool},
         "force_off": {"timeout_s": float},
         "zero_ft": {},
@@ -1112,6 +1122,8 @@ class WebService(WorkcellCommands):
                 new[k] = allowed[k](v)
             except (TypeError, ValueError):
                 raise CommandError(f"{k}: bad value {v!r}") from None
+            if k == "speed_mm_s" and new[k] == 0:
+                new.pop(k)                           # 0 mm/s = no limit, as on OPERATE: not saved
         if st.type in ("movej", "move_pose") and "target" in new:
             w = self.program.waypoints.get(new["target"])
             if w is None and not (st.type == "movej" and new["target"] in self.core.profile.waypoints):
@@ -1250,8 +1262,9 @@ class WebService(WorkcellCommands):
                 pose = self.program.pose_target(st)
                 self.core.geo.planning_target(pose)
                 lin = bool(st.params.get("cartesian"))
+                mm_s = st.params.get("speed_mm_s") if lin else None
                 return (self._held if hold else self._submit)(f"move here (step {path_label(path)})",
-                                                              lambda: self.core.move_pose(pose, lin, v, a))
+                                                              lambda: self.core.move_pose(pose, lin, v, a, mm_s))
         except ProgramError as e:
             raise CommandError(str(e)) from None
         raise CommandError("only move steps have a position to move to")
@@ -1488,7 +1501,7 @@ class WebService(WorkcellCommands):
             if s.type in ("movej", "move_pose"):
                 v = f"  v={round(100 * float(p['velocity']))} %" if "velocity" in p else ""
                 where = f" · {wp['frame']} / {wp['tcp']}" if wp and wp.get("frame") else ""
-                detail = f"{p.get('target') or ('joints' if s.type == 'movej' else 'pose')}{where}{v}"
+                detail = f"{p.get('target') or ('joints' if s.type == 'movej' else 'pose')}{where}{v}{s.speed_text()}"
             elif s.type == "controller":
                 m = prof.modes.get(p.get("mode"))
                 detail = m.label if m else detail
@@ -1513,7 +1526,8 @@ class WebService(WorkcellCommands):
                 try:
                     pose = self.program.pose_target(s)
                     detail = (f"{s.params.get('target', '') + ': ' if 'target' in s.params else ''}"
-                              f"{pose.frame} / {pose.tcp}{'  linear' if s.params.get('cartesian') else ''}")
+                              f"{pose.frame} / {pose.tcp}{'  linear' if s.params.get('cartesian') else ''}"
+                              f"{s.speed_text()}")
                 except Exception:
                     pass
             elif s.type == "controller":
@@ -2101,6 +2115,7 @@ class WebService(WorkcellCommands):
             "base": {"name": base, "label": B.BASES[base][0]},
             "robot": p.display_name, "profile": p.name, "ur_type": p.ur_type, "robot_ip": p.robot_ip,
             "fake": c.fake, "remote_power": remote_power(), "base_link": p.base_link, "joint_names": p.joint_names,
+            "max_cart_speed_mm_s": p.max_cart_speed_mm_s,
             "modes": [{"name": n, "label": m.label, "interface": m.command_interface, "direct_torque": m.direct_torque,
                        "experimental": m.experimental, "moveit": m.supports_moveit,
                        "allowed": m.allow_activation and not no_mode[n],
