@@ -4,7 +4,7 @@
 
 One JSON line per event: {t, time, who, key, uid, role, kind, what, details}.
   who      the name typed in the browser; key: the Tailscale login or IP (the roles.py key); uid: the public user id
-  kind     control | stop | program | policy | record | mode | power | setup | roles
+  kind     control | stop | program | policy | record | mode | power | setup | roles | batch | teach
 Secrets never go in: no lease tokens, no browser ids (only the public id), and command arguments named like
 a secret or carrying big payloads are left out of `details`. Append-only; at ROTATE_BYTES the file is renamed to
 .1 (the old .1 is dropped), so at most about twice that is kept.
@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 from .calibration import config_dir
 
 ROTATE_BYTES = 2_000_000
-KINDS = ("control", "stop", "program", "policy", "record", "mode", "power", "setup", "roles")
+KINDS = ("control", "stop", "program", "policy", "record", "mode", "power", "setup", "roles", "batch", "teach")
 _SKIP_ARGS = ("token", "bid", "client", "password", "secret", "data_b64", "text", "yaml", "rev")
 
 
