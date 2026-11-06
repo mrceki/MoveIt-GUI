@@ -58,6 +58,10 @@ from ..parts import PartError, merged_model as parts_merged
 from ..setups import SetupError
 from ..services import ServiceError
 from .workcell import WorkcellCommands
+from .flask_cmds import FLASK_ADMIN, FlaskCommands
+from ..flask_geometry import FlaskGeometryError
+from ..flask_scrape import FlaskScrapeError
+from ..flask_setup import FlaskSetupError
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
 LEASE_TIMEOUT_S = 2.5
@@ -76,11 +80,11 @@ ADMIN_COMMANDS = frozenset((
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "setup_save", "setup_delete", "setup_load",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
-    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save"))
+    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save", *FLASK_ADMIN))
 # commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
 ACTIVITY_COMMANDS = {
     **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
-                              "program_scrape_baseline", "program_save", "program_open", "program_new",
+                              "program_scrape_baseline", "program_flask_scrape", "program_save", "program_open", "program_new",
                               "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
     **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_stop")},
     **{c: "record" for c in ("record_start", "record_stop")},
@@ -145,7 +149,7 @@ def remote_power() -> bool:
     return os.environ.get("MOVEIT_GUI_LOCAL_POWER_ONLY", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
-class WebService(WorkcellCommands):
+class WebService(WorkcellCommands, FlaskCommands):
     def __init__(self, core: RobotCore, clock: Callable[[], float] = time.monotonic):
         self.core = core
         self.clock = clock
@@ -196,6 +200,7 @@ class WebService(WorkcellCommands):
         except PayloadCalibrationError as e:
             self.payload_progress["error"] = str(e)
         self._workcell_init()
+        self._flask_init()
 
     # ================================================================= polling
     def _log_error(self, what: str, e: BaseException):
@@ -482,7 +487,8 @@ class WebService(WorkcellCommands):
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError,
+                    FlaskGeometryError, FlaskScrapeError, FlaskSetupError) as e:
                 raise CommandError(str(e)) from None
             if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
                 self.program_rev += 1
@@ -2438,6 +2444,7 @@ class WebService(WorkcellCommands):
 # commands that change the open program: undoable (new/open are guarded in the browser instead)
 PROGRAM_EDITS = {"program_insert", "program_rename_waypoint", "program_update", "program_set_waypoint", "program_type_waypoint", "program_duplicate", "program_rename",
                  "program_set_yaml", "program_record", "program_delete_step", "program_move_step", "program_scrape", "program_scrape_baseline",
+                 "program_flask_scrape",
                  "program_new", "program_open"}
 UNDO_DEPTH = 50
 HOLD_TIMEOUT_S = 0.4          # hold-to-run: no renewal for this long -> STOP

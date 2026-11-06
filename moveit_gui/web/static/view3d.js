@@ -909,6 +909,42 @@ export class View3D {
         new THREE.LineBasicMaterial({ color: 0x7f8ea3 })));
     this.draw();
   }
+  // ------------------------------------------------------------ shapes
+  // Simple overlay in baseLink, mm (SETUP > Flask Geometry: the fitted flask, touches, pivot, scrape poses):
+  // {spheres: [{c, r, color, opacity}], cylinders: [{a, b, r, color, opacity}], points: [{p, color, size}],
+  //  lines: [{a, b, color}]}. null or {} clears it.
+  setShapes(sh) {
+    if (!this.shapes) { this.shapes = new THREE.Group(); this.scene.add(this.shapes); }
+    for (const o of this.shapes.children) o.traverse((x) => { if (x.geometry) x.geometry.dispose(); if (x.material) x.material.dispose(); });
+    this.shapes.clear();
+    sh = sh || {};
+    const B = this.base(), v = (p) => new THREE.Vector3(p[0] / 1000, p[1] / 1000, p[2] / 1000).applyMatrix4(B);
+    const glass = (color, opacity) => new THREE.MeshBasicMaterial({ color, transparent: true, opacity: opacity ?? 0.18,
+      depthWrite: false, side: THREE.DoubleSide });
+    for (const s of sh.spheres || []) {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(s.r / 1000, 32, 20), glass(s.color ?? 0x60a5fa, s.opacity));
+      m.position.copy(v(s.c)); m.renderOrder = 3; this.shapes.add(m);
+    }
+    for (const c of sh.cylinders || []) {
+      const a = v(c.a), b = v(c.b), len = a.distanceTo(b);
+      if (len < 1e-6) continue;
+      const m = new THREE.Mesh(new THREE.CylinderGeometry(c.r / 1000, c.r / 1000, len, 28, 1, true), glass(c.color ?? 0x60a5fa, c.opacity));
+      m.position.copy(a.clone().add(b).multiplyScalar(0.5));
+      m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.clone().sub(a).normalize());
+      m.renderOrder = 3; this.shapes.add(m);
+    }
+    const lines = (sh.lines || []).reduce((acc, l) => { (acc[l.color ?? 0x2b5fb8] ||= []).push(v(l.a), v(l.b)); return acc; }, {});
+    for (const [color, pts] of Object.entries(lines)) {
+      const l = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: +color }));
+      l.renderOrder = 4; this.shapes.add(l);
+    }
+    for (const p of sh.points || []) {
+      const m = new THREE.Mesh(new THREE.SphereGeometry((p.size ?? 3) / 1000, 12, 8),
+        new THREE.MeshBasicMaterial({ color: p.color ?? 0x2b5fb8, depthTest: p.onTop ? false : true }));
+      m.position.copy(v(p.p)); m.renderOrder = 6; this.shapes.add(m);
+    }
+    this.draw();
+  }
   // ---------------------------------------------------------- goal state
   // The orange goal robot: IK for the goal marker (the TCP pose), seeded from the arm's current joints, within
   // `limits` ({name: [lo, hi] rad}). Damped least squares on the robot model in the page: instant, nothing is sent

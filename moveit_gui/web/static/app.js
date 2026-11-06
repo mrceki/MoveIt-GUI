@@ -4,6 +4,7 @@
 
 import { jointMonitor, ftChart } from "/static/monitors.js";
 import { workcell } from "/static/workcell.js";
+import { flaskPage } from "/static/flask.js";
 import { drivers, driversBadge } from "/static/drivers.js";
 import { workspace } from "/static/views.js";
 import { extraViews } from "/static/panels.js";
@@ -2050,7 +2051,7 @@ pages.AUTOMATION = {
 pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
-  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry"]],
+  GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry", "Flask Geometry"]],
     ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]], ["GUI", ["Layouts", "Roles"]]],
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
@@ -2248,9 +2249,16 @@ pages.SETUP = {
     this.views["Parts"] = h("div", { class: "col su-main" }, pt.card, pt.editor);
     this.views["Camera calibration"] = h("div", { class: "cols" }, hc.left, hc.right);
     this.views["Setups"] = h("div", { class: "cols" }, st.card, st.side);
+    // Flask Geometry + flask scrape: flask.js
+    this.fl = flaskPage({ h, btn, note, cmd, pcmd, toast, ask, askText, lease, freedriveButton, gate, fake: () => INFO.fake,
+      repaint: () => this.sub === "Flask Geometry" && this.svPaint(true),
+      guardProgram: (what) => pages.PROGRAMS.guard(what),
+      openProgram: (r) => { pages.PROGRAMS.display(r.program, r.selected); navTo("PROGRAMS"); } });
+    this.views["Flask Geometry"] = this.fl.view;
     this.show("TCPs");
   },
   SV_PAGES: { "TCPs": "TCP frames (the active one is larger)", "Parts": "the robot with its parts (saved ones)", "Vial Geometry": "touched points and the fitted rim",
+    "Flask Geometry": "the flask, touches (blue rim, violet bulb, teal neck), next touch and pivot (orange), poses (green/red)",
     "Keep-out zones": "keep-out boxes (red = enabled)",
     "F/T + Payload": "calibration poses: the blue ghost is the selected pose" },
   async svInit() {
@@ -2278,7 +2286,7 @@ pages.SETUP = {
     }
     this.zKey = null;
     if (!full) return;
-    v.setMarkers([]); v.setPathMm(null); v.setFrames([]);
+    v.setMarkers([]); v.setPathMm(null); v.setFrames([]); v.setShapes(n === "Flask Geometry" ? this.fl.shapes() : null);
     if (n === "Parts") {
       const p = this.wc.W.parts.draft();
       v.setPartDraft(p, (pose) => this.wc.W.parts.poseFromGizmo(pose));
@@ -2378,6 +2386,7 @@ pages.SETUP = {
     } else this.body.replaceChildren(this.views[n]);
     if (n === "Drivers & cameras") this.dr.load(); else this.dr.leave();
     if (n === "Vial Geometry") cmd("vial_get").then((r) => r.ok && this.vial(r.vial));
+    if (n === "Flask Geometry") this.fl.load();
     if (n === "Controller gains") this.gLoad(true);
     if (n === "Parts") this.wc.W.parts.load();
     if (n === "TCPs") this.pivotCmd("pivot_get");
@@ -2932,6 +2941,7 @@ pages.SETUP = {
     const w = s.workcell || {}, st = w.setup || {}, c = s.calibration || {};
     const own = (c.tcps || []).filter((t) => !t.builtin).length, ko = (s.keepout?.boxes || []).filter((b) => b.enabled).length;
     const vial = (c.fixtures || []).some((f) => (f.name || f) === "vial");
+    const flask = (c.fixtures || []).some((f) => (f.name || f) === "flask");
     const nb = {
       "Setups": st.name ? (st.changed?.length || st.base_changed ? ["changed", "warn", `"${st.name}" is loaded; changed since: ` +
         [...(st.changed || []), ...(st.base_changed ? ["base"] : [])].join(", ")] : ["✓ " + st.name, "ok", `"${st.name}" is loaded, unchanged`])
@@ -2942,6 +2952,7 @@ pages.SETUP = {
       "Camera calibration": w.cams_n ? ["✓ " + w.cams_n, "ok", "saved camera calibrations"] : ["—", "", "No camera calibrated"],
       "F/T + Payload": s.payload?.saved?.file ? ["✓", "ok", "a payload calibration is saved"] : ["—", "", "No payload calibration saved"],
       "Vial Geometry": vial ? ["✓", "ok", "the vial is taught"] : null,
+      "Flask Geometry": flask ? ["✓", "ok", "the flask is saved"] : null,
       "Keep-out zones": ko ? [String(ko), "", "enabled keep-out boxes"] : null,
       "Drivers & cameras": driversBadge(w.drivers),
     };
@@ -2989,6 +3000,7 @@ pages.SETUP = {
       }
     }
     if (this.sub === "Vial Geometry") gate(this.vsave, this.vialOk);
+    if (this.sub === "Flask Geometry") this.fl.update(s);
     if (this.sub === "Controller gains" && this.gData) {
       if (this.gWasApplying && !s.gains_applying) this.gLoad(true);
       this.gWasApplying = !!s.gains_applying;
