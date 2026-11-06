@@ -517,7 +517,9 @@ pages.OPERATE = {
     this.mode = "j";
     this.planId = -1;
     import("/static/view3d.js").then((m) => this.initView(m)).catch((e) => {
-      $("#v3-msg").textContent = "3D view unavailable in this browser: " + e.message;
+      const m = $("#v3-msg");
+      if (m) m.textContent = "3D view unavailable in this browser: " + e.message;
+      else console.warn("3D view unavailable:", e);
     });
   },
   // ---- camera presets, trail, follow, TF frames overlay (drawing is in view3d.js)
