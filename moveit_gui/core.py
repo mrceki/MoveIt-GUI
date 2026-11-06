@@ -33,6 +33,7 @@ from .profile import RobotProfile, reorder_joints
 from .program import ProgramHooks, ProgramRunner, RunState
 from .recorder import NAME_RE, FakeBagProcess, Recorder
 from .ft_bias import FtBias
+from .ft_guard import FtGuard
 from .gains import Gains
 from .calibration import config_dir as _config_dir
 
@@ -122,6 +123,14 @@ class RobotCore:
         self._selected_axes: dict = {}               # mode -> admittance selected_axes (read once per mode entry)
         self._mode_seen = "unknown"
         self._plan: Optional[dict] = None            # the last plan: trajectory, preview, start, time
+        # F/T soft / hard limit (ft_guard.py): RosBridge feeds every sample from its F/T callback; other bridges
+        # (fake) get the 10 Hz snapshot reading from update()
+        self.ft_guard = FtGuard(_config_dir() / "ft_limit.yaml", on_hard=self._ft_hard_stop, log=bridge.log)
+        self.ft_guard.freedrive = lambda: bool(self.last_snap.freedrive)
+        self.ft_guard.commanding = self.commanding
+        self._ft_pushed = hasattr(bridge, "on_wrench")
+        if self._ft_pushed:
+            bridge.on_wrench = self.ft_guard.feed
         self.policies.feedback_listeners.append(self._on_policy_feedback)
         self.policies.done_listeners.append(self._on_policy_done)
         for f, e in self.policies.errors.items():
@@ -132,6 +141,8 @@ class RobotCore:
         """Poll once: snapshot, detected mode, command source. Call at the UI rate."""
         s = self.bridge.snapshot()
         self.last_snap = s
+        if not self._ft_pushed:
+            self.ft_guard.feed(s.wrench)
         if self.modes.control_state_unknown:
             self.mode = CONTROL_STATE_UNKNOWN
         else:
@@ -948,6 +959,18 @@ class RobotCore:
                 self.bridge.log(f"STOP: {type(e).__name__}: {e}")
         self.command_source = "idle"
         self.bridge.log(f"STOPPED: {reason}" if reason else "STOP GUI MOTION pressed")
+
+    def _ft_hard_stop(self, why: str):
+        """The F/T hard limit (ft_guard.py, its own thread): stop everything the GUI commands, motion first."""
+        self.bridge.log(f"F/T HARD LIMIT: {why}: stopping the GUI's motion")
+        for part in (self.bridge.cancel_motion, self.runner.stop, self.policies.cancel,
+                     lambda: self.jog_stop("F/T hard limit"), lambda: self.force_stop("F/T hard limit: zeroed")):
+            try:
+                part()
+            except Exception as e:
+                self.bridge.log(f"F/T limit stop: {type(e).__name__}: {e}")
+        self.last_refusal = f"F/T hard limit: {why}"
+        self.command_source = "idle"
 
     def commanding(self) -> bool:
         """The GUI is commanding the arm: a move, a program or policy run, a jog or a force."""

@@ -129,6 +129,7 @@ class RosBridge:
         self._t_spin = time.monotonic()                 # executor heartbeat
         self._shutting_down = False
         self.wrench_history = WrenchHistory()           # 100 Hz F/T for the web chart
+        self.on_wrench = None                           # every F/T sample, for the F/T limit (core: ft_guard.feed)
         self._joints_received = False
         self._velocities_ok = False
         self._freedrive_on = False
@@ -455,6 +456,12 @@ class RosBridge:
             self._snap.wrench = w = [f.x, f.y, f.z, t.x, t.y, t.z]
         self._t_wrench = time.monotonic()
         self.wrench_history.add(time.time(), w)
+        cb = self.on_wrench
+        if cb is not None:
+            try:
+                cb(w)
+            except Exception as e:  # pragma: no cover - never break the F/T subscription
+                self.log(f"F/T limit check failed: {e}")
 
     def _on_speed(self, msg: Float64):
         with self._lock:

@@ -315,6 +315,23 @@ the check before a run refuses a camera topic that publishes nothing. In fake mo
 Screenshots: `docs/ux/web_programs_scrape_baseline.png`, `docs/ux/web_programs_force_step.png`,
 `docs/ux/web_programs_franka_baseline.png`, `docs/ux/web_programs_orbit_step.png`.
 
+## Force limit (SETUP › F/T + Payload)
+
+A soft and a hard limit on |F| (N) and |T| (Nm) of the F/T reading as the GUI shows it (after the bias), kept in
+`~/.config/moveit_gui/ft_limit.yaml` (`moveit_gui/ft_guard.py`). Off by default; only an Admin can change it.
+Every F/T sample (about 500 Hz) is checked, on a 5-sample average so one noisy sample does not trip it.
+
+* **Soft**: the chip on the OPERATE F/T card turns amber. Nothing stops.
+* **Hard**: the chip turns red and the GUI's motion stops at once: the MoveIt motion is cancelled, the program
+  stopped, the policy cancelled, the jog stopped and an applied force zeroed (an admittance controller stays on, so
+  it gives way). Everyone gets a message. It fires once per event and re-arms when the reading is below the soft
+  limit (or 80 % of the hard one) for 0.5 s, so you can move away from the contact.
+* In freedrive it only warns: your hands are on the arm.
+* With **Zero now** the reading at rest still holds the tool weight (about 10 N on the UR7e tool): set the limits
+  above it, or use Zero all.
+* It is a GUI guard for scraping contacts, not a safety function. The robot's own limits and the e-stop stay the
+  safety.
+
 ## F/T bias (SETUP › F/T + Payload)
 
 A software bias on the ATI reading. The ATI box is never biased (keep `ft_hardware_biasing:=false`). The GUI sets

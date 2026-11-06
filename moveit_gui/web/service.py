@@ -75,7 +75,7 @@ ADMIN_COMMANDS = frozenset((
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "setup_save", "setup_delete", "setup_load",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
-    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save"))      # "Under TCP": the box top stays this far below the touching TCP
+    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save", "ft_guard_save"))      # "Under TCP": the box top stays this far below the touching TCP
 
 
 
@@ -1675,6 +1675,26 @@ class WebService(WorkcellCommands):
             raise CommandError(why)
         return self.core.ft_bias
 
+    # F/T soft / hard limit (ft_guard.py)
+    def cmd_ft_guard_get(self):
+        return {"ok": True, **self.core.ft_guard.view()}
+    cmd_ft_guard_get.read_only = True
+
+    def cmd_ft_guard_save(self, enabled=False, soft_f=0, hard_f=0, soft_t=0, hard_t=0):
+        from ..ft_guard import FtGuardError
+        try:
+            cfg = self.core.ft_guard.save({"enabled": enabled, "soft_f": soft_f, "hard_f": hard_f,
+                                           "soft_t": soft_t, "hard_t": hard_t})
+        except FtGuardError as e:
+            raise CommandError(str(e)) from None
+        lim = ", ".join(f"{k} {cfg[k]:g}" for k in ("soft_f", "hard_f", "soft_t", "hard_t") if cfg[k])
+        self.core.bridge.log(f"F/T limit {'on' if cfg['enabled'] else 'off'}" + (f": {lim}" if lim else ""))
+        return {"ok": True, "msg": "F/T limit saved", **self.core.ft_guard.view()}
+
+    def cmd_ft_guard_reset_peak(self):
+        self.core.ft_guard.reset_peak()
+        return {"ok": True}
+
     def cmd_ft_bias_get(self, refresh=False):
         if refresh:
             self.core.ft_bias.read()
@@ -2264,7 +2284,7 @@ class WebService(WorkcellCommands):
             "joint_state_age": s.joint_state_age,
             "joint_vel_dps": [round(math.degrees(v), 2) for v in s.joint_velocities] if s.joint_velocities else None,
             "tcp": tcp, "tcp_sig": tcp_sig, "tcp_off": tcp_off, "wrench": [round(v, 3) for v in s.wrench] if s.wrench else None,
-            "ft_samples": self._ft_samples(),
+            "ft_samples": self._ft_samples(), "ft_guard": c.ft_guard.view(),
             "gripper_position": s.gripper_position, "gripper_status": s.gripper_status,
             "gripper_controller": s.gripper_controllers.get(c.profile.gripper.get("controller") or ""),
             "freedrive": s.freedrive,

@@ -487,6 +487,7 @@ pages.OPERATE = {
     const ft = h("div", { class: "card" },
       h("div", { class: "row chead" }, h("span", { class: "ctitle grow", title: `Frame: ${INFO.ft_frame || "sensor frame"}` }, "F/T sensor"),
         h("span", { class: "chip hidden", id: "op-ft-bias", title: "A software bias is set (SETUP › F/T + Payload)" }, "Biased"),
+        h("span", { class: "chip hidden", id: "op-ft-lim", title: "F/T limit (SETUP › F/T + Payload): amber over the soft limit, red over the hard one" }, ""),
         h("button", { class: "btn quiet ibtn", type: "button", id: "op-ft-show", title: "Show the F/T chart under this card",
           html: icon("chart") + "<span>Chart</span>", onclick: () => this.vg.toggleChart() })),
       h("div", { class: "ft3" }, h("span", { class: "u" }, "N"), [0, 1, 2].map(ftCell),
@@ -988,6 +989,17 @@ pages.OPERATE = {
     }
     const w = s.wrench;
     $("#op-ft-bias").classList.toggle("hidden", !(s.ft_bias && s.ft_bias.bias && !s.ft_bias.raw));
+    const G = s.ft_guard, lim = $("#op-ft-lim");
+    lim.classList.toggle("hidden", !(G && G.enabled));
+    if (G && G.enabled) {
+      lim.className = "chip" + (G.level === 2 ? " err" : G.level === 1 ? " warn" : "");
+      lim.textContent = G.hard_f ? `|F| ${G.f.toFixed(0)} / ${G.hard_f} N` : `|T| ${G.t.toFixed(1)} / ${G.hard_t} Nm`;
+      const t = G.last_trip;
+      if (t && t.at !== this.ftTripSeen) {
+        if (this.ftTripSeen !== undefined && t.stopped) toast(`F/T hard limit: ${t.why}. The GUI's motion was stopped.`, false, true);
+        this.ftTripSeen = t.at;
+      }
+    }
     AXES.forEach((_, i) => {
       $(`#op-ft${i}`).textContent = w ? (w[i] >= 0 ? "+" : "") + w[i].toFixed(i < 3 ? 2 : 3) : "—";
       const lim = i < 3 ? 50 : 5, x = w ? Math.max(-1, Math.min(1, w[i] / lim)) : 0;
@@ -2309,6 +2321,40 @@ pages.SETUP = {
         "from where the arm is now is clear. Keep a hand near STOP.")))
       cmd("payload_collect", { index: this.pPick });
   },
+  // F/T limit card (ft_guard.py): soft warns, hard stops the GUI's motion
+  ftLimitCard() {
+    if (this.ftl) return this.ftl;
+    const num = (id, ph) => h("input", { type: "number", id, min: "0", step: "1", placeholder: ph, style: "width:72px" });
+    const on = h("input", { type: "checkbox", id: "su-ftl-on" });
+    const save = btn("Save", "primary", () => cmd("ft_guard_save", { enabled: on.checked,
+      soft_f: +$("#su-ftl-sf").value || 0, hard_f: +$("#su-ftl-hf").value || 0,
+      soft_t: +$("#su-ftl-st").value || 0, hard_t: +$("#su-ftl-ht").value || 0 }).then((r) => r.ok && this.ftlFill(r)),
+      "Admin only. Saved on the robot PC");
+    save.dataset.lease = "1";
+    this.ftl = h("div", { class: "card" },
+      h("div", { class: "row" }, h("div", { class: "section grow" }, "Force limit"),
+        h("label", { class: "row" }, on, "On")),
+      h("div", { class: "muted small" }, "On the F/T reading as shown above. Soft: a warning. Hard: the GUI's motion " +
+        "stops at once (program, move, policy, jog, applied force). In freedrive it only warns. 0 or empty: that limit off."),
+      h("div", { class: "row" }, h("span", { style: "width:40px" }, "|F|"), "soft", num("su-ftl-sf", "N"), "hard", num("su-ftl-hf", "N"), "N"),
+      h("div", { class: "row" }, h("span", { style: "width:40px" }, "|T|"), "soft", num("su-ftl-st", "Nm"), "hard", num("su-ftl-ht", "Nm"), "Nm"),
+      h("div", { class: "row" }, h("span", { class: "grow mono small", id: "su-ftl-now" }, ""),
+        btn("Reset peak", "quiet", () => cmd("ft_guard_reset_peak")), save),
+      h("div", { class: "small", id: "su-ftl-trip" }, ""));
+    cmd("ft_guard_get").then((r) => r.ok && this.ftlFill(r));
+    return this.ftl;
+  },
+  ftlFill(r) {
+    $("#su-ftl-on").checked = !!r.enabled;
+    for (const [k, id] of [["soft_f", "sf"], ["hard_f", "hf"], ["soft_t", "st"], ["hard_t", "ht"]]) $(`#su-ftl-${id}`).value = r[k] || "";
+  },
+  ftlLive(G) {
+    if (!this.ftl || !this.ftl.isConnected || !G) return;
+    $("#su-ftl-now").textContent = `now |F| ${G.f.toFixed(1)} N  |T| ${G.t.toFixed(2)} Nm   peak ${G.peak_f.toFixed(1)} N  ${G.peak_t.toFixed(2)} Nm`;
+    const t = G.last_trip;
+    $("#su-ftl-trip").textContent = t ? `Last hard limit: ${new Date(t.at * 1000).toLocaleTimeString()} — ${t.why}` +
+      (t.stopped ? " (stopped the GUI's motion)" : t.stopped === false ? " (nothing to stop)" : "") : "";
+  },
   show(n) {
     if (this.sub === "Parts" && n !== "Parts" && this.view) this.view.clearPartDraft();
     this.sub = n;
@@ -2317,6 +2363,7 @@ pages.SETUP = {
       if (n === "F/T + Payload") {            // the poses, their ghost, the result side by side under the bias
         this.pcols.insertBefore(this.sv, this.pcols.lastChild);
         this.body.replaceChildren(this.views[n]);
+        this.views[n].insertBefore(this.ftLimitCard(), this.pcols);
       } else this.body.replaceChildren(h("div", { class: "cols" }, this.views[n], this.sv));
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
@@ -2910,6 +2957,7 @@ pages.SETUP = {
   update(s) {
     this.navStatus(s);
     if (this.sub === "F/T + Payload" && this.fbChart) this.fbChart.push(s);
+    if (this.sub === "F/T + Payload") this.ftlLive(s.ft_guard);
     if (this.view && this.SV_PAGES[this.sub]) {          // the shared 3D view follows the arm; zones when they change
       const q = {};
       (s.joints_deg || []).forEach((x, i) => (q[INFO.joint_names[i]] = x * Math.PI / 180));
