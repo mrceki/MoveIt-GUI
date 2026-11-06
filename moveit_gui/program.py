@@ -728,6 +728,10 @@ class ProgramRunner:
         if self._thread:
             self._thread.join(timeout)
 
+    def alive(self) -> bool:
+        """The run thread is still there (it has reported its end once it is gone)."""
+        return bool(self._thread and self._thread.is_alive())
+
     # ------------------------------------------------------------------- loop
     def _wait_if_paused(self) -> bool:
         """Block while paused. Returns False if stopped (or the force could not be re-applied: _fail_msg)."""

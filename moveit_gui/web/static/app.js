@@ -222,6 +222,18 @@ function usersRender(s) {
     }
   }
 }
+// a batch waiting between runs asks the person in control (any page); the answer starts the next run or ends the batch
+let batchAskId = 0;
+function batchAsk(s) {
+  const b = s.batch, id = b && b.active && b.phase === "waiting" && holds ? b.ask_id : 0;
+  if (id === batchAskId) return;
+  if (batchAskId) dismiss("batch");
+  batchAskId = id;
+  if (!id) return;
+  const still = () => holds && S.batch && S.batch.phase === "waiting" && S.batch.ask_id === id;
+  ask(b.question, { ok: "Run", cancel: "Stop batch", key: "batch", valid: still })
+    .then((go) => { if (go != null && still()) cmd("batch_answer", { go: !!go }); });
+}
 async function releaseLease() { await post("/api/release"); holds = false; TOKEN = MYID = null; render(); }
 // Heartbeat: every 500 ms, never two at once, with a timeout. Control is lost ONLY when the server answers
 // holds:false. A failed or slow request is a connection problem (banner, keeps trying), not a lost lease: the server
@@ -1391,6 +1403,7 @@ pages.PROGRAMS = {
         btn("Record pose", "", () => this.apply(pcmd("program_record", { kind: "pose", frame: $("#pg-frame").value }))),
         btn("Record joints", "quiet", () => this.apply(pcmd("program_record", { kind: "joints" })))));
     teach.lastChild.querySelectorAll(".btn").forEach((b) => (b.dataset.lease = "1"));
+    const teachHand = this.buildTeachHand();
     const scrape = h("details", { class: "card" }, h("summary", { class: "section" }, "New scraping program"),
       h("div", { class: "muted" }, "Put the tool on the vial rim where scraping starts (freedrive), then create. Every other angle is that pose turned about the vial axis."),
       h("div", { class: "grid", style: "grid-template-columns:auto 1fr" },
@@ -1436,13 +1449,14 @@ pages.PROGRAMS = {
       h("textarea", { id: "pg-yaml", rows: "16", spellcheck: "false" }),
       btn("Apply YAML", "", () => this.apply(pcmd("program_set_yaml", { text: $("#pg-yaml").value }))));
     yamlBox.lastChild.dataset.lease = "1";
-    const teachTab = h("div", { class: "col", id: "pg-t-teach" }, teach, scrape, yamlBox);
-    const tabs = h("div", { class: "tabs" }, ["cmd:Command", "insert:Insert", "teach:Teach & more"].map((t) => {
+    const teachTab = h("div", { class: "col", id: "pg-t-teach" }, teach, teachHand, scrape, yamlBox);
+    const batchTab = this.buildBatch();
+    const tabs = h("div", { class: "tabs" }, ["cmd:Command", "insert:Insert", "teach:Teach & more", "batch:Batch"].map((t) => {
       const [k, label] = t.split(":");
       return h("a", { id: `pg-tab-${k}`, onclick: () => this.setTab(k) }, label);
     }));
     const right = h("div", { class: "card pg-right" }, tabs,
-      h("div", { id: "pg-t-cmd", class: "col" }), insertTab, teachTab);
+      h("div", { id: "pg-t-cmd", class: "col" }), insertTab, teachTab, batchTab);
     const run = h("div", { class: "runbar" },
       h("span", { class: "state", id: "pg-state" }, "READY"),
       btn("▶ RUN", "primary", () => this.run(false)), btn("Step", "", () => this.run(true)),
@@ -1486,15 +1500,16 @@ pages.PROGRAMS = {
   setTab(k) {
     if (k !== "insert") dockJog(null); else if (current === "PROGRAMS" && $("#pg-drawer").open) dockJog($("#pg-jog"));
     this.tab = k;
-    for (const t of ["cmd", "insert", "teach"]) {
+    for (const t of ["cmd", "insert", "teach", "batch"]) {
       $(`#pg-t-${t}`).classList.toggle("hidden", t !== k);
       $(`#pg-tab-${t}`).classList.toggle("on", t === k);
     }
+    if (k === "batch") { this.batchVials(); this.batchSteps(); }
   },
   row(path = this.path) { return path && this.prog ? this.prog.rows.find((r) => pathEq(r.path, path)) : null; },
   select(path) {
     this.path = path;
-    if (this.tab === "teach") this.setTab("cmd");          // Insert stays (jog, insert, jog, insert)
+    if (this.tab === "teach" && !(S && S.teach)) this.setTab("cmd");    // Insert stays (jog, insert, jog, insert)
     this.paintTree(); this.editor(); this.paint3d();
   },
   // folders and loops fold in the tree (a generated scraping program has hundreds of rows)
@@ -1585,6 +1600,17 @@ pages.PROGRAMS = {
   },
   paint3d() {
     if (!this.view || !this.prog) return;
+    if (this.teachPrev) {                        // reviewing a taught path: the raw motion (blue) and its MoveL points
+      const r = this.teachPrev;
+      this.pgStop();
+      this.pathKey = null;                       // the program path comes back when the review ends
+      this.view.setPathMm(r.raw_mm);
+      this.view.setMarkers(r.kept.map((k) => ({ ...k, selected: false })), true);
+      this.view.showGhost(null);
+      $("#pg-v3-note").style.color = "";
+      $("#pg-v3-note").textContent = `Taught path (blue) and the ${r.points} points it becomes (grey: the MoveL steps). Nothing moves.`;
+      return;
+    }
     // the program's TCP path, recomputed when the program changes (or on ↻); never while it runs
     const want = $("#pg-v3-path").checked;
     const key = want ? `${this.prog.rev}|${S && S.tcp_sig}` : "off";   // a TCP change or edit redraws it too
@@ -1645,6 +1671,7 @@ pages.PROGRAMS = {
     this.paintTree();
     this.editor();
     this.paint3d();
+    if (this.tab === "batch") this.batchSteps();
   },
   paintTree() {
     const exec = S && S.runner.state !== "IDLE" ? S.runner.path : null;
@@ -1922,6 +1949,235 @@ pages.PROGRAMS = {
     }
     const exec = st !== "IDLE" ? s.runner.path : null;
     if (JSON.stringify(exec) !== JSON.stringify(this.lastExec)) this.paintTree();
+    this.teachUpdate(s);
+    this.batchUpdate(s);
+  },
+
+  // --- Teach by hand: Record, move the arm by hand, Mark (waypoints) or Finish (path). Nothing moves by itself.
+  buildTeachHand() {
+    const sel = (id, opts, onchange) => h("select", { id, onchange }, opts.map(([v, l]) => h("option", { value: v }, l)));
+    const tol = (id, value, onchange) => h("input", { type: "number", id, value, step: "0.5", min: "0.1", style: "width:64px", onchange });
+    this.tc = {
+      rec: btn("● Record", "primary", () => this.teachStart(), "Start teaching. Then move the arm by hand (freedrive)"),
+      mark: btn("Mark", "", () => this.apply(cmd("teach_mark")), "Add the current pose as a waypoint and a move step"),
+      fin: btn("Finish", "", () => cmd("teach_finish"), "End the recording"),
+      cancel: btn("Cancel", "quiet", () => cmd("teach_cancel"), "End teaching; marks already made stay (Undo removes them)"),
+      ins: btn("Insert", "primary", () => this.teachInsert(), "Add the path as a folder of MoveL steps"),
+      discard: btn("Discard", "quiet", () => cmd("teach_cancel"), "Throw the taught path away"),
+    };
+    return h("div", { class: "card", id: "pg-tc" }, h("div", { class: "section" }, "Teach by hand"),
+      h("div", { class: "muted" }, "Press Record, then move the arm by hand (freedrive). Nothing moves by itself. " +
+        "Waypoints: each Mark adds a waypoint and a move. Path: the motion is recorded and turned into a few MoveL steps. " +
+        "Waypoints are named taught_001, taught_002, … in the frame above. Placed at the selection (Insert tab: Place)."),
+      h("div", { class: "row" }, h("span", { class: "muted" }, "Teach"),
+        sel("pg-tc-mode", [["waypoints", "Waypoints"], ["path", "Path"]], () => this.teachForm()),
+        h("span", { class: "muted", id: "pg-tc-as" }, "as"),
+        sel("pg-tc-move", [["linear", "MoveL"], ["joints", "MoveJ"], ["pose", "MoveJ to pose"]]),
+        h("label", { class: "chk", id: "pg-tc-autol", title: "Also mark by itself when the arm has stood still for 1 s after moving" },
+          h("input", { type: "checkbox", id: "pg-tc-auto" }), "Mark when still 1 s")),
+      h("div", { class: "row hidden", id: "pg-tc-tol", title: "How far the MoveL steps may be from the taught path" },
+        h("span", { class: "muted" }, "Tolerance"), tol("pg-tc-mm", "1", () => this.teachSimplify()), h("span", { class: "muted" }, "mm"),
+        tol("pg-tc-deg", "2", () => this.teachSimplify()), h("span", { class: "muted" }, "°")),
+      h("div", { class: "row" }, this.tc.rec, this.tc.mark, this.tc.fin, this.tc.cancel),
+      h("div", { class: "mono small", id: "pg-tc-status" }),
+      h("div", { class: "col hidden", id: "pg-tc-review" },
+        h("div", { class: "secondary", id: "pg-tc-res" }),
+        h("div", { class: "row" }, h("span", { class: "muted" }, "Max mm/s"),
+          h("input", { type: "number", id: "pg-tc-speed", step: "1", min: "0", style: "width:72px",
+            title: "TCP speed limit for the MoveL steps (empty: no limit). Suggested: your average speed while teaching" }),
+          h("div", { class: "grow" }), this.tc.ins, this.tc.discard)));
+  },
+  teachForm() {
+    const path = $("#pg-tc-mode").value === "path";
+    for (const id of ["#pg-tc-as", "#pg-tc-move", "#pg-tc-autol"]) $(id).classList.toggle("hidden", path);
+    $("#pg-tc-tol").classList.toggle("hidden", !path);
+  },
+  teachTol() { return { pos_tol_mm: +$("#pg-tc-mm").value, rot_tol_deg: +$("#pg-tc-deg").value }; },
+  teachStart() {
+    const path = $("#pg-tc-mode").value === "path";
+    cmd("teach_start", { mode: path ? "path" : "waypoints", move: $("#pg-tc-move").value, frame: $("#pg-frame").value,
+      auto: !path && $("#pg-tc-auto").checked, path: this.path, where: this.where, ...this.teachTol() });
+  },
+  teachSimplify() { if (S && S.teach && S.teach.phase === "review") cmd("teach_simplify", this.teachTol()); },
+  teachInsert() {
+    const v = $("#pg-tc-speed").value.trim();
+    this.apply(cmd("teach_insert", { ...this.teachTol(), speed_mm_s: v === "" ? null : +v, path: this.path, where: this.where }));
+  },
+  teachUpdate(s) {
+    const t = s.teach, review = !!(t && t.phase === "review" && t.result), r = review ? t.result : null;
+    gate(this.tc.rec, !t && s.idle && s.runner.state === "IDLE" && !(s.batch && s.batch.active));
+    gate(this.tc.mark, !!t && t.mode === "waypoints");
+    gate(this.tc.fin, !!t && t.phase === "recording");
+    gate(this.tc.cancel, !!t && !review);
+    gate(this.tc.ins, review && s.runner.state === "IDLE");
+    gate(this.tc.discard, review);
+    $("#pg-tc-mode").disabled = $("#pg-tc-move").disabled = $("#pg-tc-auto").disabled = !!t;
+    if (t && $("#pg-tc-mode").value !== t.mode) { $("#pg-tc-mode").value = t.mode; this.teachForm(); }
+    if (t && document.activeElement !== $("#pg-tc-mm") && document.activeElement !== $("#pg-tc-deg")) {
+      $("#pg-tc-mm").value = t.pos_tol_mm; $("#pg-tc-deg").value = t.rot_tol_deg;
+    }
+    let line = "";
+    if (t && t.mode === "waypoints")
+      line = `Teaching waypoints (${t.move_label}) in ${t.frame} · ${t.marks} marked` + (t.last ? ` · last ${t.last}` : "") +
+        (t.auto ? " · marks when still 1 s" : "");
+    else if (t && !review)
+      line = `● Recording the path in ${t.frame} · ${Math.round(t.elapsed_s)} s · ${t.samples} samples` +
+        (t.full ? " · full: press Finish" : "") + (t.missed ? ` · ${t.missed} missed` : "");
+    else if (review) line = "Check the path in the 3D view, then Insert or Discard.";
+    if (t && t.by && !holds) line += ` · by ${t.by}`;
+    if (t && t.error) line += ` · ${t.error}`;
+    $("#pg-tc-status").textContent = line;
+    $("#pg-tc-review").classList.toggle("hidden", !review);
+    if (review) {
+      $("#pg-tc-res").textContent = `${r.points} points from ${r.samples} samples · max ${r.max_mm.toFixed(1)} mm / ` +
+        `${r.max_deg.toFixed(1)}° off the taught path · ${r.length_mm.toFixed(0)} mm in ${r.duration_s.toFixed(1)} s · ` +
+        `average ${r.avg_mm_s.toFixed(0)} mm/s while moving`;
+      if (!this.tcFilled) $("#pg-tc-speed").value = r.speed_mm_s ?? "";    // suggest the taught speed once per review
+      this.tcFilled = true;
+    } else this.tcFilled = false;
+    const key = review ? `${r.samples}|${r.points}|${r.max_mm}|${r.max_deg}` : "";
+    if (key !== (this.teachKey || "")) {
+      this.teachKey = key;
+      this.teachPrev = review ? r : null;
+      this.paint3d();
+    }
+  },
+
+  // --- Batch: run the program several times, one thing changed per run (vial profile, one step parameter, nothing)
+  buildBatch() {
+    const sel = (id, opts, onchange) => h("select", { id, onchange }, opts.map(([v, l]) => h("option", { value: v }, l)));
+    const lab = (t) => h("span", { class: "muted" }, t);
+    this.bt = {
+      save: btn("Save", "", () => this.batchSave(), "Save the batch next to the program (<name>.batch.yaml)"),
+      load: btn("Load saved", "quiet", () => this.batchLoad(), "Load the batch saved next to the program"),
+      check: btn("Check", "quiet", () => this.batchCheck()),
+      run: btn("▶ Run batch", "primary", () => this.batchRun()),
+      stop: btn("■ Stop batch", "danger", () => cmd("batch_stop"), "End the run and the batch now"),
+    };
+    this.bt.save.dataset.lease = "1";
+    return h("div", { class: "col hidden", id: "pg-t-batch" },
+      h("div", { class: "muted" }, "Run the program several times with one thing changed per run. Each run is a normal program " +
+        "run with the usual checks. STOP ends the whole batch. The vial and the program are put back afterwards."),
+      h("div", { class: "row" }, lab("Change per run"),
+        sel("pg-b-kind", [["repeat", "Nothing (repeat)"], ["vials", "Vial profile"], ["sweep", "One step parameter"]], () => this.batchForm())),
+      h("div", { class: "row", id: "pg-b-repeat" }, lab("Runs"),
+        h("input", { type: "number", id: "pg-b-n", value: "3", min: "1", step: "1", style: "width:72px" })),
+      h("div", { class: "col hidden", id: "pg-b-vials" },
+        h("div", { class: "row", id: "pg-b-vlist" }),
+        h("div", { class: "row" }, lab("Use as fixture"), h("input", { type: "text", id: "pg-b-fx", value: "vial", style: "width:110px",
+          title: "The fixture frame the program uses; each run makes the next vial profile this fixture" }),
+          btn("↻", "quiet", () => this.batchVials(), "Reload the vial profiles"))),
+      h("div", { class: "col hidden", id: "pg-b-sweep" },
+        h("div", { class: "row" }, lab("Step"), h("select", { id: "pg-b-step", class: "grow", onchange: () => this.batchParams() })),
+        h("div", { class: "row" }, lab("Parameter"), h("select", { id: "pg-b-param", onchange: () => this.batchNow() }),
+          h("span", { class: "muted small", id: "pg-b-now" })),
+        h("div", { class: "row" }, lab("Values"), h("input", { type: "text", id: "pg-b-vals", class: "grow", placeholder: "e.g. 2, 3, 4" }))),
+      h("div", { class: "row" },
+        h("label", { class: "chk" }, h("input", { type: "checkbox", id: "pg-b-pause" }), "Ask before each next run"),
+        lab("On failure"), sel("pg-b-fail", [["stop", "stop"], ["continue", "go on"]])),
+      h("div", { class: "row" }, this.bt.save, this.bt.load, this.bt.check, h("div", { class: "grow" }), this.bt.run, this.bt.stop),
+      h("div", { class: "secondary", id: "pg-b-status" }),
+      h("div", { class: "scroll", style: "max-height:300px" },
+        h("table", { class: "hist" }, h("thead", {}, h("tr", {}, ["#", "Changed", "Result", "Time", "Recording"].map((x) => h("th", {}, x)))),
+          h("tbody", { id: "pg-b-rows" }))));
+  },
+  batchForm() {
+    const k = $("#pg-b-kind").value;
+    $("#pg-b-repeat").classList.toggle("hidden", k !== "repeat");
+    $("#pg-b-vials").classList.toggle("hidden", k !== "vials");
+    $("#pg-b-sweep").classList.toggle("hidden", k !== "sweep");
+  },
+  async batchVials() {
+    const r = await cmd("vial_profiles");
+    if (!r.ok) return;
+    const was = new Set([...document.querySelectorAll("#pg-b-vlist input:checked")].map((x) => x.value).concat(this.bWant || []));
+    this.bWant = null;
+    $("#pg-b-vlist").replaceChildren(...(r.vials.length ? r.vials.map((v) => h("label", { class: "chk" },
+      h("input", { type: "checkbox", value: v.name, checked: was.has(v.name) }), v.name))
+      : [h("span", { class: "muted" }, "No vial profiles yet (SETUP › Vial Geometry).")]));
+  },
+  batchSteps() {
+    if (!this.prog) return;
+    const sel = $("#pg-b-step"), was = this.bStepWant || sel.value;
+    this.bStepWant = null;
+    const rows = this.prog.rows.filter((r) => r.sweep && r.sweep.length);
+    sel.replaceChildren(...(rows.length ? rows.map((r) => h("option", { value: JSON.stringify(r.path), selected: JSON.stringify(r.path) === was },
+      `${r.label} ${r.title}`)) : [h("option", { value: "" }, "no step with a number to change")]));
+    this.batchParams(this.bParamWant);
+    this.bParamWant = null;
+  },
+  bRow() { const v = $("#pg-b-step").value; return v ? this.row(JSON.parse(v)) : null; },
+  batchParams(want) {
+    const r = this.bRow(), sel = $("#pg-b-param"), was = want || sel.value;
+    sel.replaceChildren(...(r ? r.sweep : []).map((o) => h("option", { value: o.key, selected: o.key === was }, o.label)));
+    this.batchNow();
+  },
+  batchNow() {
+    const r = this.bRow(), o = r && r.sweep.find((x) => x.key === $("#pg-b-param").value);
+    $("#pg-b-now").textContent = o ? `now ${o.value ?? "not set"}` : "";
+  },
+  batchDef() {
+    const r = this.bRow();
+    return { kind: $("#pg-b-kind").value, repeats: +$("#pg-b-n").value, fixture: $("#pg-b-fx").value.trim(),
+      vials: [...document.querySelectorAll("#pg-b-vlist input:checked")].map((x) => x.value),
+      step: r ? r.path : null, step_type: r ? r.type : "", param: $("#pg-b-param").value, values: $("#pg-b-vals").value,
+      pause: $("#pg-b-pause").checked, on_fail: $("#pg-b-fail").value };
+  },
+  batchFill(d) {
+    $("#pg-b-kind").value = d.kind; this.batchForm();
+    if (d.repeats) $("#pg-b-n").value = d.repeats;
+    $("#pg-b-fx").value = d.fixture || "vial";
+    $("#pg-b-pause").checked = !!d.pause;
+    $("#pg-b-fail").value = d.on_fail || "stop";
+    if (d.kind === "vials") {
+      document.querySelectorAll("#pg-b-vlist input").forEach((x) => (x.checked = false));
+      this.bWant = d.vials || []; this.batchVials();
+    }
+    if (d.kind === "sweep") {
+      this.bStepWant = JSON.stringify(d.step); this.bParamWant = d.param; this.batchSteps();
+      $("#pg-b-vals").value = (d.values || []).join(", ");
+    }
+  },
+  async batchSave() { await cmd("batch_save", { batch: this.batchDef() }); },
+  async batchLoad() {
+    const r = await cmd("batch_get");
+    if (r.ok && r.batch) this.batchFill(r.batch);
+    else if (r.ok) toast(r.msg, false);
+  },
+  async batchCheck() {
+    const r = await cmd("batch_check", { batch: this.batchDef() });
+    if (r.ok) toast(r.problems.length ? "Batch check found problems:\n• " + r.problems.join("\n• ") : `Batch OK: ${r.runs} runs.`,
+      !r.problems.length, !!r.problems.length);
+    return r;
+  },
+  async batchRun() {
+    const batch = this.batchDef();
+    const c = await cmd("batch_check", { batch });
+    if (!c.ok) return;
+    if (c.problems.length) { toast("Batch check found problems:\n• " + c.problems.join("\n• "), false, true); return; }
+    if (!INFO.fake && !(await ask(`Run ${this.prog?.name || "the program"} ${c.runs} times on the robot?\n\n` +
+      "Each run is a normal program run. STOP ends the whole batch.", { ok: "Run" }))) return;
+    cmd("batch_run", { batch });
+  },
+  batchUpdate(s) {
+    const b = s.batch;
+    if (!b) return;
+    gate(this.bt.run, !b.active && s.idle && s.runner.state === "IDLE" && !s.teach);
+    this.bt.stop.disabled = !b.active;                 // stopping needs no lease
+    const k = Math.min(b.done + 1, b.total);
+    $("#pg-b-status").textContent = b.active
+      ? `Batch of ${b.name}: run ${k} of ${b.total}` + (b.phase === "waiting" ? " · waiting for the person in control" : "")
+      : b.result ? (b.result[0] ? "✓ " : "✗ ") + b.result[1] + (b.restored ? ` · ${b.restored}` : "") : "";
+    const key = JSON.stringify(b.rows);
+    if (key === this.bRowsKey) return;
+    this.bRowsKey = key;
+    $("#pg-b-rows").replaceChildren(...b.rows.map((r) => {
+      const rec = r.recording || "", base = rec.split("/").filter(Boolean).pop() || "";
+      return h("tr", {}, h("td", {}, String(r.n)), h("td", {}, r.change),
+        h("td", { style: r.ok === false ? "color:var(--danger)" : "" }, r.ok == null ? "running…" : (r.ok ? "✓ " : "✗ ") + (r.result || "")),
+        h("td", { class: "mono" }, r.duration_s != null ? r.duration_s.toFixed(1) + " s" : ""),
+        h("td", { class: "mono", title: rec }, base));
+    }));
   },
 };
 
@@ -3280,12 +3536,18 @@ function navTo(name) {
 
 // What the robot is doing now, for the header pill and the amber banner: [text, css class, page, banner text]
 function activity(s) {
-  const r = s.runner, pol = s.policy, f = s.force;
+  const r = s.runner, pol = s.policy, f = s.force, B = s.batch;
+  const bk = B && B.active ? `Batch ${Math.min(B.done + 1, B.total)}/${B.total}` : "";
+  if (bk && B.phase === "waiting")
+    return [`❚❚ ${bk}: waiting`, "warn", "PROGRAMS", "The batch waits for the person in control to start the next run."];
   if (r.state !== "IDLE") {
     const where = r.path ? r.path.map((x) => x + 1).join(".") : "";
-    return [`${r.state === "PAUSED" ? "❚❚ Paused" : "▶"} program ${r.program || ""}${where ? " · " + where : ""}`,
+    return [`${r.state === "PAUSED" ? "❚❚ Paused" : "▶"} ${bk ? bk + " · " : ""}program ${r.program || ""}${where ? " · " + where : ""}`,
       r.state === "PAUSED" ? "warn" : "run", "PROGRAMS", ""];
   }
+  if (bk) return [`▶ ${bk}`, "run", "PROGRAMS", ""];
+  if (s.teach) return [s.teach.mode === "path" && s.teach.phase === "recording" ? "● Teaching a path" : "Teaching",
+    "warn", "PROGRAMS", "Teaching by hand on PROGRAMS: nothing moves by itself."];
   if (pol.busy) {
     const fb = pol.feedback;
     return pol.current
@@ -3387,6 +3649,7 @@ function renderHeader(s) {
   $("#lease-who").title = "Click to change your name";
   $("#lease-who").onclick = async () => { await operatorName(true); if (holds) takeLease(); };
   usersRender(s);
+  batchAsk(s);
   document.body.classList.toggle("viewing", !holds);
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
   const viewer = INFO && INFO.role === "viewer";

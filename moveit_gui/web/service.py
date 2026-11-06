@@ -58,6 +58,10 @@ from ..parts import PartError, merged_model as parts_merged
 from ..setups import SetupError
 from ..services import ServiceError
 from .workcell import WorkcellCommands
+from .teaching import TeachCommands
+from .batching import BatchCommands
+from ..batch import BatchError, sweep_options
+from ..teach import TeachError
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
 LEASE_TIMEOUT_S = 2.5
@@ -86,6 +90,8 @@ ACTIVITY_COMMANDS = {
     **{c: "record" for c in ("record_start", "record_stop")},
     **{c: "mode" for c in ("switch_mode", "freedrive", "recover")},
     **{c: "power" for c in ("power_on", "power_off", "brake_release")},
+    **{c: "batch" for c in ("batch_run", "batch_stop", "batch_save")},
+    **{c: "teach" for c in ("teach_start", "teach_insert", "teach_cancel")},
 }
 
 
@@ -145,7 +151,7 @@ def remote_power() -> bool:
     return os.environ.get("MOVEIT_GUI_LOCAL_POWER_ONLY", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
-class WebService(WorkcellCommands):
+class WebService(WorkcellCommands, TeachCommands, BatchCommands):
     def __init__(self, core: RobotCore, clock: Callable[[], float] = time.monotonic):
         self.core = core
         self.clock = clock
@@ -196,6 +202,7 @@ class WebService(WorkcellCommands):
         except PayloadCalibrationError as e:
             self.payload_progress["error"] = str(e)
         self._workcell_init()
+        self._teach_init()
 
     # ================================================================= polling
     def _log_error(self, what: str, e: BaseException):
@@ -225,6 +232,10 @@ class WebService(WorkcellCommands):
             self.drivers.tick()
         except Exception as e:
             self._log_error("drivers", e)
+        try:
+            self._teach_tick()
+        except Exception as e:
+            self._log_error("teach", e)
         self._drain_logs()
 
     def _drain_logs(self):
@@ -482,14 +493,10 @@ class WebService(WorkcellCommands):
             try:
                 out = handler(**args)
             except (GeometryError, ProgramError, CalibrationError, PayloadCalibrationError, VialGeometryError,
-                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError) as e:
+                    GainsError, FtBiasError, PartError, HandEyeError, SetupError, ServiceError, B.BaseError,
+                    TeachError, BatchError) as e:
                 raise CommandError(str(e)) from None
-            if before is not None and (before[0] != self._program_yaml() or before[1] != self.program_path):
-                self.program_rev += 1
-                if cmd in PROGRAM_EDITS:
-                    self._undo.append(before)
-                    del self._undo[:-UNDO_DEPTH]
-                    self._redo.clear()
+            if before is not None and self._record_edit(before, undoable=cmd in PROGRAM_EDITS):
                 if isinstance(out, dict) and "program" in out:
                     out["program"].update(self._history_view(), rev=self.program_rev)
         kind = "roles" if cmd == "roles_save" else "setup" if cmd in ADMIN_COMMANDS else ACTIVITY_COMMANDS.get(cmd)
@@ -497,6 +504,17 @@ class WebService(WorkcellCommands):
             self._act(kind, cmd.replace("_", " "),
                       None if holds else {"name": "someone without control", "role": role}, summarize_args(args))
         return out
+
+    def _record_edit(self, before: tuple, undoable: bool = True) -> bool:
+        """After an edit (edit lock held): a changed program gets a new revision and, if undoable, an undo entry."""
+        if before[0] == self._program_yaml() and before[1] == self.program_path:
+            return False
+        self.program_rev += 1
+        if undoable:
+            self._undo.append(before)
+            del self._undo[:-UNDO_DEPTH]
+            self._redo.clear()
+        return True
 
     def _submit(self, cmd: str, fn: Callable[[], tuple]) -> dict:
         jid = next(self._job_ids)
@@ -523,6 +541,10 @@ class WebService(WorkcellCommands):
     @staticmethod
     def _ok(msg="ok", **kw):
         return {"ok": True, "msg": msg, **kw}
+
+    @staticmethod
+    def _err(msg) -> CommandError:
+        return CommandError(msg)
 
     # ---------------------------------------------------------------- manual
     def cmd_move_joints(self, q_deg, vel=0.1, acc=0.1):
@@ -836,7 +858,7 @@ class WebService(WorkcellCommands):
     def _manual_refusal(self) -> Optional[str]:
         """Why a manual (non-motion) robot command such as the gripper is not allowed now, or None."""
         c = self.core
-        if c.runner.state.name != "IDLE":
+        if c.runner.state.name != "IDLE" or c.batch.active:
             return "a program is running: pause or stop it first"
         if c.policies.busy:
             return "a policy is running: stop it first"
@@ -1113,7 +1135,8 @@ class WebService(WorkcellCommands):
         return self.core.programs_dir
 
     def cmd_program_list(self):
-        return self._ok(files=sorted(p.name for p in self._programs_dir().glob("*.y*ml")))
+        return self._ok(files=sorted(p.name for p in self._programs_dir().glob("*.y*ml")
+                                     if not p.name.endswith(".batch.yaml")))      # PROGRAMS > Batch files
     cmd_program_list.read_only = True
 
     def cmd_program_get(self):
@@ -1121,7 +1144,7 @@ class WebService(WorkcellCommands):
     cmd_program_get.read_only = True
 
     def _editable(self):
-        if self.core.runner.state != RunState.IDLE:
+        if self.core.runner.state != RunState.IDLE or self.core.batch.active:
             raise CommandError("stop the program before editing")
 
     def cmd_program_new(self, name=None):
@@ -1301,20 +1324,25 @@ class WebService(WorkcellCommands):
         if type not in STEP_TYPES:
             raise CommandError(f"unknown step type '{type}'")
         st = self._default_step(type, params or {})
-        if path is None or path == []:
+        at = self._insert_step(st, None if path is None or path == [] else self._path(path), where)
+        return self._reply(f"added {st.title}", at)
+
+    def _insert_step(self, st: Step, path, where="after") -> tuple:
+        """Put st after / before the step at path, or into it (a container); path None = at the end. Its path."""
+        if path is None:
             self.program.steps.append(st)
-            return self._reply(f"added {st.title}", (len(self.program.steps) - 1,))
-        path = self._path(path)
+            return (len(self.program.steps) - 1,)
+        path = tuple(path)
         if where == "into":
             parent = self.program.step_at(path)
             if not parent.container:
                 raise CommandError(f"{parent.title} cannot contain steps: insert after it instead")
             parent.children.append(st)
-            return self._reply(f"added {st.title}", path + (len(parent.children) - 1,))
+            return path + (len(parent.children) - 1,)
         lst = self.program.siblings(path)
         at = path[-1] + (1 if where != "before" else 0)
         lst.insert(at, st)
-        return self._reply(f"added {st.title}", path[:-1] + (at,))
+        return path[:-1] + (at,)
 
     def cmd_program_update(self, path, params):
         self._editable()
@@ -1539,6 +1567,8 @@ class WebService(WorkcellCommands):
         return self._reply("step moved", path[:-1] + (j,))
 
     def cmd_program_run(self, start=0, step_mode=False, loop=False):
+        if self.teach is not None:
+            raise CommandError("finish teaching first (Teach & more)")
         if not self.core.idle():
             raise CommandError("robot is busy")
         if self.core.modes.control_state_unknown:
@@ -1568,6 +1598,7 @@ class WebService(WorkcellCommands):
 
     def cmd_program_stop(self):
         self.core.note_stop(self._actor()["name"] or "the operator")
+        self.core.batch.stop("stopped from PROGRAMS")       # a batch ends with its run
         self.core.runner.stop()
         return self._ok("stopping")
 
@@ -1674,7 +1705,8 @@ class WebService(WorkcellCommands):
                 problems = [str(e)]
             rows.append({"path": list(path), "label": path_label(path), "depth": len(path) - 1, "type": s.type,
                          "title": s.title, "detail": detail, "container": s.container,
-                         "params": {k: v for k, v in p.items()}, "waypoint": wp, "problems": problems})
+                         "params": {k: v for k, v in p.items()}, "waypoint": wp, "problems": problems,
+                         "sweep": sweep_options(s)})
         return rows
 
     def program_view(self) -> dict:
@@ -2412,6 +2444,8 @@ class WebService(WorkcellCommands):
             "force": {**c.force_view(), "note": c.force_note()},
             "plan": self._plan_summary(),
             "gripper_joint": c.profile.gripper.get("joint_name"),
+            "teach": self.teach_view(),
+            "batch": c.batch.view(),
         }
 
     def _ft_samples(self) -> list:
@@ -2430,6 +2464,7 @@ class WebService(WorkcellCommands):
             if p else {"id": self._plan_id}
 
     def shutdown(self):
+        self._teach_end("GUI closed")
         self._jobs.shutdown(wait=False, cancel_futures=True)
         self.drivers_stop_all()
         self.core.recorder.stop_and_wait("GUI closed")      # never leave a `ros2 bag record` running
@@ -2438,7 +2473,7 @@ class WebService(WorkcellCommands):
 # commands that change the open program: undoable (new/open are guarded in the browser instead)
 PROGRAM_EDITS = {"program_insert", "program_rename_waypoint", "program_update", "program_set_waypoint", "program_type_waypoint", "program_duplicate", "program_rename",
                  "program_set_yaml", "program_record", "program_delete_step", "program_move_step", "program_scrape", "program_scrape_baseline",
-                 "program_new", "program_open"}
+                 "program_new", "program_open", "teach_mark", "teach_insert"}
 UNDO_DEPTH = 50
 HOLD_TIMEOUT_S = 0.4          # hold-to-run: no renewal for this long -> STOP
 

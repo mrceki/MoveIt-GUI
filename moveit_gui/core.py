@@ -30,6 +30,7 @@ from .policies import PolicyLibrary
 from .policy_action import MockPolicyRunner, RunPolicyFeedback, RunPolicyResult, SubprocessPolicyRunner
 from .policy_executor import PolicyExecutor
 from .profile import RobotProfile, reorder_joints
+from .batch import BatchRunner
 from .program import ProgramHooks, ProgramRunner, RunState
 from .recorder import NAME_RE, FakeBagProcess, Recorder
 from .ft_bias import FtBias
@@ -68,7 +69,7 @@ class RobotCore:
         self.modes = ControlModeManager(
             bridge, profile, log=bridge.log,
             policy_running=lambda: self.policies.busy,
-            program_running=lambda: self.runner is not None and self.runner.state != RunState.IDLE)
+            program_running=lambda: self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active))
         # One policy runtime path: AUTOMATION and the program `policy` step both go through this.
         library = PolicyLibrary(policies_dir)
         self.policies = PolicyExecutor(library, self.modes, bridge,
@@ -94,6 +95,9 @@ class RobotCore:
         self.runner.speed_override = lambda: self.speed_override
         self.runner.robot_stopped = self._robot_stopped_during_run
         self.runner.hooks = _CoreProgramHooks(self)
+        # PROGRAMS > Batch: one program run several times; the whole batch counts as one program run (idle())
+        self.batch = BatchRunner(self)
+        self.last_run_recording = ""                 # the recording of the last program run ("" = none)
         self.last_snap = Snapshot()
         self._watchdog_why = None
         self._watchdog_stop = None
@@ -259,7 +263,7 @@ class RobotCore:
             return "a force is applied"
         if self.policies.busy:
             return "a policy is running"
-        if self.runner is not None and self.runner.state != RunState.IDLE:
+        if self.runner is not None and (self.runner.state != RunState.IDLE or self.batch.active):
             return "a program is running"
         if self.busy or self.jogging:
             return "the robot is moving"
@@ -277,7 +281,7 @@ class RobotCore:
         return ok, msg
 
     def idle(self) -> bool:
-        return not self.busy and self.runner.state == RunState.IDLE and not self.policies.busy
+        return not self.busy and self.runner.state == RunState.IDLE and not self.policies.busy and not self.batch.active
 
     def refuse(self, msg: str) -> Result:
         self.last_refusal = msg
@@ -287,7 +291,7 @@ class RobotCore:
     # ----------------------------------------------------------------- motion
     def motion_refusal(self) -> Optional[str]:
         """Why manual MoveIt motion is not allowed right now, or None."""
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy:
+        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
             return "robot is busy"
         if self.modes.control_state_unknown:
             return ("control state is UNKNOWN: GUI motion is disabled until it is recovered "
@@ -735,7 +739,7 @@ class RobotCore:
         return self.robot_refusal()
 
     def _force_claim_refusal(self) -> Optional[str]:
-        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy:
+        if self.busy or self.runner.state != RunState.IDLE or self.policies.busy or self.batch.active:
             return "robot is busy"
         return self.force_refusal()
 
@@ -988,7 +992,8 @@ class RobotCore:
         if reason:
             self.note_stop(reason)
         # each part on its own: one that raises must not keep the others (or the cancel) from running
-        for part in (lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
+        for part in (lambda: self.batch.stop("stopped by STOP"),                   # first: no next run of a batch starts
+                     lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
                      lambda: self.jog_stop("STOP"), self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
             try:
                 part()
@@ -1092,12 +1097,13 @@ class RobotCore:
         self.program_result = (ok, msg)
         self.bridge.log(f"program: {msg}")
         x = self._run_extras("program")
+        self.last_run_recording = self.recording_dir() or self._step_rec or ""
         total = int(getattr(self.runner, "steps_total", 0) or 0)
         self.history.record("program", getattr(self.runner, "program_name", "?"),
                             getattr(self.runner, "started_at", None), ok, msg.splitlines()[0] if msg else "",
                             log=x.pop("_log"), speed_override=self.speed_override,
                             steps_done=total if ok else max(0, x.pop("_step")), steps_total=total,
-                            recording=self.recording_dir() or self._step_rec or "", **{k: v for k, v in x.items() if k != "_step"})
+                            recording=self.last_run_recording, **{k: v for k, v in x.items() if k != "_step"})
         self._step_rec = None
         for fn in list(self.done_listeners):
             fn((ok, msg))
