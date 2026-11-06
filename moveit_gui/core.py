@@ -104,6 +104,9 @@ class RobotCore:
         self.last_refusal = ""
         self.mode_before_freedrive = profile.default_mode
         self.program_step = -1
+        self._runs: dict = {}                  # kind -> facts about the run going on now (see _touch_run)
+        self.log_mark: Callable[[], int] = lambda: 0                 # the web service sets these two: the log lines
+        self.log_since: Callable[[int], list] = lambda mark: []      # a run produced
         self.program_result: Optional[Tuple[bool, str]] = None
         self.policy_feedback: Optional[RunPolicyFeedback] = None
         self.policy_result: Optional[RunPolicyResult] = None
@@ -169,6 +172,7 @@ class RobotCore:
         # Startup / move_group restart / fixture re-taught: re-apply the keep-out boxes (never while moving)
         self.keepout.poll(bool(s.connected.get("MoveIt")), self.idle() and not s.freedrive)
         self._auto_record()
+        self._track_runs(s)
         self.recorder.poll()
         self.gains.poll(self.idle() and not s.freedrive)
         self.ft_bias.poll(not self.ft_bias.busy)
@@ -949,7 +953,40 @@ class RobotCore:
             return wrench_fresh(snap), still       # a frozen sensor reads as "no F/T data": the zero fails
         return self.ft_bias.zero(sample, stopped=stopped, refusal=lambda: None)
 
+    # ---------------------------------------------------------- run history facts
+    def _touch_run(self, kind: str) -> dict:
+        """Facts about the run going on now (who started it, F/T peak, log start, who stopped it)."""
+        r = self._runs.get(kind)
+        if r is None:
+            r = self._runs[kind] = {"operator": self.operator() or "", "peak_f": 0.0, "peak_t": 0.0, "stopped_by": "",
+                                    "log": self.log_mark(), "step": -1}
+        return r
+
+    def _track_runs(self, snap):
+        if self.runner.state != RunState.IDLE:
+            self._touch_run("program")
+        if getattr(self.policies, "current", None):       # cleared just before the policy's done callbacks
+            self._touch_run("policy")
+        w = snap.wrench if self._runs else None
+        if w and len(w) >= 6 and snap.wrench_age is not None and snap.wrench_age < 1.0:
+            f, t = sum(x * x for x in w[:3]) ** 0.5, sum(x * x for x in w[3:6]) ** 0.5
+            for r in self._runs.values():
+                r["peak_f"], r["peak_t"] = max(r["peak_f"], f), max(r["peak_t"], t)
+
+    def note_stop(self, who: str):
+        """Remember who ended the runs going on now (the first one counts)."""
+        for r in self._runs.values():
+            r["stopped_by"] = r["stopped_by"] or who
+
+    def _run_extras(self, kind: str) -> dict:
+        r = self._runs.pop(kind, None) or {"operator": self.operator() or "", "peak_f": 0.0, "peak_t": 0.0,
+                                           "stopped_by": "", "log": self.log_mark(), "step": -1}
+        return {"operator": r["operator"], "stopped_by": r["stopped_by"], "peak_force_n": round(r["peak_f"], 2),
+                "peak_torque_nm": round(r["peak_t"], 3), "_step": r["step"], "_log": self.log_since(r["log"])}
+
     def stop_all(self, reason: str = ""):
+        if reason:
+            self.note_stop(reason)
         # each part on its own: one that raises must not keep the others (or the cancel) from running
         for part in (lambda: self.force_stop("STOP: zeroed at once"),    # joins the stream for at most 2 s
                      lambda: self.jog_stop("STOP"), self.runner.stop, self.policies.cancel, self.bridge.cancel_motion):
@@ -1040,6 +1077,9 @@ class RobotCore:
     # ---------------------------------------------------------------- runner
     def _on_step(self, i: int):
         self.program_step = i
+        if i >= 0:
+            r = self._touch_run("program")
+            r["step"] = max(r["step"], i)
         for fn in list(self.step_listeners):
             fn(i)
 
@@ -1051,9 +1091,13 @@ class RobotCore:
     def _on_done(self, ok: bool, msg: str):
         self.program_result = (ok, msg)
         self.bridge.log(f"program: {msg}")
+        x = self._run_extras("program")
+        total = int(getattr(self.runner, "steps_total", 0) or 0)
         self.history.record("program", getattr(self.runner, "program_name", "?"),
                             getattr(self.runner, "started_at", None), ok, msg.splitlines()[0] if msg else "",
-                            speed_override=self.speed_override, recording=self.recording_dir() or self._step_rec or "")
+                            log=x.pop("_log"), speed_override=self.speed_override,
+                            steps_done=total if ok else max(0, x.pop("_step")), steps_total=total,
+                            recording=self.recording_dir() or self._step_rec or "", **{k: v for k, v in x.items() if k != "_step"})
         self._step_rec = None
         for fn in list(self.done_listeners):
             fn((ok, msg))
@@ -1066,8 +1110,10 @@ class RobotCore:
         self.policy_result = res
         name, t0 = getattr(self.policies, "started", (None, None))
         if name:
+            x = self._run_extras("policy")
+            x.pop("_step")
             self.history.record("policy", name, t0, res.success, res.stop_reason, res.log_dir or "",
-                                recording=self.recording_dir())
+                                log=x.pop("_log"), recording=self.recording_dir(), **x)
         if self.command_source.startswith("policy"):
             self.command_source = "idle"
         self.bridge.log(f"policy: {res.stop_reason}" + (f" (log {res.log_dir})" if res.log_dir else ""))

@@ -413,7 +413,7 @@ def make_handler(hub: Hub, allow_hosts=()):
                 body = self._body(MAX_UPLOAD if path == "/api/upload" else MAX_BODY)
                 client = str(body.get("token") or body.get("client") or "")        # the lease secret; STOP and /api/lease need none
                 if path == "/api/stop":
-                    return self._json(200, service.stop(self._who()))
+                    return self._json(200, service.stop(self._who(), str(body.get("bid") or ""), self._key(), self._role(need_origin=False)))
                 if path == "/api/lease":
                     op = " ".join(str(body.get("name") or "").split())[:24]   # operator name typed in the browser
                     bid = str(body.get("bid") or "")
@@ -422,10 +422,10 @@ def make_handler(hub: Hub, allow_hosts=()):
                     op = op or (service.users.label(bid) if service.users.valid(bid) else "")
                     return self._json(200, {"ok": True, "lease": service.take_lease(
                         "", f"{op} @ {self._who()}" if op else self._who(), presented=client, bid=bid,
-                        role=self._role())})
+                        role=self._role(), key=self._key())})
                 if path == "/api/ask":
                     bid = str(body.get("bid") or "")
-                    return self._json(200, service.ask_control(bid, role=self._role()))
+                    return self._json(200, service.ask_control(bid, role=self._role(), key=self._key()))
                 if path == "/api/hello":                          # this browser's name changed
                     service.users.rename(str(body.get("bid") or ""), str(body.get("name") or ""))
                     return self._json(200, {"ok": True})
