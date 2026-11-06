@@ -31,7 +31,7 @@ from .policy_action import MockPolicyRunner, RunPolicyFeedback, RunPolicyResult,
 from .policy_executor import PolicyExecutor
 from .profile import RobotProfile, reorder_joints
 from .program import ProgramHooks, ProgramRunner, RunState
-from .recorder import FakeBagProcess, Recorder
+from .recorder import NAME_RE, FakeBagProcess, Recorder
 from .ft_bias import FtBias
 from .gains import Gains
 from .calibration import config_dir as _config_dir
@@ -52,6 +52,8 @@ class RobotCore:
                                  getattr(bridge, "topic_types", lambda: []), bridge.log,
                                  spawn=FakeBagProcess if fake else None)
         self._auto_rec: Optional[str] = None         # recording directory started by auto-record
+        self.operator: Callable[[], str] = lambda: ""    # who is in control (the web service sets it)
+        self._step_rec: Optional[str] = None         # recording directory a program's record_start step began
         for note in self.store.notes:
             bridge.log(f"calibration: {note}")
         self.geo = Geometry(self.store, bridge.lookup_transform, bridge.read_pose_source)
@@ -189,6 +191,41 @@ class RobotCore:
     def recording_dir(self) -> str:
         live = self.recorder.view()["recording"]
         return live["dir"] if live else ""
+
+    def record_start(self, name: str = "", note: str = "", presets=None, source: str = "") -> Tuple[bool, str]:
+        """Start a recording with the who / what / why in meta.json. presets None = the saved selection."""
+        who = self.operator() or ""
+        run = self._run_label()
+        info = {"operator": who, "note": note or "", "mode": self.mode,
+                "program": run[1] if run and run[0] == "program" else ""}
+        return self.recorder.start(name=name or (f"program_{run[1]}" if run else ""),
+                                   source=source or f"manual ({who or 'operator'})",
+                                   run={"kind": run[0], "name": run[1], "start": time.time()} if run else None,
+                                   presets=presets, info=info)
+
+    def take_photo(self, topic: str, label: str = "") -> Tuple[bool, str]:
+        """One still from an image topic: into the running recording's photos/ folder, else <recordings>/../photos.
+        File name: <date>_<time>_<label>.jpg"""
+        grab = getattr(self.bridge, "grab_photo", None)
+        if grab is None:
+            return False, "this bridge cannot take photos"
+        jpeg, why = grab(topic)
+        if jpeg is None:
+            return False, why or f"{topic}: no image"
+        live = self.recording_dir()
+        folder = Path(live) / "photos" if live else self.recorder.root.parent / "photos"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        tag = NAME_RE.sub("_", (label or "photo").strip())[:60].strip("_") or "photo"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path, n = folder / f"{stamp}_{tag}.jpg", 1
+            while path.exists():
+                n += 1
+                path = folder / f"{stamp}_{tag}~{n}.jpg"
+            path.write_bytes(jpeg)
+        except OSError as e:
+            return False, f"cannot save the photo in {folder}: {e}"
+        return True, f"photo saved: {path}"
 
     def mode_label(self) -> str:
         m = self.profile.modes.get(self.mode)
@@ -975,7 +1012,8 @@ class RobotCore:
         self.bridge.log(f"program: {msg}")
         self.history.record("program", getattr(self.runner, "program_name", "?"),
                             getattr(self.runner, "started_at", None), ok, msg.splitlines()[0] if msg else "",
-                            speed_override=self.speed_override, recording=self.recording_dir())
+                            speed_override=self.speed_override, recording=self.recording_dir() or self._step_rec or "")
+        self._step_rec = None
         for fn in list(self.done_listeners):
             fn((ok, msg))
 
@@ -1023,3 +1061,22 @@ class _CoreProgramHooks(ProgramHooks):
 
     def zero_ft(self, stopped):
         return self.core.program_zero_ft(stopped)
+
+    def record_start(self, presets, name, note):
+        ok, msg = self.core.record_start(name=name, note=note, presets=presets or None)
+        live = self.core.recorder.view()["recording"]
+        if ok and live:
+            self.core._step_rec = live["dir"]
+        return ok, msg
+
+    def record_stop(self, reason, wait=False):
+        if wait:
+            self.core.recorder.stop_and_wait(reason)
+            return True, "recording finished"
+        return self.core.recorder.stop(reason)
+
+    def recording(self):
+        return self.core.recording_dir() or None
+
+    def photo(self, topic, label):
+        return self.core.take_photo(topic, label)

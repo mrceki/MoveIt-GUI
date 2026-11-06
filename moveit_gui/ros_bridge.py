@@ -1122,10 +1122,8 @@ class RosBridge:
         return out
 
     # Camera calibration (handeye.py): one full-resolution frame and the camera's intrinsics, on demand.
-    def grab_image(self, topic: str, timeout_s: float = 3.0):
-        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
-        or (None, why)."""
-        import cv2
+    def _next_image(self, topic: str, timeout_s: float):
+        """(type, message) of the next message on an Image / CompressedImage topic, or (None, why)."""
         types = dict(self.node.get_topic_names_and_types()).get(topic, [])
         t = next((x for x in types if x in IMAGE_TYPES), None)
         if t is None:
@@ -1146,7 +1144,15 @@ class RosBridge:
                 return None, f"{topic}: no image within {timeout_s:.0f} s"
         finally:
             self.node.destroy_subscription(sub)
-        m = got["m"]
+        return t, got["m"]
+
+    def grab_image(self, topic: str, timeout_s: float = 3.0):
+        """(gray uint8 HxW at full resolution, frame_id) of the next message on an Image / CompressedImage topic,
+        or (None, why)."""
+        import cv2
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
         try:
             if t == IMAGE_TYPE:
                 from .camera import to_gray
@@ -1158,6 +1164,28 @@ class RosBridge:
         except Exception as e:
             return None, f"{topic}: {e}"
         return img, m.header.frame_id
+
+    def grab_photo(self, topic: str, timeout_s: float = 3.0):
+        """(JPEG bytes at full resolution, "") of the next frame of an image topic, or (None, why). A JPEG
+        CompressedImage is passed through unchanged."""
+        t, m = self._next_image(topic, timeout_s)
+        if t is None:
+            return None, m
+        try:
+            if t == IMAGE_TYPE:
+                from .camera import decode_image, encode_jpeg
+                return encode_jpeg(decode_image(m.encoding, m.width, m.height, m.step, m.data,
+                                                bool(m.is_bigendian), max_width=max(1, int(m.width)))), ""
+            if "jpeg" in str(m.format).lower() or "jpg" in str(m.format).lower():
+                return bytes(m.data), ""
+            import cv2
+            from .camera import encode_jpeg
+            bgr = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None, f"{topic}: could not decode {m.format}"
+            return encode_jpeg(bgr[..., ::-1]), ""
+        except Exception as e:
+            return None, f"{topic}: {e}"
 
     def camera_info(self, topic: str, timeout_s: float = 3.0) -> Tuple[Optional[dict], str]:
         from sensor_msgs.msg import CameraInfo
