@@ -154,7 +154,8 @@ function usersFill() {
     ...us.map((u) => h("div", { class: "up-row" + (u.id === MYUID ? " me" : "") },
       h("span", { class: "up-dot" + (u.control ? " on" : "") }),
       h("span", { class: "up-name" }, u.name + (u.id === MYUID ? " (you)" : "")),
-      u.control ? h("span", { class: "chip ok" }, "control") : "",
+      u.control ? h("span", { class: "chip ok" }, S && S.lease && S.lease.away ? "control · away" : "control") : "",
+      u.role ? h("span", { class: "chip", title: "Role (SETUP › Roles)" }, u.role) : "",
       h("span", { class: "up-where muted small", title: "Where it connects from (Tailscale user or IP)" },
         u.where + (u.tabs > 1 ? ` · ${u.tabs} tabs` : "")))),
     h("div", { class: "up-foot" },
@@ -238,7 +239,7 @@ async function heartbeat() {
     if (netBad) { netBad = false; render(); }
     if (d.holds) { if (!holds) { holds = true; render(); } }
     else lostControl(S && S.lease && S.lease.client && S.lease.client !== MYID ? `${S.lease.name} took over`
-      : "another browser took it and left, or this browser went quiet for over 2.5 s (sleep, network gap, a tab in the background for long)");
+      : "this browser went quiet while the robot moved, or was away for over 2 min");
   } catch (e) {
     hbFailsSince = hbFailsSince || Date.now();
     if (!netBad && Date.now() - hbFailsSince > 800) { netBad = true; render(); }
@@ -1988,7 +1989,7 @@ pages.SETUP = {
   sub: "Setups",
   // the menu in the order a new user needs it: what is on the robot, then calibrate it, then the cell around it
   GROUPS: [["Robot", ["Setups", "Parts", "TCPs"]], ["Calibrate", ["Camera calibration", "F/T + Payload", "Vial Geometry"]],
-    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]], ["GUI", ["Layouts"]]],
+    ["Cell", ["Drivers & cameras", "Keep-out zones", "Controller gains"]], ["GUI", ["Layouts", "Roles"]]],
   build(el) {
     this.nav = h("div", { class: "list subnav" }, this.GROUPS.flatMap(([g, ns]) => [h("div", { class: "navgrp" }, g),
       ...ns.map((n) => h("div", { class: "item", "data-name": n, onclick: () => this.show(n) },
@@ -2271,6 +2272,8 @@ pages.SETUP = {
       } else this.body.replaceChildren(h("div", { class: "cols" }, this.views[n], this.sv));
       $("#su-v3-what").textContent = this.SV_PAGES[n];
       this.svInit(); this.svPaint(true);
+    } else if (n === "Roles") {
+      this.body.replaceChildren(this.rolesView());
     } else if (n === "Layouts") {          // made by OPERATE's workspace (views.js)
       this.lay = this.lay || pages.OPERATE.vg.setupView();
       this.lay.refresh();
@@ -2283,6 +2286,47 @@ pages.SETUP = {
     if (n === "TCPs") this.pivotCmd("pivot_get");
     if (n === "Camera calibration") this.wc.W.he.load();
     if (n === "Setups") this.wc.W.setups.load();
+  },
+  // ---- roles (roles.py): Viewer watches, Operator runs the robot, Admin also changes the setup
+  rolesView() {
+    const box = h("div", { class: "col su-main" });
+    const draw = (r) => {
+      const people = { ...r.people };
+      const pick = (v, on) => h("select", { onchange: (e) => on(e.target.value) },
+        ...r.roles.map((x) => h("option", { value: x, ...(x === v ? { selected: true } : {}) }, x[0].toUpperCase() + x.slice(1))));
+      let dflt = r.default;
+      const rows = h("div", { class: "col" });
+      const fill = () => rows.replaceChildren(...Object.keys(people).sort().map((k) => h("div", { class: "row" },
+        h("span", { class: "grow mono" }, k), pick(people[k], (v) => { people[k] = v; }),
+        btn("Remove", "quiet", () => { delete people[k]; fill(); }))),
+        ...(Object.keys(people).length ? [] : [h("div", { class: "muted" }, "Nobody listed: everyone gets the default role.")]));
+      fill();
+      const online = ((S && S.users) || []).filter((u) => u.key && !(u.key in people) && !/^(127\.|::1$|localhost)/.test(u.key));
+      const add = h("input", { type: "text", placeholder: "Tailscale login or IP", style: "min-width:220px" });
+      const mine = INFO.role === "admin";
+      const save = btn("Save", "primary", async () => {
+        const res = await cmd("roles_save", { default: dflt, people });
+        if (res.ok) draw(res);
+      });
+      save.dataset.lease = "1";
+      box.replaceChildren(
+        h("div", { class: "section" }, "Roles"),
+        h("div", { class: "muted" }, "Viewer: watches. Operator: runs the robot. Admin: also changes SETUP and roles. " +
+          "This PC is always Admin." + (r.saved ? "" : " Not saved yet: everyone is Admin.")),
+        h("div", { class: "muted" }, `You are ${INFO.role[0].toUpperCase() + INFO.role.slice(1)}` +
+          (INFO.key ? ` (${INFO.key})` : "") + "."),
+        h("div", { class: "row" }, h("span", { class: "grow" }, "Anyone not listed"), pick(dflt, (v) => { dflt = v; })),
+        rows,
+        h("div", { class: "row" }, add, btn("Add", "", () => {
+          const k = add.value.trim(); if (k) { people[k] = people[k] || "operator"; add.value = ""; fill(); }
+        })),
+        online.length ? h("div", { class: "col" }, h("div", { class: "muted small" }, "Open now:"),
+          ...online.map((u) => h("div", { class: "row" }, h("span", { class: "grow" }, `${u.name} · ${u.key}`),
+            btn("Add", "quiet", () => { people[u.key] = u.role || "operator"; fill(); })))) : "",
+        mine ? h("div", { class: "row" }, save) : h("div", { class: "muted" }, "Only an Admin can change roles."));
+    };
+    cmd("roles_get").then((r) => r.ok && draw(r));
+    return box;
   },
   // ---- controller gains: one table per mode, edited fields highlighted, Apply shows the change first
   buildGains() {
@@ -3175,13 +3219,16 @@ function renderHeader(s) {
   const L = s.lease;
   // (states sent just before our own takeover still name the old holder: ignore them for 2 s)
   if (L.client && L.client !== MYID && holds && Date.now() - leaseAt > 2000) lostControl(`${L.name} took over`);
-  $("#lease-who").textContent = holds ? `You (${L.name.split(" @ ")[0]})` : L.client ? `${L.name.split(" @ ")[0]} has control` : "";
+  $("#lease-who").textContent = holds ? `You (${L.name.split(" @ ")[0]})` : L.client ? `${L.name.split(" @ ")[0]} has control${L.away ? " (away)" : ""}` : "";
   $("#lease-view").hidden = holds;
   $("#lease-who").title = "Click to change your name";
   $("#lease-who").onclick = async () => { await operatorName(true); if (holds) takeLease(); };
   usersRender(s);
   document.body.classList.toggle("viewing", !holds);
   $("#lease-btn").textContent = holds ? "Release" : L.client ? "Take over" : "Take control";
+  const viewer = INFO && INFO.role === "viewer";
+  $("#lease-btn").disabled = viewer && !holds;
+  $("#lease-btn").title = viewer ? "You are a Viewer: an Admin can make you an Operator (SETUP › Roles)" : "";
   $("#lease-btn").className = "btn " + (holds ? "quiet" : "primary");
   $("#lease-btn").style.color = holds ? "var(--on-chrome2)" : "";
   document.querySelectorAll("[data-freedrive]").forEach((b) => {

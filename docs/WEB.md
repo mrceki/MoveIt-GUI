@@ -43,13 +43,21 @@ program runner and lease, and they do not know about each other.
   by itself after 45 s, and the question ends after 60 s). Give hands control straight to the one who asked, only
   while the robot is idle. For 15 s nobody else can take it. Keep tells the one who asked, who can ask again
   after 20 s. **Take over** still works without asking, but only while the robot is idle.
+- **Roles** (`web/roles.py`, SETUP › Roles). **Viewer** watches only and cannot take control. **Operator** runs the
+  robot: moves, programs, gripper, force, policies, recording. **Admin** also changes the setup: TCPs, calibrations,
+  keep-out zones, gains, parts, drivers, hand-eye, setups and roles. A person is their Tailscale login when the page
+  comes through `tailscale serve`, else their IP address. A browser on the robot PC is always Admin, so the lab can
+  never be locked out. Roles are kept in `~/.config/moveit_gui/roles.yaml`. Without that file everyone is Admin (as
+  before roles). The people list shows each person's role. STOP works for everyone.
 - **■ STOP works from every browser, with or without control** (and Esc). It stops the GUI program, MoveIt motion and the
   running policy. It is not an emergency stop: the pendant e-stop is.
   A STOP pressed while MoveIt is still planning (or while the move waits to start) also counts: that move is never sent.
 - **Heartbeat.** The controlling browser checks in every 500 ms (one at a time, 2 s timeout), and every request that
   carries the control token (commands, jog and force renewals, hold-to-run) counts as one too. If the robot PC hears
-  nothing for 2.5 s (closed laptop, Wi-Fi gone, tab killed), it **stops everything** and ends freedrive. If the robot
-  was idle, it simply drops the lease. The robot-PC log says why and for how long it was silent ("lost contact with
+  nothing for 2.5 s (closed laptop, Wi-Fi gone, tab killed) while the robot moves, it **stops everything** and ends
+  freedrive. If the robot was idle, the holder is only **away** (a tab in the background, a short gap): it keeps
+  control for 2 minutes and is back with its next heartbeat. The header and the people list show "(away)". An away
+  holder never stops the robot, and anyone can take over from it. After 2 minutes away, control is dropped. The robot-PC log says why and for how long it was silent ("lost contact with
   <name> (no heartbeat for 2.6 s, limit 2.5 s)").
 - **Lost control, or just a slow link?** A page declares "You lost control" **only when the robot PC answers that it no
   longer holds the lease** (it timed out, or someone took over). If the answer does not arrive (network hiccup, the
@@ -58,8 +66,8 @@ program runner and lease, and they do not know about each other.
 - **Control token.** Take control makes the robot PC issue a random secret token, sent only to that browser. Every
   command, heartbeat and release must carry it (STOP and the read-only status calls need none). The state everyone
   watches shows only the holder's name and a public id, which is no credential. The token lives in the tab's
-  `sessionStorage`: **reloading the tab keeps control** (if the reload takes less than 2.5 s), a duplicated tab does
-  not inherit it. Closing the tab drops control after 2.5 s.
+  `sessionStorage`: **reloading the tab keeps control**, a duplicated tab does not inherit it. Closing the tab with
+  the robot idle drops control after 2 minutes (or at once when someone takes over).
 - **Take over** from another browser is only possible while the robot is idle. The browser that loses control
   gets a message that stays until dismissed ("You lost control: <name> took over").
 - **Operator names.** The first Take control asks for your name (kept in that browser); the header then shows

@@ -32,7 +32,7 @@ class Users:
     def valid(bid) -> bool:
         return isinstance(bid, str) and bool(BID.match(bid))
 
-    def open(self, bid: str, name: str = "", where: str = "") -> Optional[str]:
+    def open(self, bid: str, name: str = "", where: str = "", key: str = "", role: str = "") -> Optional[str]:
         """A tab of this browser opened the state stream. Returns its public id (None: no usable id)."""
         if not self.valid(bid):
             return None
@@ -40,10 +40,12 @@ class Users:
         with self._lock:
             u = self._b.get(bid)
             if u is None or (u["gone"] and now - u["gone"] > GONE_S):
-                u = self._b[bid] = {"id": public_id(bid), "name": "", "where": where, "tabs": 0, "since": now, "gone": 0.0}
+                u = self._b[bid] = {"id": public_id(bid), "name": "", "where": where, "tabs": 0, "since": now, "gone": 0.0,
+                                    "key": key, "role": role}
             u["tabs"] += 1
             u["gone"] = 0.0
             u["where"] = where or u["where"]
+            u["key"], u["role"] = key or u["key"], role or u["role"]
             if clean_name(name):
                 u["name"] = clean_name(name)
             return u["id"]
@@ -88,5 +90,5 @@ class Users:
                 seen[name] = seen.get(name, 0) + 1
                 out.append({"id": u["id"], "name": name if seen[name] == 1 else f"{name} ({seen[name]})",
                             "where": u["where"], "tabs": u["tabs"], "control": u["id"] == holder,
-                            "for_s": round(now - u["since"])})
+                            "for_s": round(now - u["since"]), "key": u["key"], "role": u["role"]})
             return out

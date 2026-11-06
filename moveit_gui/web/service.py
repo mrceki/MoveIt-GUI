@@ -5,6 +5,9 @@ Safety rules for a robot driven over a network:
     browsers only watch. STOP is accepted from anyone, without a lease.
   * The lease holder sends a heartbeat. If it stops for LEASE_TIMEOUT_S while the robot is doing anything
     (motion, program, policy, freedrive, payload run), everything is stopped and the lease is dropped.
+    If the robot is idle, the holder is only "away" (a tab in the background, a short network gap): it keeps control
+    for IDLE_LEASE_S, and its next heartbeat or command brings it back. An away holder never stops the robot (someone
+    may use the teach pendant meanwhile); anyone may take over from it, as always while idle.
   * Taking the lease from another browser is only possible while the robot is idle.
   * Motion rules (busy, UNKNOWN control state, MoveIt-capable mode) are RobotCore's, not this file's.
 
@@ -43,6 +46,7 @@ from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
 from ..policies import RecordingOptions
 from .users import Users, public_id
+from .roles import Roles, RolesError, at_least
 from ..program import CONTAINER_STEPS, STEP_TYPES, Program, ProgramError, ProgramWaypoint, RunState, Step, path_label, walk
 from ..program_path import simulate
 from ..robot_model import model_or_error
@@ -55,9 +59,22 @@ from .workcell import WorkcellCommands
 from ..scrape_pattern import ScrapeBaseline, ScrapePattern, ScrapePatternError, build, build_baseline
 
 LEASE_TIMEOUT_S = 2.5
+IDLE_LEASE_S = 120.0       # an away holder (robot idle) keeps control this long
 LOG_EVERY_S = 30.0          # rate limit for repeated watchdog / tick errors
 VIAL_POINTS = ("Rim 1", "Rim 2", "Rim 3", "Bottom")
-KEEPOUT_TCP_CLEARANCE_MM = 5.0      # "Under TCP": the box top stays this far below the touching TCP
+KEEPOUT_TCP_CLEARANCE_MM = 5.0
+# commands that change the setup rather than run the robot: Admin only (roles.py)
+ADMIN_COMMANDS = frozenset((
+    "tcp_save", "tcp_delete", "pivot_reset", "pivot_capture", "pivot_remove", "pivot_solve", "pivot_save",
+    "gains_apply", "gains_apply_policy", "gains_forget", "gains_restore", "gains_preset_save", "gains_preset_delete",
+    "ft_bias_set", "ft_bias_clear", "ft_bias_preset_save", "ft_bias_preset_delete",
+    "keepout_save", "keepout_enable", "keepout_delete", "keepout_apply",
+    "vial_capture", "vial_reset", "vial_save", "vial_use_example", "vial_profile_save", "vial_profile_delete",
+    "payload_collect", "payload_evaluate", "payload_reset", "payload_save", "payload_apply", "record_configure",
+    "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
+    "parts_make_tcp", "base_switch", "setup_save", "setup_delete", "setup_load",
+    "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
+    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save"))      # "Under TCP": the box top stays this far below the touching TCP
 
 
 
@@ -95,6 +112,7 @@ class Lease:
         self.name = ""
         self.seen = 0.0
         self.uid: Optional[str] = None               # the holder's public user id (users.py), if its page sent one
+        self.away = False                            # went quiet while the robot was idle (see IDLE_LEASE_S)
 
     @property
     def client(self) -> Optional[str]:               # truthy while somebody holds the lease
@@ -104,7 +122,7 @@ class Lease:
         return bool(token) and bool(self.token) and secrets.compare_digest(str(token), self.token)
 
     def view(self) -> dict:
-        return {"client": self.id, "name": self.name, "uid": self.uid}
+        return {"client": self.id, "name": self.name, "uid": self.uid, "away": self.away}
 
 
 def remote_power() -> bool:
@@ -120,6 +138,7 @@ class WebService(WorkcellCommands):
         self.lease = Lease()
         self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
         self.users = Users(clock)                         # who has the page open (one per browser)
+        self.roles = Roles(Path(os.environ.get("MOVEIT_GUI_ROLES") or config_dir() / "roles.yaml"))
         self.asking: Optional[dict] = None                # someone asks the holder for control: {uid, name, at, kept}
         self.offer: Optional[dict] = None                 # the holder gave control to {uid, name, until}
         self._lock = threading.RLock()
@@ -205,16 +224,29 @@ class WebService(WorkcellCommands):
             silent = self.clock() - lease.seen
             if not (lease.token and silent > LEASE_TIMEOUT_S):
                 return
-            self.lease = Lease()
+            if lease.away:
+                if silent <= IDLE_LEASE_S:
+                    return                                # away: never stops anything
+                self.lease = Lease()
         who = lease.name or lease.id
+        if lease.away:
+            self.core.bridge.log(f"web: {who} was away for {silent:.0f} s (limit {IDLE_LEASE_S:.0f} s): control released")
+            return
         try:
             active = not self.core.idle() or self.core.last_snap.freedrive or self.payload_progress["running"]
         except Exception:
             active = True                                 # cannot tell: be safe
         if not active:
-            self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
-                                 f"{LEASE_TIMEOUT_S:.1f} s): control released")
+            with self._lease_lock:
+                if self.lease is lease and self.clock() - lease.seen > LEASE_TIMEOUT_S:
+                    lease.away = True
+            self.core.bridge.log(f"web: {who} went quiet (no heartbeat for {silent:.1f} s) with the robot idle: "
+                                 f"keeps control for {IDLE_LEASE_S:.0f} s unless someone takes over")
             return
+        with self._lease_lock:
+            if self.lease is not lease or self.clock() - lease.seen <= LEASE_TIMEOUT_S:
+                return                                    # taken over, or a heartbeat came meanwhile
+            self.lease = Lease()
         self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
                              f"{LEASE_TIMEOUT_S:.1f} s): STOPPING")
         for what, fn in (("stop_all", self.core.stop_all),
@@ -227,11 +259,14 @@ class WebService(WorkcellCommands):
                 self._log_error(f"lease stop ({what})", e)
 
     # =================================================================== lease
-    def take_lease(self, client: str = "", name: str = "", presented: str = "", bid: str = "") -> dict:
+    def take_lease(self, client: str = "", name: str = "", presented: str = "", bid: str = "",
+                   role: str = "admin") -> dict:
         """Returns {client: public id, name, uid, token: secret}. The token is shown only here; keep it out of logs.
         client: the token to install (in-process callers and tests); empty = a random one, which is what the HTTP
         layer always uses. presented: the token the caller already holds, so the holder may take again.
         bid: the browser's own id (users.py), so the users list can say who has control."""
+        if not at_least(role, "operator"):
+            raise CommandError("you are a Viewer: an Admin can make you an Operator (SETUP › Roles)")
         uid = public_id(bid) if Users.valid(bid) else None
         with self._lease_lock:
             cur = self.lease
@@ -257,8 +292,10 @@ class WebService(WorkcellCommands):
     KEPT_S = 8.0      # "kept" is shown to the one who asked this long
     OFFER_S = 15.0    # control given to someone waits this long for them to take it
 
-    def ask_control(self, bid: str, name: str = "") -> dict:
+    def ask_control(self, bid: str, name: str = "", role: str = "admin") -> dict:
         """A browser without control asks the holder for it (the holder's page shows a pop-up: Give / Keep)."""
+        if not at_least(role, "operator"):
+            raise CommandError("you are a Viewer: an Admin can make you an Operator (SETUP › Roles)")
         if not Users.valid(bid):
             raise CommandError("this page has no browser id: reload it")
         uid = public_id(bid)
@@ -313,6 +350,7 @@ class WebService(WorkcellCommands):
         with self._lease_lock:
             if self.lease.holds(token):
                 self.lease.seen = self.clock()
+                self.lease.away = False
                 return True
             return False
 
@@ -320,6 +358,19 @@ class WebService(WorkcellCommands):
         with self._lease_lock:
             if self.lease.holds(token):
                 self.lease = Lease()
+
+    # ------------------------------------------------------------------ roles
+    def cmd_roles_get(self):
+        return {"ok": True, **self.roles.view()}
+    cmd_roles_get.read_only = True
+
+    def cmd_roles_save(self, default="admin", people=None):
+        try:
+            self.roles.save(str(default), dict(people or {}))
+        except RolesError as e:
+            raise CommandError(str(e)) from None
+        self.core.bridge.log(f"web: roles saved (default {default}, {len(people or {})} people)")
+        return {"ok": True, "msg": "roles saved", **self.roles.view()}
 
     def stop(self, who: str = "") -> dict:
         """Anyone may stop. Synchronous."""
@@ -330,11 +381,14 @@ class WebService(WorkcellCommands):
         return {"ok": True, "msg": "stopped"}
 
     # ================================================================ commands
-    def command(self, client: str, cmd: str, args: dict, local: bool = False) -> dict:
-        """local: the browser runs on the robot PC (decided by the server from the connection, never by the page)."""
+    def command(self, client: str, cmd: str, args: dict, local: bool = False, role: str = "admin") -> dict:
+        """local: the browser runs on the robot PC (decided by the server from the connection, never by the page).
+        role: the caller's role (roles.py, decided by the server); in-process callers and tests are admin."""
         handler = getattr(self, f"cmd_{cmd}", None)
         if handler is None:
             raise CommandError(f"unknown command '{cmd}'")
+        if cmd in ADMIN_COMMANDS and not at_least(role, "admin"):
+            raise CommandError(f"only an Admin can change the setup (you are {role.capitalize()})")
         local_only = getattr(handler, "local_only", False)
         if local_only and not local and not remote_power():
             raise CommandError("only from a browser on the robot PC, where you can see the robot "
