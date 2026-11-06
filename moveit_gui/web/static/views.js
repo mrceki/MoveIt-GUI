@@ -453,8 +453,9 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
     }
   }
   const midSize = () => { const m = el.querySelector(":scope > .lmid"); return m ? { w: m.clientWidth, h: m.clientHeight } : { w: 0, h: 0 }; };
-  // the row under the 3D view, as tall as its pictures need for the whole width; 0: it does not fit (too tall or
-  // too low), then the row keeps its own height (its line) and the pictures letterbox
+  // the row under the 3D view, as tall as its pictures need for the whole width; 0: it does not fit (the 3D view
+  // keeps at least half the height, e.g. one camera alone would be too tall), then the row keeps its own height
+  // (its line) and the pictures letterbox
   function fitBottomH() {
     const S = L();
     if (!S.bottom.length || !stackFit("bottom")) return 0;
@@ -463,7 +464,7 @@ export function workspace({ h, cmd, toast, cards, view3d, ftEl, ftBtn, header, o
     const sumAr = S.bottom.reduce((a, id) => a + fitAr(id), 0);
     const n = S.bottom.length - S.bottom.filter(isMin).length;
     const v = Math.round((Wr - n * W.ch.w) / sumAr + W.ch.h);
-    return v >= MINH && v <= H - MAIN_MINH ? v : 0;
+    return v >= MINH && v <= Math.min(H / 2, H - MAIN_MINH) ? v : 0;
   }
   // the stack beside the 3D view, as wide as its pictures need for the whole height; 0: it does not fit (the 3D view
   // keeps at least half the width), then the stack keeps its own width (its line)

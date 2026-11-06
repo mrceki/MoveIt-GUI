@@ -142,7 +142,9 @@ red button named after it.
       picture's shape. Under the 3D view the row height follows the cameras' width. Beside it the stack width
       follows the cameras' height. In a side column the height follows the column width. While it fits, the line
       it sets is off. It falls back to the line (and the picture letterboxes) if fitting would leave the 3D view too
-      little room, or with fit off.
+      little room (the 3D view always keeps at least half the height and half the width; one camera alone under
+      it would be too tall), or with fit off.
+    * The F/T chart has no number line under the plot; the F/T sensor card shows the numbers.
     * **−** minimises a window to its title bar, in place. Nothing else moves.
     * F/T sensor › **Chart** opens the chart right under the card (press again to close it). That chart stays
       attached to the card: it cannot be minimised or dragged, and it moves with the card.

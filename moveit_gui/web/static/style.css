@@ -798,12 +798,11 @@ body.ledit .ltile .lbar > .vtool[hidden] { display: none !important; }
   .ltile.lft .ftc-body > .ftc-canvas { grid-column: 1 / -1; grid-row: 2; }
   .ltile.lft .ftc-body > .row:last-child { grid-column: 2; grid-row: 1; flex-wrap: nowrap; align-self: center; }
   body:not(.ledit) .ltile.lft .ftc-body > .row:last-child { padding-right: 32px; }
-  .ltile.lft .ftc-read { flex: none; width: 200px; text-align: right; }
+  .ltile.lft .ftc-read { display: none; }
   .ltile.lft .ftc-chips { gap: 3px !important; }
   .ltile.lft .ftc-chip { padding: 0 6px; }
   body:not(.ledit) .ltile.lft .ftc-chips { padding-left: 76px; }
 }
-@container (max-width: 1000px) { .ltile.lft .ftc-read { display: none; } }
 
 /* fit to picture (camera bar) */
 .vtool.fiton { color: var(--accent); background: var(--sunken); }
