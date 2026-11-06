@@ -68,7 +68,7 @@ async function post(path, body = {}, silent = false) {
   let r, data;
   try {
     r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ token: TOKEN, ...body }) });
+                            body: JSON.stringify({ token: TOKEN, bid: BID, ...body }) });
     data = await r.json();
   } catch (e) {
     data = { ok: false, msg: `no answer from the robot PC (${e.message})` };
@@ -2996,6 +2996,10 @@ pages.SETUP = {
 };
 
 // ============================================================== DIAGNOSTICS
+function outcomeText(e) {
+  const o = e.outcome || (e.ok ? "finished" : "failed");
+  return o === "finished" ? "✓ finished" : o === "stopped" ? `✗ stopped by ${e.stopped_by}` : `✗ failed: ${e.result}`;
+}
 pages.DIAGNOSTICS = {
   build(el) {
     el.append(h("div", { class: "cols" },
@@ -3004,10 +3008,24 @@ pages.DIAGNOSTICS = {
       this.buildRec(),
       h("div", { class: "card", style: "margin-top:8px" },
         h("div", { class: "row" }, h("span", { class: "section" }, "Run history"), h("div", { class: "grow" }),
-          h("span", { class: "muted small", id: "dg-hfile" }), btn("Refresh", "quiet", () => this.history())),
-        h("div", { class: "scroll", style: "max-height:220px" }, h("table", { class: "hist" },
-          h("thead", {}, h("tr", {}, ["When", "What", "Name", "Duration", "Result", "Log"].map((x) => h("th", {}, x)))),
-          h("tbody", { id: "dg-hist" })))),
+          h("select", { id: "dg-hname", onchange: () => this.history(), title: "Show one program or policy only" },
+            h("option", { value: "" }, "All programs")),
+          btn("Refresh", "quiet", () => this.history())),
+        h("div", { class: "scroll", style: "max-height:240px" }, h("table", { class: "hist" },
+          h("thead", {}, h("tr", {}, ["When", "What", "Name", "Started by", "Length", "Steps", "Result", "Recording"].map((x) => h("th", {}, x)))),
+          h("tbody", { id: "dg-hist" }))),
+        h("div", { class: "muted small", id: "dg-hfile", style: "margin-top:4px" }),
+        h("div", { id: "dg-hdetail" })),
+      h("div", { class: "card", style: "margin-top:8px" },
+        h("div", { class: "row" }, h("span", { class: "section" }, "Activity"), h("div", { class: "grow" }),
+          h("select", { id: "dg-awho", onchange: () => this.activity(), title: "Show one person only" },
+            h("option", { value: "" }, "Everyone")),
+          h("select", { id: "dg-akind", onchange: () => this.activity(), title: "Show one kind of event only" },
+            h("option", { value: "" }, "All kinds"))),
+        h("div", { class: "scroll", style: "max-height:260px" }, h("table", { class: "hist" },
+          h("thead", {}, h("tr", {}, ["When", "Who", "What", "Details"].map((x) => h("th", {}, x)))),
+          h("tbody", { id: "dg-act" }))),
+        h("div", { class: "muted small", id: "dg-afile", style: "margin-top:4px" })),
       h("div", { class: "card", style: "margin-top:8px" },
         h("div", { class: "row" }, h("span", { class: "section" }, "Log"), h("div", { class: "grow" }),
           h("input", { type: "search", id: "dg-q", placeholder: "filter…", style: "width:160px", oninput: () => this.show() }),
@@ -3024,7 +3042,6 @@ pages.DIAGNOSTICS = {
     const lines = logs.filter((l) => (!q || l.toLowerCase().includes(q)) && (!bad || PROBLEM.test(l)));
     $("#dg-log").textContent = lines.join("\n");
     $("#dg-log").scrollTop = 1e9;
-    if (Date.now() - (this.histT || 0) > 5000) this.history();
     if (Date.now() - (this.recT || 0) > 5000) this.recCatalog();
   },
 
@@ -3127,18 +3144,62 @@ pages.DIAGNOSTICS = {
     if (!live && this.recLive) { this.recLive = null; setTimeout(() => this.recCatalog(), 500); }
   },
   async history() {
-    this.histT = Date.now();
-    const r = await cmd("history", { n: 100 });
+    const sel = $("#dg-hname"), r = await cmd("history", { n: 500, name: sel.value });
     if (!r.ok) return;
-    $("#dg-hfile").textContent = r.file;
-    $("#dg-hist").replaceChildren(...(r.runs.length ? r.runs.map((e) => h("tr", {},
+    this.histKey = S && S.history_last;
+    if (r.names.join("|") !== this.hnames) {
+      this.hnames = r.names.join("|");
+      sel.replaceChildren(h("option", { value: "" }, "All programs"),
+        ...r.names.map((n) => h("option", { value: n, selected: n === sel.value }, n)));
+    }
+    $("#dg-hfile").textContent = `The last ${r.keep} runs are kept (older ones are dropped). File: ${r.file}`;
+    $("#dg-hist").replaceChildren(...(r.runs.length ? r.runs.map((e) => h("tr", {
+      class: e.id && e.id === this.hsel ? "sel" : "", style: "cursor:pointer", title: "Click for details",
+      onclick: () => this.historyOpen(e) },
       h("td", { class: "mono" }, new Date(e.start * 1000).toLocaleString()), h("td", {}, e.kind), h("td", {}, e.name),
+      h("td", {}, e.operator ? e.operator.split(" @ ")[0] : "—"),
       h("td", { class: "num" }, e.duration_s ? e.duration_s.toFixed(1) + " s" : "—"),
-      h("td", { style: `color:var(--${e.ok ? "ok" : "danger"})` }, (e.ok ? "✓ " : "✗ ") + e.result),
-      h("td", { class: "mono small" }, [e.log_dir, e.recording && "bag: " + e.recording.split("/").pop()].filter(Boolean).join("  ·  ")))) :
-      [h("tr", {}, h("td", { class: "muted" }, "No runs yet."))]));
+      h("td", { class: "num" }, e.steps_total ? `${e.steps_done} of ${e.steps_total}` : "—"),
+      h("td", { style: `color:var(--${e.outcome === "finished" ? "ok" : "danger"})` }, outcomeText(e)),
+      h("td", { class: "mono small" }, e.recording ? e.recording.split("/").pop() : "")))
+      : [h("tr", {}, h("td", { class: "muted" }, "No runs yet."))]));
+  },
+  async historyOpen(e) {
+    this.hsel = e.id;
+    const r = e.id ? await cmd("history_get", { id: e.id }) : { ok: true, run: e };
+    const box = $("#dg-hdetail");
+    if (!r.ok) { box.replaceChildren(h("div", { class: "muted small" }, r.msg || "not found")); return; }
+    const x = r.run, kv = (k, v) => [h("span", { class: "k" }, k), h("span", { class: "v", style: "text-align:left" }, String(v))];
+    box.replaceChildren(h("div", { class: "section", style: "margin-top:8px" }, `${x.kind} ${x.name}: ${outcomeText(x)}`),
+      h("div", { class: "grid" },
+        ...kv("Started", new Date(x.start * 1000).toLocaleString()), ...kv("Started by", x.operator || "—"),
+        ...kv("Length", (x.duration_s || 0).toFixed(1) + " s"),
+        ...kv("Steps", x.steps_total ? `${x.steps_done} of ${x.steps_total}` : "—"),
+        ...kv("Result", x.result || "—"), ...kv("Stopped by", x.stopped_by || "—"),
+        ...kv("F/T peak", x.peak_force_n == null ? "—" : `${x.peak_force_n} N, ${x.peak_torque_nm} Nm`),
+        ...kv("Recording", x.recording || "—"), ...(x.log_dir ? kv("Policy log", x.log_dir) : [])),
+      h("pre", { class: "log", style: "max-height:200px;margin-top:4px" },
+        x.log && x.log.length ? x.log.join("\n") : "No log lines kept for this run."));
+    this.history();
+  },
+  async activity() {
+    const who = $("#dg-awho"), kind = $("#dg-akind"), r = await cmd("activity", { n: 300, who: who.value, kind: kind.value });
+    if (!r.ok) return;
+    this.actSeq = S && S.activity_seq;
+    if (r.people.join("|") !== this.apeople) {
+      this.apeople = r.people.join("|");
+      who.replaceChildren(h("option", { value: "" }, "Everyone"), ...r.people.map((n) => h("option", { value: n, selected: n === who.value }, n)));
+    }
+    if (!kind.options[1]) kind.append(...r.kinds.map((k) => h("option", { value: k }, k)));
+    $("#dg-afile").textContent = `Newest first, up to 300 events. Read-only. File: ${r.file}`;
+    $("#dg-act").replaceChildren(...(r.events.length ? r.events.map((e) => h("tr", {},
+      h("td", { class: "mono" }, e.time), h("td", { title: [e.key, e.role].filter(Boolean).join(" · ") }, e.who || "—"),
+      h("td", {}, e.what), h("td", { class: "muted small" }, e.details)))
+      : [h("tr", {}, h("td", { class: "muted" }, "Nothing yet."))]));
   },
   update(s) {
+    if (s.history_last !== this.histKey && Date.now() - (this.histT || 0) > 1000) { this.histT = Date.now(); this.history(); }
+    if (s.activity_seq !== this.actSeq && Date.now() - (this.actT || 0) > 1000) { this.actT = Date.now(); this.activity(); }
     $("#dg-ctrl").innerHTML = Object.entries(s.controllers || {}).sort().map(([n, st]) =>
       `<tr><td>${n}</td><td style="color:var(--${st === "active" ? "ok" : "muted"})">${st}</td></tr>`).join("") || "<tr><td class='muted'>not reported</td></tr>";
     const rows = [["Mode", s.mode_label], ["Command source", s.command_source],

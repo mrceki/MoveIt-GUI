@@ -46,6 +46,7 @@ from ..geometry_calibration import VialGeometryError, estimate_vial
 from ..jog import JogCommand, JogError, JogVelocity
 from ..keepout import make_box
 from ..policies import RecordingOptions
+from ..activity import KINDS as ACTIVITY_KINDS, ActivityLog, summarize_args
 from .users import Users, public_id
 from .roles import Roles, RolesError, at_least
 from ..program import CONTAINER_STEPS, STEP_TYPES, Program, ProgramError, ProgramWaypoint, RunState, Step, path_label, walk
@@ -75,7 +76,17 @@ ADMIN_COMMANDS = frozenset((
     "drivers_save", "drivers_delete", "drivers_autostart", "parts_save", "parts_delete", "parts_mesh_upload",
     "parts_make_tcp", "base_switch", "setup_save", "setup_delete", "setup_load",
     "handeye_board", "handeye_start", "handeye_capture", "handeye_drop", "handeye_plan", "handeye_collect",
-    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save"))      # "Under TCP": the box top stays this far below the touching TCP
+    "handeye_solve", "handeye_save", "handeye_apply", "handeye_delete", "roles_save"))
+# commands the activity log (activity.py) records, with their kind; every ADMIN_COMMAND is "setup" (roles_save "roles")
+ACTIVITY_COMMANDS = {
+    **{c: "program" for c in ("program_run", "program_pause", "program_resume", "program_stop", "program_scrape",
+                              "program_scrape_baseline", "program_save", "program_open", "program_new",
+                              "program_delete", "robot_play", "robot_pause", "robot_stop_program")},
+    **{c: "policy" for c in ("policy_prepare", "policy_run", "policy_stop")},
+    **{c: "record" for c in ("record_start", "record_stop")},
+    **{c: "mode" for c in ("switch_mode", "freedrive", "recover")},
+    **{c: "power" for c in ("power_on", "power_off", "brake_release")},
+}      # "Under TCP": the box top stays this far below the touching TCP
 
 
 
@@ -113,6 +124,8 @@ class Lease:
         self.name = ""
         self.seen = 0.0
         self.uid: Optional[str] = None               # the holder's public user id (users.py), if its page sent one
+        self.key = ""                                # the holder's roles.py key (Tailscale login or IP): public
+        self.role = ""
         self.away = False                            # went quiet while the robot was idle (see IDLE_LEASE_S)
 
     @property
@@ -138,6 +151,9 @@ class WebService(WorkcellCommands):
         self.clock = clock
         self.lease = Lease()
         core.operator = lambda: self.lease.name or ""
+        self.activity = ActivityLog(Path(os.environ["MOVEIT_GUI_ACTIVITY"]) if os.environ.get("MOVEIT_GUI_ACTIVITY") else None)
+        core.log_mark = lambda: self._log_last
+        core.log_since = self._log_since
         self._lease_lock = threading.Lock()               # lease state only, held for microseconds: heartbeats never wait
         self.users = Users(clock)                         # who has the page open (one per browser)
         self.roles = Roles(Path(os.environ.get("MOVEIT_GUI_ROLES") or config_dir() / "roles.yaml"))
@@ -151,6 +167,8 @@ class WebService(WorkcellCommands):
         self.results: deque = deque(maxlen=50)            # {id, cmd, ok, msg, t}
         self.logs: deque = deque(maxlen=2000)             # (seq, line)
         self._log_seq = itertools.count(1)
+        self._log_last = 0
+        self._log_lock = threading.Lock()
         self.program = Program(name="untitled", robot=core.profile.name)
         self.program_path: Optional[Path] = None
         self._undo: List[tuple] = []                      # program snapshots (yaml, path) before each edit
@@ -207,8 +225,33 @@ class WebService(WorkcellCommands):
             self.drivers.tick()
         except Exception as e:
             self._log_error("drivers", e)
-        for line in self.core.bridge.drain_logs():
-            self.logs.append((next(self._log_seq), line))
+        self._drain_logs()
+
+    def _drain_logs(self):
+        with self._log_lock:
+            for line in self.core.bridge.drain_logs():
+                self._log_last = next(self._log_seq)
+                self.logs.append((self._log_last, line))
+
+    def _log_since(self, mark: int) -> List[str]:
+        """The log lines after `mark` (a run's own lines), including what the bridge has not handed over yet."""
+        self._drain_logs()
+        return [line for seq, line in list(self.logs) if seq > mark]
+
+    # ------------------------------------------------------------ activity log
+    def _actor(self) -> dict:
+        """The lease holder as the activity log names them (public things only: no token, no browser id)."""
+        return self._actor_of(self.lease)
+
+    @staticmethod
+    def _actor_of(L: "Lease") -> dict:
+        return {"name": (L.name or "").split(" @ ")[0], "key": L.key, "uid": L.uid or "", "role": L.role}
+
+    def _act(self, kind: str, what: str, who: Optional[dict] = None, details: str = ""):
+        try:
+            self.activity.add(kind, what, who if who is not None else self._actor(), details)
+        except Exception as e:                            # never let the log break an action
+            self._log_error("activity log", e)
 
     def _check_hold(self):
         with self._lock:
@@ -233,6 +276,8 @@ class WebService(WorkcellCommands):
         who = lease.name or lease.id
         if lease.away:
             self.core.bridge.log(f"web: {who} was away for {silent:.0f} s (limit {IDLE_LEASE_S:.0f} s): control released")
+            self._act("control", "control released after being away", self._actor_of(lease),
+                      f"away for {silent:.0f} s")
             return
         try:
             active = not self.core.idle() or self.core.last_snap.freedrive or self.payload_progress["running"]
@@ -244,6 +289,7 @@ class WebService(WorkcellCommands):
                     lease.away = True
             self.core.bridge.log(f"web: {who} went quiet (no heartbeat for {silent:.1f} s) with the robot idle: "
                                  f"keeps control for {IDLE_LEASE_S:.0f} s unless someone takes over")
+            self._act("control", "went away (robot idle, keeps control)", self._actor_of(lease))
             return
         with self._lease_lock:
             if self.lease is not lease or self.clock() - lease.seen <= LEASE_TIMEOUT_S:
@@ -251,6 +297,9 @@ class WebService(WorkcellCommands):
             self.lease = Lease()
         self.core.bridge.log(f"web: lost contact with {who} (no heartbeat for {silent:.1f} s, limit "
                              f"{LEASE_TIMEOUT_S:.1f} s): STOPPING")
+        self.core.note_stop(f"lost contact with {lease.name.split(' @ ')[0] or lease.id}")
+        self._act("control", "lost contact: control lost, robot stopped", self._actor_of(lease),
+                  f"no heartbeat for {silent:.1f} s")
         for what, fn in (("stop_all", self.core.stop_all),
                          ("payload cancel", lambda: self.payload and self.payload.cancel()),
                          ("freedrive off", lambda: self.core.last_snap.freedrive and
@@ -262,7 +311,7 @@ class WebService(WorkcellCommands):
 
     # =================================================================== lease
     def take_lease(self, client: str = "", name: str = "", presented: str = "", bid: str = "",
-                   role: str = "admin") -> dict:
+                   role: str = "admin", key: str = "") -> dict:
         """Returns {client: public id, name, uid, token: secret}. The token is shown only here; keep it out of logs.
         client: the token to install (in-process callers and tests); empty = a random one, which is what the HTTP
         layer always uses. presented: the token the caller already holds, so the holder may take again.
@@ -272,6 +321,7 @@ class WebService(WorkcellCommands):
         uid = public_id(bid) if Users.valid(bid) else None
         with self._lease_lock:
             cur = self.lease
+            took_from = ""
             again = cur.holds(client) or cur.holds(presented)
             off = self.offer if self.offer and self.clock() < self.offer["until"] else None
             if off and not again and off["uid"] != uid:
@@ -280,21 +330,28 @@ class WebService(WorkcellCommands):
                 if not self.core.idle() or self.core.last_snap.freedrive:
                     raise CommandError(f"{cur.name or 'another browser'} is controlling a moving robot")
                 self.core.bridge.log(f"web: {name or 'a browser'} took over control from {cur.name or cur.id}")
+                took_from = cur.name.split(" @ ")[0] or "another browser"
             lease = Lease()
             lease.token, lease.id = client or secrets.token_urlsafe(24), secrets.token_urlsafe(6)
             lease.name, lease.seen, lease.uid = name or "browser", self.clock(), uid
+            lease.key, lease.role = key, role
             self.lease = lease
             self.offer = None
             if self.asking and (self.asking["uid"] == uid or not again):
                 self.asking = None                        # answered by taking it (or a new holder: the question is gone)
-            return {**lease.view(), "token": lease.token}
+            out = {**lease.view(), "token": lease.token}
+        if not again:                                     # a holder taking again (page reload) is no news
+            gift = bool(off and off["uid"] == uid)
+            self._act("control", "took over control" if took_from else "took control", self._actor_of(lease),
+                      f"from {took_from}" if took_from else ("given to them" if gift else ""))
+        return out
 
     # ------------------------------------------------------- asking for control
     ASK_S = 60.0      # a question for control is open this long
     KEPT_S = 8.0      # "kept" is shown to the one who asked this long
     OFFER_S = 15.0    # control given to someone waits this long for them to take it
 
-    def ask_control(self, bid: str, name: str = "", role: str = "admin") -> dict:
+    def ask_control(self, bid: str, name: str = "", role: str = "admin", key: str = "") -> dict:
         """A browser without control asks the holder for it (the holder's page shows a pop-up: Give / Keep)."""
         if not at_least(role, "operator"):
             raise CommandError("you are a Viewer: an Admin can make you an Operator (SETUP › Roles)")
@@ -315,6 +372,8 @@ class WebService(WorkcellCommands):
                 raise CommandError(f"{a['name']} is asking already: wait for the answer")
             self.asking = {"uid": uid, "name": name or self.users.label(bid), "at": self.clock(), "kept": False}
         self.core.bridge.log(f"web: {self.asking['name']} asks {self.lease.name} for control")
+        self._act("control", "asked for control", {"name": self.asking["name"], "uid": uid, "key": key, "role": role},
+                  f"from {self.lease.name.split(' @ ')[0]}")
         return {"ok": True, "msg": f"asked {self.lease.name.split(' @ ')[0]} for control"}
 
     def cmd_control_answer(self, give=False):
@@ -323,6 +382,7 @@ class WebService(WorkcellCommands):
             a = self.asking
             if not a or a["kept"] or self.clock() - a["at"] > self.ASK_S:
                 raise CommandError("nobody is asking for control now")
+            who = self._actor()
             if not give:
                 a["kept"], a["at"] = True, self.clock()
                 holder = self.lease.name
@@ -333,6 +393,7 @@ class WebService(WorkcellCommands):
                 self.offer = {"uid": a["uid"], "name": a["name"], "until": self.clock() + self.OFFER_S}
                 self.asking = None
         self.core.bridge.log(f"web: {holder} {'gave control to' if give else 'keeps control; asked by'} {a['name']}")
+        self._act("control", "gave control" if give else "kept control", who, details=(f"to {a['name']}" if give else f"asked by {a['name']}"))
         return self._ok(f"control given to {a['name']}" if give else "you keep control")
 
     def _lease_state(self) -> dict:
@@ -358,8 +419,10 @@ class WebService(WorkcellCommands):
 
     def release(self, token: str):
         with self._lease_lock:
-            if self.lease.holds(token):
-                self.lease = Lease()
+            if not self.lease.holds(token):
+                return
+            who, self.lease = self._actor(), Lease()
+        self._act("control", "released control", who)
 
     # ------------------------------------------------------------------ roles
     def cmd_roles_get(self):
@@ -372,10 +435,16 @@ class WebService(WorkcellCommands):
         except RolesError as e:
             raise CommandError(str(e)) from None
         self.core.bridge.log(f"web: roles saved (default {default}, {len(people or {})} people)")
+        self._act("roles", "saved roles", details=f"default {default}, " + ", ".join(
+            f"{k}={v}" for k, v in sorted((people or {}).items()))[:150])
         return {"ok": True, "msg": "roles saved", **self.roles.view()}
 
-    def stop(self, who: str = "") -> dict:
-        """Anyone may stop. Synchronous."""
+    def stop(self, who: str = "", bid: str = "", key: str = "", role: str = "") -> dict:
+        """Anyone may stop. Synchronous. bid: the pressing browser's own id (users.py), to name it in the activity log."""
+        name = self.users.label(bid) if Users.valid(bid) else (who or "a browser")
+        self._act("stop", "pressed STOP", {"name": name, "key": key, "role": role,
+                                           "uid": public_id(bid) if Users.valid(bid) else ""})
+        self.core.note_stop(name)
         self.core.stop_all()
         if self.payload:
             self.payload.cancel()
@@ -423,6 +492,10 @@ class WebService(WorkcellCommands):
                     self._redo.clear()
                 if isinstance(out, dict) and "program" in out:
                     out["program"].update(self._history_view(), rev=self.program_rev)
+        kind = "roles" if cmd == "roles_save" else "setup" if cmd in ADMIN_COMMANDS else ACTIVITY_COMMANDS.get(cmd)
+        if kind and cmd != "roles_save":              # roles_save logs itself with the list
+            self._act(kind, cmd.replace("_", " "),
+                      None if holds else {"name": "someone without control", "role": role}, summarize_args(args))
         return out
 
     def _submit(self, cmd: str, fn: Callable[[], tuple]) -> dict:
@@ -572,9 +645,26 @@ class WebService(WorkcellCommands):
         return self._ok(out.get("note") or f"{len(out['points']) - 1} moves", **out)
     cmd_program_preview_path.read_only = True
 
-    def cmd_history(self, n=50):
-        return self._ok(runs=self.core.history.recent(int(n)), file=str(self.core.history.path))
+    def cmd_history(self, n=50, name=""):
+        from ..history import KEEP_RUNS
+        h = self.core.history
+        return self._ok(runs=h.recent(min(int(n), KEEP_RUNS), str(name or "")), file=str(h.path), keep=KEEP_RUNS,
+                        names=sorted({e.get("name", "") for e in h.entries}))
     cmd_history.read_only = True
+
+    def cmd_history_get(self, id):
+        e = self.core.history.get(str(id))
+        if e is None:
+            raise CommandError("that run is no longer in the history")
+        return self._ok(run=e)
+    cmd_history_get.read_only = True
+
+    def cmd_activity(self, n=300, who="", kind=""):
+        a = self.activity
+        return self._ok(events=a.recent(min(int(n), 2000), str(who or ""), str(kind or "")), seq=a.seq,
+                        people=a.people(), kinds=list(ACTIVITY_KINDS),
+                        file=str(a.path))
+    cmd_activity.read_only = True
 
     # ------------------------------------------------------------ recording (rosbag2 / MCAP)
     # Nothing here moves the robot. Starting needs control (one operator decides what fills the disk);
@@ -1477,6 +1567,7 @@ class WebService(WorkcellCommands):
         return self._ok("resumed")
 
     def cmd_program_stop(self):
+        self.core.note_stop(self._actor()["name"] or "the operator")
         self.core.runner.stop()
         return self._ok("stopping")
 
@@ -1784,6 +1875,7 @@ class WebService(WorkcellCommands):
         return self._ok(f"{name} started")
 
     def cmd_policy_stop(self):
+        self.core.note_stop(self._actor()["name"] or "the operator")
         self.core.policies.cancel()
         return self._ok("stopping policy")
 
@@ -2293,6 +2385,7 @@ class WebService(WorkcellCommands):
             "record": self.core.recorder.view(),
             "gains_applying": self.core.gains.applying,
             "lease": self._lease_state(),
+            "activity_seq": self.activity.seq, "history_last": (self.core.history.entries[-1].get("id") if self.core.history.entries else ""),
             "users": self.users.view(self.lease.uid),
             "jog": {"active": c.jogging, "hold_refusal": c.jog_hold_refusal(),
                     "servo_warning": c.servo_warning() if c.jogging else ""},

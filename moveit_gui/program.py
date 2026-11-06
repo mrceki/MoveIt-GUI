@@ -669,6 +669,7 @@ class ProgramRunner:
             self._thread.join(2.0)                 # the last run reported its end and is just finishing
             if self._thread.is_alive():
                 return False
+        self.steps_total = len(program.steps)
         problems = self.preflight(program, start_index)
         if problems:
             self.program_name, self.started_at = program.name, None
