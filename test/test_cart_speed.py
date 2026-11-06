@@ -143,25 +143,25 @@ def core(tmp_path, monkeypatch):
     bridge.shutdown()
 
 
-def test_fake_bridge_takes_path_length_over_speed_when_slower(core):
+def test_fake_bridge_takes_path_length_over_speed_plus_the_ramps(core):
     b = core.bridge
     T0 = b.T_base_tool0.copy()
     T1 = T0.copy()
-    T1[:3, 3] += [0.0, 0.0, 0.1]                         # 100 mm
+    T1[:3, 3] += [0.0, 0.0, 0.1]                         # 100 mm, Accel 50 %: ramps at 250 mm/s^2
     assert b.move_pose("tool0", T1, True, 0.5, 0.5, cart_speed=0.02)
-    assert b.last_move_s == pytest.approx(5.0, rel=1e-6)  # 0.1 m / 0.02 m/s
+    assert b.last_move_s == pytest.approx(0.1 / 0.02 + 0.02 / 0.25, rel=1e-6)   # L / v + v / a
     assert np.allclose(b.T_base_tool0[:3, 3], T1[:3, 3])
     assert b.move_pose("tool0", T0, True, 0.5, 0.5)
     assert b.last_move_s == pytest.approx(0.4)            # no limit: the old timing (0.2 / vel)
     assert b.move_pose("tool0", T1, True, 0.5, 0.5, cart_speed=1.0)
-    assert b.last_move_s == pytest.approx(0.4)            # the limit is slower than the move anyway
+    assert b.last_move_s == pytest.approx(2 * math.sqrt(0.1 / 0.25))   # too short to reach 1 m/s: a triangle
     assert b.move_pose("tool0", T0, False, 0.5, 0.5, cart_speed=0.02)
     assert b.last_move_s == pytest.approx(0.4)            # not linear: no limit
     # a pure rotation about tool0 still moves an offset TCP point: 90 deg about z, point 0.1 m along x
     R = T0.copy()
     R[:3, :3] = T0[:3, :3] @ tf.mm_deg_to_T([0, 0, 0], [0, 0, 90])[:3, :3]
     assert b.move_pose("tool0", R, True, 0.5, 0.5, cart_speed=0.01, speed_point=[0.1, 0, 0])
-    assert b.last_move_s == pytest.approx(math.sqrt(2) * 0.1 / 0.01, rel=1e-6)
+    assert b.last_move_s == pytest.approx(math.sqrt(2) * 0.1 / 0.01 + 0.01 / 0.25, rel=1e-6)
 
 
 def test_core_passes_mm_s_as_m_s_with_the_gui_speed_and_the_tcp_point(core):
@@ -245,7 +245,7 @@ def test_program_editor_and_runner_use_speed_mm_s(web):
         assert _wait(lambda: web.core.program_result is not None, 20)
     assert web.core.program_result[0], web.core.program_result
     assert mp.call_args.kwargs["cart_speed"] == pytest.approx(0.02)
-    assert b.last_move_s == pytest.approx(0.5, rel=0.01)  # 10 mm at 20 mm/s
+    assert b.last_move_s == pytest.approx(0.5 + 0.02 / 0.05, rel=0.01)  # 10 mm at 20 mm/s + ramps at 50 mm/s^2
     web.command("a", "program_update", {"path": [0], "params": {"speed_mm_s": 0}})      # 0 = off, not saved
     assert "speed_mm_s" not in web.program.steps[0].params
 
@@ -285,8 +285,10 @@ def test_ros_bridge_retimes_a_linear_plan_for_the_tcp_point(rb):
     out = b.plan_pose("tool0", np.eye(4), True, 0.1, 0.1, cart_speed=0.05, speed_point=[0.5, 0, 0])
     assert out is traj
     assert b.moveit.plan.call_args.kwargs["cartesian"] is True
-    assert _secs(traj.points[-1].time_from_start) == pytest.approx(4.0, rel=0.01)    # 0.2 m/s -> 0.05 m/s
-    assert any("slowed" in x for x in b.lines)
+    # TCP 1 m from the axis turns 0.2 rad: 0.2 m at a constant 0.05 m/s + ramps at 500 x 10 % = 50 mm/s^2
+    assert _secs(traj.points[-1].time_from_start) == pytest.approx(0.2 / 0.05 + 0.05 / 0.05, rel=0.01)
+    assert len(traj.points) > 150 and traj.points[0].velocities == [0.0] and traj.points[-1].velocities == [0.0]
+    assert any("constant 50.0 mm/s" in x for x in b.lines), b.lines
 
     traj = _traj()
     b = _ros_bridge(rb, traj)
@@ -313,3 +315,120 @@ def test_ros_bridge_move_pose_passes_the_limit_to_plan_pose(rb):
     assert b.move_pose("tool0", np.eye(4), True, 0.2, 0.3, cart_speed=0.03, speed_point=[0, 0, 0.1])
     args = b.plan_pose.call_args.args
     assert args[0] == "tool0" and args[2:] == (True, 0.2, 0.3, 0.03, [0, 0, 0.1])
+
+
+# ------------------------------------------------------------ constant speed
+L1, L2 = 0.4, 0.3
+PLANAR = f"""<robot name="planar">
+  <link name="base_link"/><link name="a"/><link name="b"/><link name="tool0"/>
+  <joint name="j1" type="revolute"><parent link="base_link"/><child link="a"/><axis xyz="0 0 1"/>
+    <limit lower="-3" upper="3" effort="1" velocity="3.0"/></joint>
+  <joint name="j2" type="revolute"><parent link="a"/><child link="b"/><origin xyz="{L1} 0 0"/><axis xyz="0 0 1"/>
+    <limit lower="-3" upper="3" effort="1" velocity="3.0"/></joint>
+  <joint name="t" type="fixed"><parent link="b"/><child link="tool0"/><origin xyz="{L2} 0 0"/></joint>
+</robot>"""
+
+
+def _ik(x, y):
+    c2 = (x * x + y * y - L1 * L1 - L2 * L2) / (2 * L1 * L2)
+    q2 = math.acos(c2)
+    return [math.atan2(y, x) - math.atan2(L2 * math.sin(q2), L1 + L2 * math.cos(q2)), q2]
+
+
+def _line(n, p0=(0.35, -0.05), p1=(0.35, 0.05), t_end=0.7):
+    """A MoveIt-like Cartesian plan: n IK points on a straight line, timed anyhow (here: evenly)."""
+    pts = []
+    for i in range(n):
+        u = i / (n - 1)
+        q = _ik(p0[0] + u * (p1[0] - p0[0]), p0[1] + u * (p1[1] - p0[1]))
+        pts.append(SimpleNamespace(positions=q, velocities=[0.0, 0.0], accelerations=[0.0, 0.0],
+                                   time_from_start=_dur(t_end * u)))
+    return SimpleNamespace(joint_names=["j1", "j2"], points=pts)
+
+
+@pytest.fixture
+def planar():
+    model = parse_urdf(PLANAR)
+    return model, cart_speed.point_fk(model, "base_link", "tool0")
+
+
+def _speeds(traj, point_at):
+    P = np.array([point_at(dict(zip(traj.joint_names, p.positions))) for p in traj.points])
+    t = np.array([_secs(p.time_from_start) for p in traj.points])
+    return P, t, np.linalg.norm(np.diff(P, axis=0), axis=1) / np.diff(t)
+
+
+def test_constant_speed_cruises_at_v_between_exact_endpoints(planar):
+    model, at = planar
+    traj = _line(8)                                       # sparse: 8 points for 100 mm, as move_group returned
+    q_first, q_last = list(traj.points[0].positions), list(traj.points[-1].positions)
+    v, a = 0.02, 0.5
+    big = {"j1": 10.0, "j2": 10.0}
+    info = cart_speed.constant_speed(traj, at, v, a, big, big)
+    P, t, seg = _speeds(traj, at)
+    assert info["slowed"] == 1.0 and info["points"] > 90  # densified to <= 1 mm steps
+    assert traj.points[0].positions == pytest.approx(q_first) and traj.points[-1].positions == pytest.approx(q_last)
+    assert traj.points[0].velocities == [0.0, 0.0] and traj.points[-1].velocities == [0.0, 0.0]
+    assert t[0] == 0.0 and np.all(np.diff(t) > 0)
+    assert all(p.accelerations == [] for p in traj.points)   # positions + velocities: cubic splines
+    L = 0.1
+    assert t[-1] == pytest.approx(cart_speed.trapezoid_duration(L, v, a), rel=0.01)
+    ramp = v * v / (2 * a)                                # 0.4 mm
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+    cruise = (s[1:] > ramp + 0.002) & (s[:-1] < L - ramp - 0.002)
+    assert cruise.sum() > 80
+    assert np.all(np.abs(seg[cruise] - v) <= 0.02 * v)   # constant within 2 %
+    assert cart_speed.peak_speed(traj, at) <= v * 1.02
+    line = np.array([0.35, 0, 0])                         # every point on the straight line x = 0.35 (< 0.1 mm)
+    assert np.max(np.abs(P[:, 0] - line[0])) < 1e-4
+
+
+def test_constant_speed_ramps_and_a_short_move_is_a_triangle(planar):
+    _, at = planar
+    traj = _line(3, (0.35, 0.0), (0.35, 0.002))           # 2 mm: 20 mm/s at 50 mm/s^2 needs 8 mm to get there
+    big = {"j1": 10.0, "j2": 10.0}
+    cart_speed.constant_speed(traj, at, 0.02, 0.05, big, big)
+    _, t, seg = _speeds(traj, at)
+    assert t[-1] == pytest.approx(2 * math.sqrt(0.002 / 0.05), rel=0.01)
+    assert seg.max() <= math.sqrt(0.05 * 0.002) * 1.02    # peak of the triangle, under 20 mm/s
+
+
+def test_constant_speed_keeps_the_joint_limits_by_slowing_the_whole_move(planar):
+    _, at = planar
+    traj = _line(8)
+    vlim, alim = {"j1": 0.05, "j2": 0.05}, {"j1": 0.2, "j2": 0.2}
+    info = cart_speed.constant_speed(traj, at, 0.1, 1.0, vlim, alim)
+    assert info["slowed"] > 1.0 and info["v"] < 0.1
+    qd = np.array([p.velocities for p in traj.points])
+    t = np.array([_secs(p.time_from_start) for p in traj.points])
+    assert np.max(np.abs(qd)) <= 0.05 + 1e-9
+    assert np.max(np.abs(np.gradient(qd, t, axis=0))) <= 0.2 * 1.001
+    _, _, seg = _speeds(traj, at)
+    assert seg.max() <= info["v"] * 1.02                  # still a constant (slower) cruise
+
+
+def test_joint_limits_come_from_the_urdf_and_the_profile(planar):
+    model, _ = planar
+    prof = RobotProfile.load(PROFILE)
+    vel, acc = cart_speed.joint_limits(model, prof, ["j1", "j2", "nolimit"], 0.5, 0.1)
+    assert vel["j1"] == pytest.approx(1.5) and vel["nolimit"] == pytest.approx(math.pi * 0.5)
+    assert acc["j1"] == pytest.approx(5.0 * 0.1)
+    assert cart_speed.cart_accel_m_s2(prof, 0.1) == pytest.approx(0.05)
+
+
+def test_retime_linear_falls_back_to_the_uniform_slowdown(planar):
+    model = parse_urdf(URDF)
+    at = cart_speed.point_fk(model, "base_link", "tool0", [-0.5, 0, 0])   # the TCP sits on the joint axis
+    traj = _traj()
+    lines = []
+    big = {"j1": 10.0}
+    cart_speed.retime_linear(traj, at, 0.01, 0.5, big, big, lines.append)
+    assert any("constant speed not possible" in x for x in lines)
+    assert _secs(traj.points[-1].time_from_start) == pytest.approx(1.0)   # nothing moves: left as planned
+    _, at2 = planar
+    traj = _line(8)
+    lines = []
+    cart_speed.retime_linear(traj, at2, 0.02, 0.5, {"j1": 10.0, "j2": 10.0}, {"j1": 10.0, "j2": 10.0}, lines.append)
+    assert any("constant 20.0 mm/s" in x for x in lines)
+    assert not any("slowed" in x for x in lines)
+    assert cart_speed.peak_speed(traj, at2) <= 0.02 * 1.02
